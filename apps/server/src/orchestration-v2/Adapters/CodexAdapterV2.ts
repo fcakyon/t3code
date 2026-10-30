@@ -4455,35 +4455,55 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }).pipe(Effect.orDie),
         );
 
-        yield* client.handleServerNotification("account/rateLimits/updated", (payload) =>
-          Effect.gen(function* () {
-            const previous = yield* Ref.getAndUpdate(rateLimitSnapshot, (previous) =>
-              mergeCodexRateLimits(previous, payload.rateLimits),
+        const applyRateLimits = Effect.fnUntraced(function* (rateLimits: CodexRateLimitSnapshot) {
+          const previous = yield* Ref.getAndUpdate(rateLimitSnapshot, (previous) =>
+            mergeCodexRateLimits(previous, rateLimits),
+          );
+          const resetAt = codexUsageLimitResetAt(yield* Ref.get(rateLimitSnapshot));
+          for (const item of (yield* Ref.get(limitedTurnItems)).values()) {
+            if (resetAt === null || item.failure.resetAt != null) continue;
+            const updated = {
+              ...item,
+              updatedAt: yield* DateTime.now,
+              failure: { ...item.failure, resetAt },
+            };
+            yield* Ref.update(limitedTurnItems, (current) =>
+              new Map(current).set(item.providerThreadId!, updated),
             );
-            const resetAt = codexUsageLimitResetAt(yield* Ref.get(rateLimitSnapshot));
-            for (const item of (yield* Ref.get(limitedTurnItems)).values()) {
-              if (resetAt === null || item.failure.resetAt != null) continue;
-              const updated = {
-                ...item,
-                updatedAt: yield* DateTime.now,
-                failure: { ...item.failure, resetAt },
-              };
-              yield* Ref.update(limitedTurnItems, (current) =>
-                new Map(current).set(item.providerThreadId!, updated),
-              );
-              yield* emitProviderEvent({
-                type: "turn_item.updated",
-                driver: CODEX_PROVIDER,
-                turnItem: updated,
-              });
-            }
-            const update = codexRateLimitsToUpdate(payload.rateLimits, previous);
-            if (update && adapterOptions.onUsageLimits) {
-              const checkedAt = DateTime.formatIso(yield* DateTime.now);
-              yield* adapterOptions.onUsageLimits({ ...update, checkedAt });
-            }
-          }).pipe(Effect.orDie),
+            yield* emitProviderEvent({
+              type: "turn_item.updated",
+              driver: CODEX_PROVIDER,
+              turnItem: updated,
+            });
+          }
+          const update = codexRateLimitsToUpdate(rateLimits, previous);
+          if (update && adapterOptions.onUsageLimits) {
+            const checkedAt = DateTime.formatIso(yield* DateTime.now);
+            yield* adapterOptions.onUsageLimits({ ...update, checkedAt });
+          }
+        });
+
+        yield* client.handleServerNotification("account/rateLimits/updated", (payload) =>
+          applyRateLimits(payload.rateLimits).pipe(Effect.orDie),
         );
+
+        const rateLimitsProbeInFlight = yield* Ref.make(false);
+        // A run's first request can 429 before Codex pushes a codex snapshot. Notification
+        // handlers block response routing, so the read runs on its own fiber.
+        const probeUsageLimitReset = Effect.fnUntraced(function* () {
+          if (yield* Ref.getAndSet(rateLimitsProbeInFlight, true)) return;
+          yield* client.request("account/rateLimits/read", null).pipe(
+            Effect.timeout("10 seconds"),
+            Effect.flatMap((response) =>
+              applyRateLimits(response.rateLimitsByLimitId?.codex ?? response.rateLimits),
+            ),
+            Effect.catch((cause) =>
+              Effect.logWarning("orchestration-v2.codex-usage-limit-reset-read-failed", { cause }),
+            ),
+            Effect.ensuring(Ref.set(rateLimitsProbeInFlight, false)),
+            Effect.forkIn(scope, { startImmediately: true }),
+          );
+        });
 
         yield* client.handleServerNotification("thread/tokenUsage/updated", (payload) =>
           Effect.gen(function* () {
@@ -5883,6 +5903,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             yield* Ref.update(limitedTurnItems, (items) =>
               new Map(items).set(context.providerThread.id, item),
             );
+            if (current.failure.resetAt == null) yield* probeUsageLimitReset();
           }
         });
 
