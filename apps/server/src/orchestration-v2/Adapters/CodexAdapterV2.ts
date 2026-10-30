@@ -4487,23 +4487,16 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           applyRateLimits(payload.rateLimits).pipe(Effect.orDie),
         );
 
-        const rateLimitsProbeInFlight = yield* Ref.make(false);
-        // A run's first request can 429 before Codex pushes a codex snapshot. Notification
-        // handlers block response routing, so the read runs on its own fiber.
-        const probeUsageLimitReset = Effect.fnUntraced(function* () {
-          if (yield* Ref.getAndSet(rateLimitsProbeInFlight, true)) return;
-          yield* client.request("account/rateLimits/read", null).pipe(
-            Effect.timeout("10 seconds"),
-            Effect.flatMap((response) =>
-              applyRateLimits(response.rateLimitsByLimitId?.codex ?? response.rateLimits),
-            ),
-            Effect.catch((cause) =>
-              Effect.logWarning("orchestration-v2.codex-usage-limit-reset-read-failed", { cause }),
-            ),
-            Effect.ensuring(Ref.set(rateLimitsProbeInFlight, false)),
-            Effect.forkIn(scope, { startImmediately: true }),
-          );
-        });
+        // A run's first request can 429 before Codex pushes a codex snapshot.
+        const readUsageLimitReset = client.request("account/rateLimits/read", null).pipe(
+          Effect.timeout("10 seconds"),
+          Effect.flatMap((response) =>
+            applyRateLimits(response.rateLimitsByLimitId?.codex ?? response.rateLimits),
+          ),
+          Effect.catch((cause) =>
+            Effect.logWarning("orchestration-v2.codex-usage-limit-reset-read-failed", { cause }),
+          ),
+        );
 
         yield* client.handleServerNotification("thread/tokenUsage/updated", (payload) =>
           Effect.gen(function* () {
@@ -5854,7 +5847,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           },
         );
 
-        const emitRootTerminal = Effect.fnUntraced(function* (
+        const publishRootTerminal = Effect.fnUntraced(function* (
           context: ActiveCodexTurnContext,
           event: CodexRootTerminalEvent,
         ) {
@@ -5871,23 +5864,6 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }
               : event;
           yield* emitProviderEvent(current);
-          const continued = continuedRuns.get(context.providerTurnId) ?? [context];
-          if (current.status !== "completed") {
-            yield* Ref.update(
-              terminalizedNonCompletedNativeTurns,
-              (nativeTurns) =>
-                new Set([...nativeTurns, ...continued.map((turn) => turn.nativeTurnId)]),
-            );
-          }
-          for (const turn of continued) {
-            continuedRuns.delete(turn.providerTurnId);
-          }
-          const nativeThreadId = context.providerThread.nativeThreadRef?.nativeId;
-          const rootProviderThread =
-            nativeThreadId == null ? undefined : rootProviderThreads.get(nativeThreadId);
-          if (nativeThreadId != null && rootProviderThread !== undefined) {
-            rootProviderThreads.set(nativeThreadId, { ...rootProviderThread, status: "idle" });
-          }
           if (current.status === "failed" && current.failure.class === "usage_limit") {
             const item = makeProviderFailureTurnItem({
               driver: CODEX_PROVIDER,
@@ -5903,7 +5879,45 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             yield* Ref.update(limitedTurnItems, (items) =>
               new Map(items).set(context.providerThread.id, item),
             );
-            if (current.failure.resetAt == null) yield* probeUsageLimitReset();
+          }
+        });
+
+        const emitRootTerminal = Effect.fnUntraced(function* (
+          context: ActiveCodexTurnContext,
+          event: CodexRootTerminalEvent,
+        ) {
+          const awaitsReset =
+            event.status === "failed" &&
+            event.failure.class === "usage_limit" &&
+            event.failure.resetAt == null &&
+            codexUsageLimitResetAt(yield* Ref.get(rateLimitSnapshot)) === null;
+          if (!awaitsReset) yield* publishRootTerminal(context, event);
+          const continued = continuedRuns.get(context.providerTurnId) ?? [context];
+          if (event.status !== "completed") {
+            yield* Ref.update(
+              terminalizedNonCompletedNativeTurns,
+              (nativeTurns) =>
+                new Set([...nativeTurns, ...continued.map((turn) => turn.nativeTurnId)]),
+            );
+          }
+          for (const turn of continued) {
+            continuedRuns.delete(turn.providerTurnId);
+          }
+          const nativeThreadId = context.providerThread.nativeThreadRef?.nativeId;
+          const rootProviderThread =
+            nativeThreadId == null ? undefined : rootProviderThreads.get(nativeThreadId);
+          if (nativeThreadId != null && rootProviderThread !== undefined) {
+            rootProviderThreads.set(nativeThreadId, { ...rootProviderThread, status: "idle" });
+          }
+          // The run ends on its terminal, so the reset must be on it. Notification handlers
+          // block response routing, so the read and the terminal run on their own fiber.
+          if (awaitsReset) {
+            yield* readUsageLimitReset.pipe(
+              Effect.andThen(
+                turnTerminalizationPermit.withPermits(1)(publishRootTerminal(context, event)),
+              ),
+              Effect.forkIn(scope, { startImmediately: true }),
+            );
           }
         });
 

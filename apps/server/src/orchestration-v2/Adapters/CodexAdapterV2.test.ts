@@ -5637,7 +5637,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   },
                 ]
               : []),
-            ...(scenario.name === "first-request-read-failed"
+            ...(scenario.name === "first-request-read-failed" || scenario.name === "late-reset"
               ? [
                   {
                     type: "expect_outbound" as const,
@@ -5651,9 +5651,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   },
                 ]
               : []),
-            ...(scenario.name === "late-reset" || scenario.name === "first-request-read-failed"
-              ? [snapshot]
-              : []),
+            ...(scenario.name === "late-reset" ? [snapshot] : []),
             ...(scenario.name === "deferred-reset"
               ? [
                   {
@@ -5713,11 +5711,13 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         if (terminal?.status !== "failed") return;
         assert.equal(terminal.failure.class, scenario.expectedClass);
         assert.equal(terminal.threadDisposition, "reusable");
-        if (scenario.name === "deferred-reset") assert.equal(terminal.failure.resetAt, resetAt);
-        if (scenario.name.startsWith("first-request-")) assert.isNull(terminal.failure.resetAt);
+        if (scenario.name === "deferred-reset" || scenario.name === "first-request-reset")
+          assert.equal(terminal.failure.resetAt, resetAt);
+        if (scenario.name === "first-request-read-failed" || scenario.name === "late-reset")
+          assert.isNull(terminal.failure.resetAt);
         if (scenario.name === "matching-details")
           assert.equal(terminal.failure.message, "Detailed provider allowance explanation.");
-        if (scenario.name === "late-reset" || scenario.name.startsWith("first-request-")) {
+        if (scenario.name === "late-reset") {
           yield* Deferred.await(resetReceipt);
           const item = harness.events.find(
             (event) =>
