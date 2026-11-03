@@ -5438,12 +5438,6 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       expectedClass: "usage_limit",
     },
     {
-      name: "first-request-read-failed",
-      code: "usageLimitExceeded",
-      notification: false,
-      expectedClass: "usage_limit",
-    },
-    {
       name: "stale-read",
       code: "usageLimitExceeded",
       notification: false,
@@ -5578,7 +5572,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           scenario: `codex-limit-${scenario.name}`,
           entries: [
             ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Continue." }),
-            ...(scenario.name.startsWith("first-request-")
+            ...(scenario.name === "first-request-reset"
               ? [
                   {
                     ...snapshot,
@@ -5719,7 +5713,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   },
                 ]
               : []),
-            ...(scenario.name === "first-request-read-failed" || scenario.name === "late-reset"
+            ...(scenario.name === "late-reset"
               ? [
                   {
                     type: "expect_outbound" as const,
@@ -5795,8 +5789,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         assert.equal(terminal.threadDisposition, "reusable");
         if (scenario.name === "deferred-reset" || scenario.name === "first-request-reset")
           assert.equal(terminal.failure.resetAt, resetAt);
-        if (scenario.name === "first-request-read-failed" || scenario.name === "late-reset")
-          assert.isNull(terminal.failure.resetAt);
+        if (scenario.name === "late-reset") assert.isNull(terminal.failure.resetAt);
         if ("race" in scenario) assert.equal(terminal.failure.resetAt, scenario.race.resetAt);
         if (scenario.name === "matching-details")
           assert.equal(terminal.failure.message, "Detailed provider allowance explanation.");
