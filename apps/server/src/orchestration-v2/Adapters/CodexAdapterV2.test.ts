@@ -1151,6 +1151,8 @@ describe("CodexAdapterV2 session initialize", () => {
   );
 });
 
+const individualLimit = { limit: "100", used: "99", resetsAt: 2000100000 };
+
 describe("CodexAdapterV2 post-settle continuation", () => {
   // The harness notifies after every recorded event or continuation, so a wait
   // re-checks exactly when the state it reads changes. Subscribing before the
@@ -5480,6 +5482,18 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       },
     },
     {
+      name: "same-window-individual-read",
+      code: "usageLimitExceeded",
+      notification: false,
+      expectedClass: "usage_limit",
+      race: {
+        before: { individualLimit: { ...individualLimit, remainingPercent: 1 } },
+        during: { individualLimit: { ...individualLimit, remainingPercent: 5 } },
+        read: { individualLimit: { ...individualLimit, remainingPercent: 0 } },
+        resetAt: "2033-05-19T07:20:00.000Z",
+      },
+    },
+    {
       name: "usage",
       code: "usageLimitExceeded",
       notification: false,
@@ -5809,6 +5823,125 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             NodeServices.layer,
             NodeCrypto.layer,
           ),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("shares one reset read between overlapping usage-limit terminals", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "native-limit-overlap";
+      const turnFailed = (turnId: string) => ({
+        type: "emit_inbound" as const,
+        label: `turn/completed/${turnId}`,
+        frame: {
+          method: "turn/completed",
+          params: {
+            threadId: nativeThreadId,
+            turn: {
+              ...makeCodexReplayTurn({ id: turnId, status: "failed" }),
+              error: {
+                message: "Provider stopped this request.",
+                codexErrorInfo: "usageLimitExceeded",
+              },
+            },
+          },
+        },
+      });
+      const second = codexReplayPreamble({
+        nativeThreadId,
+        nativeTurnId: "turn-overlap-2",
+        prompt: "Continue.",
+      });
+      const readSent = yield* Deferred.make<void>();
+      let reads = 0;
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "codex-limit-overlapping-reads",
+          entries: [
+            ...codexReplayPreamble({
+              nativeThreadId,
+              nativeTurnId: "turn-overlap-1",
+              prompt: "Continue.",
+            }),
+            turnFailed("turn-overlap-1"),
+            {
+              type: "expect_outbound",
+              label: "account/rateLimits/read",
+              frame: { id: 4, method: "account/rateLimits/read", params: null },
+            },
+            {
+              type: "emit_inbound",
+              label: "read-sent",
+              frame: {
+                method: "account/rateLimits/updated",
+                params: { rateLimits: { limitId: "premium", primary: null, secondary: null } },
+              },
+            },
+            ...second.slice(5, 7).map((entry) => withReplayRequestId(entry, 5)),
+            second[7]!,
+            turnFailed("turn-overlap-2"),
+            {
+              type: "emit_inbound",
+              label: "account/rateLimits/read",
+              frame: {
+                id: 4,
+                result: {
+                  rateLimits: {
+                    limitId: "codex",
+                    primary: { usedPercent: 100, resetsAt: 2000100000 },
+                  },
+                },
+              },
+            },
+          ],
+        }),
+        undefined,
+        (method) =>
+          Effect.sync(() => {
+            if (method === "account/rateLimits/read") reads += 1;
+          }),
+        undefined,
+        (entry) =>
+          entry.label === "read-sent" ? Deferred.succeed(readSent, undefined) : Effect.void,
+      );
+      const first = makeCodexTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        text: "Continue.",
+        attemptId: RunAttemptId.make("attempt-overlap-1"),
+      });
+      yield* harness.runtime.startTurn(first);
+      yield* Deferred.await(readSent);
+      yield* harness.runtime.startTurn({
+        ...first,
+        runId: RunId.make("overlap-2"),
+        attemptId: RunAttemptId.make("attempt-overlap-2"),
+        rootNodeId: NodeId.make("overlap-2"),
+        runOrdinal: 2,
+        providerTurnOrdinal: 2,
+      });
+      yield* harness.awaitTerminal(2);
+      assert.equal(reads, 1);
+      assert.deepEqual(
+        harness
+          .terminalEvents()
+          .map((event) => [event.runOrdinal, event.status === "failed" && event.failure.resetAt])
+          .toSorted(([left], [right]) => Number(left) - Number(right)),
+        [
+          [1, "2033-05-19T07:20:00.000Z"],
+          [2, "2033-05-19T07:20:00.000Z"],
+        ],
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
         ),
       ),
     ),

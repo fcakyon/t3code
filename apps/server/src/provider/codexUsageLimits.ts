@@ -205,28 +205,37 @@ export function reconcileCodexRateLimitsRead(
       ? { rateLimitReachedType }
       : {}),
     ...(primary !== sent?.primary && primary !== undefined
-      ? { primary: laterWindowReport(primary, read.primary) }
+      ? { primary: laterReport(primary, read.primary, usedPercent) }
       : {}),
     ...(secondary !== sent?.secondary && secondary !== undefined
-      ? { secondary: laterWindowReport(secondary, read.secondary) }
+      ? { secondary: laterReport(secondary, read.secondary, usedPercent) }
       : {}),
     ...(individualLimit !== sent?.individualLimit && individualLimit !== undefined
-      ? { individualLimit }
+      ? {
+          individualLimit: laterReport(
+            individualLimit,
+            read.individualLimit,
+            (limit) => 100 - limit.remainingPercent,
+          ),
+        }
       : {}),
   });
 }
 
+const usedPercent = (window: CodexRateLimitWindow) => window.usedPercent;
+
 // Usage only grows within a window, so a lower report of the same reset is a late tick from a
 // concurrent stream.
-function laterWindowReport(
-  notified: CodexRateLimitWindow | null,
-  read: CodexRateLimitWindow | null | undefined,
-): CodexRateLimitWindow | null {
+function laterReport<Report extends { readonly resetsAt?: number | null }>(
+  notified: Report | null,
+  read: Report | null | undefined,
+  used: (report: Report) => number,
+): Report | null {
   return notified &&
     read &&
     notified.resetsAt != null &&
     notified.resetsAt === read.resetsAt &&
-    read.usedPercent > notified.usedPercent
+    used(read) > used(notified)
     ? read
     : notified;
 }

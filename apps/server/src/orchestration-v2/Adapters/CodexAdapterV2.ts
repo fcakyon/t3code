@@ -4498,7 +4498,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         );
 
         // A run's first request can 429 before Codex pushes a codex snapshot.
-        const readUsageLimitReset = Effect.gen(function* () {
+        const readAccountUsageLimits = Effect.gen(function* () {
           const sent = yield* Ref.get(rateLimitSnapshot);
           const response = yield* client
             .request("account/rateLimits/read", null)
@@ -4510,6 +4510,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             Effect.logWarning("orchestration-v2.codex-usage-limit-reset-read-failed", { cause }),
           ),
         );
+        // Terminals share one pending read: an overlapping read would take this read's result
+        // for a newer notification and keep the fields it dropped.
+        const pendingResetRead = yield* Ref.make<Deferred.Deferred<void> | undefined>(undefined);
+        const readUsageLimitReset = Effect.gen(function* () {
+          const read = yield* Deferred.make<void>();
+          const pending = yield* Ref.modify(pendingResetRead, (pending) =>
+            pending ? [pending, pending] : [undefined, read],
+          );
+          if (pending) return yield* Deferred.await(pending);
+          yield* readAccountUsageLimits.pipe(
+            Effect.ensuring(
+              Ref.set(pendingResetRead, undefined).pipe(
+                Effect.andThen(Deferred.succeed(read, undefined)),
+              ),
+            ),
+          );
+        });
 
         yield* client.handleServerNotification("thread/tokenUsage/updated", (payload) =>
           Effect.gen(function* () {
