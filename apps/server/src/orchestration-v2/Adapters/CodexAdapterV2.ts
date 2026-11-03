@@ -26,6 +26,7 @@ import {
   codexRateLimitsToUpdate,
   mergeCodexRateLimits,
   codexUsageLimitResetAt,
+  reconcileCodexRateLimitsRead,
   type CodexRateLimitSnapshot,
 } from "../../provider/codexUsageLimits.ts";
 import {
@@ -4456,11 +4457,16 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         );
 
         // Quota notifications repeat on token ticks; keep this path out of traces.
-        const applyRateLimits = Effect.fnUntraced(function* (rateLimits: CodexRateLimitSnapshot) {
-          const previous = yield* Ref.getAndUpdate(rateLimitSnapshot, (previous) =>
-            mergeCodexRateLimits(previous, rateLimits),
-          );
-          const resetAt = codexUsageLimitResetAt(yield* Ref.get(rateLimitSnapshot));
+        const applyRateLimits = Effect.fnUntraced(function* (
+          reconcile: (
+            previous: CodexRateLimitSnapshot | undefined,
+          ) => CodexRateLimitSnapshot | undefined,
+        ) {
+          const [previous, next] = yield* Ref.modify(rateLimitSnapshot, (previous) => {
+            const next = reconcile(previous);
+            return [[previous, next] as const, next];
+          });
+          const resetAt = codexUsageLimitResetAt(next);
           for (const item of (yield* Ref.get(limitedTurnItems)).values()) {
             if (resetAt === null || item.failure.resetAt != null) continue;
             const updated = {
@@ -4477,7 +4483,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               turnItem: updated,
             });
           }
-          const update = codexRateLimitsToUpdate(rateLimits, previous);
+          const update =
+            next && next !== previous ? codexRateLimitsToUpdate(next, previous) : undefined;
           if (update && adapterOptions.onUsageLimits) {
             const checkedAt = DateTime.formatIso(yield* DateTime.now);
             yield* adapterOptions.onUsageLimits({ ...update, checkedAt });
@@ -4485,15 +4492,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         });
 
         yield* client.handleServerNotification("account/rateLimits/updated", (payload) =>
-          applyRateLimits(payload.rateLimits).pipe(Effect.orDie),
+          applyRateLimits((previous) => mergeCodexRateLimits(previous, payload.rateLimits)).pipe(
+            Effect.orDie,
+          ),
         );
 
         // A run's first request can 429 before Codex pushes a codex snapshot.
-        const readUsageLimitReset = client.request("account/rateLimits/read", null).pipe(
-          Effect.timeout("10 seconds"),
-          Effect.flatMap((response) =>
-            applyRateLimits(response.rateLimitsByLimitId?.codex ?? response.rateLimits),
-          ),
+        const readUsageLimitReset = Effect.gen(function* () {
+          const sent = yield* Ref.get(rateLimitSnapshot);
+          const response = yield* client
+            .request("account/rateLimits/read", null)
+            .pipe(Effect.timeout("10 seconds"));
+          const read = response.rateLimitsByLimitId?.codex ?? response.rateLimits;
+          yield* applyRateLimits((current) => reconcileCodexRateLimitsRead(sent, current, read));
+        }).pipe(
           Effect.catch((cause) =>
             Effect.logWarning("orchestration-v2.codex-usage-limit-reset-read-failed", { cause }),
           ),

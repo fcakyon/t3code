@@ -5442,6 +5442,44 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       expectedClass: "usage_limit",
     },
     {
+      name: "stale-read",
+      code: "usageLimitExceeded",
+      notification: false,
+      expectedClass: "usage_limit",
+      race: {
+        before: { primary: { usedPercent: 99, resetsAt: 2000000000 } },
+        during: { primary: { usedPercent: 50, resetsAt: 2000200000 } },
+        read: { primary: { usedPercent: 100, resetsAt: 2000000000 } },
+        resetAt: null,
+      },
+    },
+    {
+      name: "complete-read",
+      code: "usageLimitExceeded",
+      notification: false,
+      expectedClass: "usage_limit",
+      race: {
+        before: {
+          primary: { usedPercent: 100, resetsAt: 2000200000 },
+          secondary: { usedPercent: 100 },
+        },
+        read: { secondary: { usedPercent: 100, resetsAt: 2000100000 } },
+        resetAt: "2033-05-19T07:20:00.000Z",
+      },
+    },
+    {
+      name: "same-window-read",
+      code: "usageLimitExceeded",
+      notification: false,
+      expectedClass: "usage_limit",
+      race: {
+        before: { primary: { usedPercent: 99, resetsAt: 2000100000 } },
+        during: { primary: { usedPercent: 97, resetsAt: 2000100000 } },
+        read: { primary: { usedPercent: 100, resetsAt: 2000100000 } },
+        resetAt: "2033-05-19T07:20:00.000Z",
+      },
+    },
+    {
       name: "usage",
       code: "usageLimitExceeded",
       notification: false,
@@ -5514,6 +5552,14 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             },
           },
         };
+        const codexRateLimits = (rateLimits: object) => ({
+          type: "emit_inbound" as const,
+          label: "account/rateLimits/updated",
+          frame: {
+            method: "account/rateLimits/updated",
+            params: { rateLimits: { limitId: "codex", ...rateLimits } },
+          },
+        });
         const transcript = makeCodexReplayTranscript({
           scenario: `codex-limit-${scenario.name}`,
           entries: [
@@ -5531,6 +5577,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   },
                 ]
               : []),
+            ...("race" in scenario ? [codexRateLimits(scenario.race.before)] : []),
             ...(scenario.name === "deferred-reset" ? [snapshot] : []),
             ...(scenario.name === "deferred-reset"
               ? [
@@ -5637,6 +5684,27 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   },
                 ]
               : []),
+            ...("race" in scenario
+              ? [
+                  {
+                    type: "expect_outbound" as const,
+                    label: "account/rateLimits/read",
+                    frame: { id: 4, method: "account/rateLimits/read", params: null },
+                  },
+                  ...("during" in scenario.race ? [codexRateLimits(scenario.race.during)] : []),
+                  {
+                    type: "emit_inbound" as const,
+                    label: "account/rateLimits/read",
+                    frame: {
+                      id: 4,
+                      result: {
+                        rateLimits: { limitId: "premium", primary: null, secondary: null },
+                        rateLimitsByLimitId: { codex: { limitId: "codex", ...scenario.race.read } },
+                      },
+                    },
+                  },
+                ]
+              : []),
             ...(scenario.name === "first-request-read-failed" || scenario.name === "late-reset"
               ? [
                   {
@@ -5715,6 +5783,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           assert.equal(terminal.failure.resetAt, resetAt);
         if (scenario.name === "first-request-read-failed" || scenario.name === "late-reset")
           assert.isNull(terminal.failure.resetAt);
+        if ("race" in scenario) assert.equal(terminal.failure.resetAt, scenario.race.resetAt);
         if (scenario.name === "matching-details")
           assert.equal(terminal.failure.message, "Detailed provider allowance explanation.");
         if (scenario.name === "late-reset") {

@@ -186,6 +186,51 @@ export function mergeCodexRateLimits(
   };
 }
 
+/**
+ * A read is the whole snapshot as of its request, so fields it omits are gone. Fields a
+ * notification changed while it was pending are newer and stay.
+ */
+export function reconcileCodexRateLimitsRead(
+  sent: CodexRateLimitSnapshot | undefined,
+  current: CodexRateLimitSnapshot | undefined,
+  read: CodexRateLimitSnapshot,
+): CodexRateLimitSnapshot | undefined {
+  if (read.limitId && read.limitId !== "codex") return current;
+  if (!current || current === sent) return read;
+  const { limitId, planType, rateLimitReachedType, primary, secondary, individualLimit } = current;
+  return mergeCodexRateLimits(read, {
+    ...(limitId !== sent?.limitId && limitId !== undefined ? { limitId } : {}),
+    ...(planType !== sent?.planType && planType !== undefined ? { planType } : {}),
+    ...(rateLimitReachedType !== sent?.rateLimitReachedType && rateLimitReachedType !== undefined
+      ? { rateLimitReachedType }
+      : {}),
+    ...(primary !== sent?.primary && primary !== undefined
+      ? { primary: laterWindowReport(primary, read.primary) }
+      : {}),
+    ...(secondary !== sent?.secondary && secondary !== undefined
+      ? { secondary: laterWindowReport(secondary, read.secondary) }
+      : {}),
+    ...(individualLimit !== sent?.individualLimit && individualLimit !== undefined
+      ? { individualLimit }
+      : {}),
+  });
+}
+
+// Usage only grows within a window, so a lower report of the same reset is a late tick from a
+// concurrent stream.
+function laterWindowReport(
+  notified: CodexRateLimitWindow | null,
+  read: CodexRateLimitWindow | null | undefined,
+): CodexRateLimitWindow | null {
+  return notified &&
+    read &&
+    notified.resetsAt != null &&
+    notified.resetsAt === read.resetsAt &&
+    read.usedPercent > notified.usedPercent
+    ? read
+    : notified;
+}
+
 /** All exhausted windows must reset before a continuation can run. */
 export function codexUsageLimitResetAt(
   snapshot: CodexRateLimitSnapshot | undefined,
