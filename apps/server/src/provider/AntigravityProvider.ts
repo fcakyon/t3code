@@ -13,6 +13,7 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import * as FiberHandle from "effect/FiberHandle";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
@@ -495,19 +496,23 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
   ) {
     if (skills) {
       discoveredSkills.set(cwd, skills);
-      yield* SubscriptionRef.update(metadata, (state) =>
-        state.draft.workspaceSnapshots?.some((entry) => entry.cwd === cwd)
-          ? {
-              ...state,
-              draft: {
-                ...state.draft,
-                workspaceSnapshots: state.draft.workspaceSnapshots.map((entry) =>
-                  entry.cwd === cwd ? { ...entry, skills } : entry,
-                ),
-              },
-            }
-          : state,
-      );
+      const current = yield* SubscriptionRef.get(metadata);
+      const existing = current.draft.workspaceSnapshots?.find((entry) => entry.cwd === cwd);
+      if (existing && !Equal.equals(existing.skills, skills)) {
+        yield* SubscriptionRef.update(metadata, (state) =>
+          state.draft.workspaceSnapshots?.some((entry) => entry.cwd === cwd)
+            ? {
+                ...state,
+                draft: {
+                  ...state.draft,
+                  workspaceSnapshots: state.draft.workspaceSnapshots.map((entry) =>
+                    entry.cwd === cwd ? { ...entry, skills } : entry,
+                  ),
+                },
+              }
+            : state,
+        );
+      }
     }
     const snapshot = yield* getSnapshot;
     const workspace = snapshot.workspaceSnapshots?.find((entry) => entry.cwd === cwd);

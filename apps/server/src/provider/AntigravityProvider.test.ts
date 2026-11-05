@@ -649,8 +649,16 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
             enabled: true,
           },
         ];
+        const emissions = yield* Ref.make(0);
+        yield* harness.provider.snapshot.streamChanges.pipe(
+          Stream.runForEach(() => Ref.update(emissions, (count) => count + 1)),
+          Effect.forkScoped,
+        );
+        yield* Effect.yieldNow;
         const discovered = yield* harness.provider.snapshotForCwd("/workspace", skills);
         expect(discovered.skills).toEqual(skills);
+        yield* Effect.yieldNow;
+        expect(yield* Ref.get(emissions)).toBe(0);
         yield* harness.provider.onSessionStarted(started, "/workspace");
         yield* harness.provider.onAvailableCommands(commands, "/workspace");
         const after = yield* harness.provider.snapshot.getSnapshot;

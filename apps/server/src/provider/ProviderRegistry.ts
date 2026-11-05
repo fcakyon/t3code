@@ -276,6 +276,30 @@ const carrySavedAntigravityAccount = (
   return { auth: previousProvider.auth, status };
 };
 
+const mergeProviderWorkspaceSnapshots = (
+  previousProvider: ServerProvider,
+  nextProvider: ServerProvider,
+): ServerProvider["workspaceSnapshots"] => {
+  if (nextProvider.workspaceSnapshots === undefined) {
+    return previousProvider.workspaceSnapshots;
+  }
+  if (
+    !nextProvider.enabled ||
+    (!nextProvider.installed && nextProvider.status === "error") ||
+    nextProvider.auth.status === "unauthenticated"
+  ) {
+    return nextProvider.workspaceSnapshots;
+  }
+  if (!previousProvider.workspaceSnapshots?.length) {
+    return nextProvider.workspaceSnapshots;
+  }
+  const nextCwds = new Set(nextProvider.workspaceSnapshots.map((snapshot) => snapshot.cwd));
+  return [
+    ...previousProvider.workspaceSnapshots.filter((snapshot) => !nextCwds.has(snapshot.cwd)),
+    ...nextProvider.workspaceSnapshots,
+  ].slice(-MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER);
+};
+
 export const mergeProviderSnapshot = (
   previousProvider: ServerProvider | undefined,
   nextProvider: ServerProvider,
@@ -285,15 +309,12 @@ export const mergeProviderSnapshot = (
   }
   const savedAccount = carrySavedAntigravityAccount(previousProvider, nextProvider);
   const { message: _uncheckedMessage, ...nextWithoutMessage } = nextProvider;
+  const workspaceSnapshots = mergeProviderWorkspaceSnapshots(previousProvider, nextProvider);
   return {
     ...(savedAccount?.status === "ready" ? nextWithoutMessage : nextProvider),
     ...savedAccount,
     models: mergeProviderModels(nextProvider, previousProvider.models, nextProvider.models),
-    ...(nextProvider.workspaceSnapshots !== undefined
-      ? { workspaceSnapshots: nextProvider.workspaceSnapshots }
-      : previousProvider.workspaceSnapshots !== undefined
-        ? { workspaceSnapshots: previousProvider.workspaceSnapshots }
-        : {}),
+    ...(workspaceSnapshots !== undefined ? { workspaceSnapshots } : {}),
     ...(shouldRetainMissingOpenCodeMetadata(nextProvider)
       ? {
           slashCommands:

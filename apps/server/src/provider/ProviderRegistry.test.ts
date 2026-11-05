@@ -733,6 +733,22 @@ it.layer(
         failedRefresh.workspaceSnapshots?.[1]?.optionDescriptors,
         optionDescriptors,
       );
+
+      const retainedAcrossEmptyMachineUpdate = ProviderRegistry.mergeProviderSnapshot(result, {
+        ...provider,
+        workspaceSnapshots: [],
+      });
+      assert.deepStrictEqual(
+        retainedAcrossEmptyMachineUpdate.workspaceSnapshots,
+        result.workspaceSnapshots,
+      );
+      const clearedOnSignOut = ProviderRegistry.mergeProviderSnapshot(result, {
+        ...provider,
+        status: "warning",
+        auth: { status: "unauthenticated" },
+        workspaceSnapshots: [],
+      });
+      assert.deepStrictEqual(clearedOnSignOut.workspaceSnapshots, []);
     });
 
     it("preserves previously discovered provider models when a refresh returns none", () => {
