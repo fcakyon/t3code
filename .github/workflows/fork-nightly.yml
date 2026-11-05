@@ -3,7 +3,9 @@ name: Fork Nightly Release
 on:
   push:
     branches:
-      - main
+      - nightly
+  schedule:
+    - cron: "17 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -15,9 +17,80 @@ permissions:
   contents: write
 
 jobs:
+  sync_upstream:
+    name: Sync upstream/main -> main -> nightly
+    if: github.repository == 'fcakyon/t3code'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_build: ${{ steps.sync.outputs.should_build }}
+      ref: ${{ steps.sync.outputs.ref }}
+    steps:
+      - name: Sync main with upstream/main and merge into nightly
+        id: sync
+        shell: bash
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add upstream "https://github.com/pingdotgg/t3code.git"
+
+          git fetch --no-tags origin main nightly
+          git fetch --no-tags upstream main
+
+          # 1. Keep origin/main identical to upstream/main
+          git checkout -B main origin/main
+          if ! git merge --ff-only upstream/main; then
+            echo "::warning::origin/main could not fast-forward to upstream/main; resetting origin/main to upstream/main so main stays pure upstream."
+            git reset --hard upstream/main
+            git push --force-with-lease origin main
+          elif [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]]; then
+            git push origin main
+          fi
+
+          # 2. Check if nightly already has main merged
+          git checkout -B nightly origin/nightly
+          before_nightly="$(git rev-parse HEAD)"
+
+          if git merge-base --is-ancestor main nightly; then
+            echo "nightly already contains upstream/main (${before_nightly})."
+            if [[ "$GITHUB_EVENT_NAME" == "push" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+              echo "ref=${before_nightly}" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "ref=${before_nightly}" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          # 3. Auto-merge main into nightly
+          if git merge --no-edit main; then
+            after_nightly="$(git rev-parse HEAD)"
+            git push origin nightly
+            echo "Merged upstream/main into nightly: ${before_nightly} -> ${after_nightly}"
+            # Pushing via GITHUB_TOKEN does not trigger a duplicate workflow run,
+            # so build the newly merged commit directly in this run.
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "ref=${after_nightly}" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort || true
+            echo "::error::Merge conflict syncing upstream/main into nightly. T3 Code scheduled agent will resolve it."
+            exit 1
+          fi
+
   build_linux:
     name: Build JS bundle & Linux x64 CLI
-    if: github.repository == 'fcakyon/t3code'
+    needs: [sync_upstream]
+    if: github.repository == 'fcakyon/t3code' && needs.sync_upstream.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
@@ -25,12 +98,12 @@ jobs:
       tag: ${{ steps.release_meta.outputs.tag }}
       release_name: ${{ steps.release_meta.outputs.name }}
       short_sha: ${{ steps.release_meta.outputs.short_sha }}
-      ref: ${{ github.sha }}
+      ref: ${{ needs.sync_upstream.outputs.ref }}
     steps:
       - name: Checkout
         shell: bash
         env:
-          CHECKOUT_REF: ${{ github.sha }}
+          CHECKOUT_REF: ${{ needs.sync_upstream.outputs.ref }}
           GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
@@ -50,7 +123,7 @@ jobs:
         shell: bash
         env:
           NIGHTLY_DATE: ${{ github.run_started_at }}
-          NIGHTLY_SHA: ${{ github.sha }}
+          NIGHTLY_SHA: ${{ needs.sync_upstream.outputs.ref }}
           NIGHTLY_RUN_NUMBER: ${{ github.run_number }}
         run: |
           nightly_date="$(date -u -d "$NIGHTLY_DATE" +%Y%m%d)"
