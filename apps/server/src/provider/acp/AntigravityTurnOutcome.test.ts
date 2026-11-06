@@ -7,12 +7,20 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import type * as EffectAcpSchema from "effect-acp/compat";
 
-import { watchAntigravityPromptOutcome } from "./AntigravityTurnOutcome.ts";
+import {
+  cancelStaleAntigravityRunningSteps,
+  watchAntigravityPromptOutcome,
+} from "./AntigravityTurnOutcome.ts";
 
 const USER_INPUT = 14;
 const PLANNER_RESPONSE = 15;
 const TOOL = 8;
 const ERROR_MESSAGE = 17;
+const RUN_COMMAND = 21;
+const STATUS_RUNNING = 2;
+const STATUS_DONE = 3;
+const STATUS_CANCELED = 6;
+const STATUS_ERROR = 7;
 
 // Error-step payloads trimmed from Antigravity 1.4.5 against a local Gemini endpoint.
 const errorPayload = (error: string) =>
@@ -206,6 +214,68 @@ describe("watchAntigravityPromptOutcome", () => {
         code: "QUOTA_EXHAUSTED",
         retryable: true,
       });
+    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+  );
+});
+
+describe("cancelStaleAntigravityRunningSteps", () => {
+  it.effect("cancels orphaned running steps in this session's own log before reopen", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const profileDirectory = yield* fs.makeTempDirectoryScoped();
+      const conversations = path.join(profileDirectory, "antigravity-acp", "conversations");
+      yield* fs.makeDirectory(conversations, { recursive: true });
+      const own = "e6aba774-5472-4277-b6ee-27b2e05570a7";
+      const peer = "0d9c2b4e-1111-4222-8333-944455556666";
+      const writeStatuses = (sessionId: string, statuses: ReadonlyArray<number>) => {
+        const database = new NodeSqlite.DatabaseSync(path.join(conversations, `${sessionId}.db`));
+        try {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER)",
+          );
+          const insert = database.prepare(
+            "INSERT INTO steps (idx, step_type, status) VALUES (?, ?, ?)",
+          );
+          statuses.forEach((status, idx) => insert.run(idx, RUN_COMMAND, status));
+        } finally {
+          database.close();
+        }
+      };
+      const readStatuses = (sessionId: string) => {
+        const database = new NodeSqlite.DatabaseSync(path.join(conversations, `${sessionId}.db`), {
+          readOnly: true,
+        });
+        try {
+          return database
+            .prepare("SELECT status FROM steps ORDER BY idx ASC")
+            .all()
+            .map((row) => Number(row.status));
+        } finally {
+          database.close();
+        }
+      };
+
+      // Missing logs and symlinks to peer logs are untouched.
+      yield* cancelStaleAntigravityRunningSteps(profileDirectory, own);
+      writeStatuses(peer, [STATUS_RUNNING, STATUS_DONE]);
+      yield* fs.symlink(
+        path.join(conversations, `${peer}.db`),
+        path.join(conversations, `${own}.db`),
+      );
+      yield* cancelStaleAntigravityRunningSteps(profileDirectory, own);
+      assert.deepEqual(readStatuses(peer), [STATUS_RUNNING, STATUS_DONE]);
+
+      // Own log marks orphaned RUNNING (2) steps as CANCELED (6) and leaves other statuses intact.
+      yield* fs.remove(path.join(conversations, `${own}.db`));
+      writeStatuses(own, [STATUS_DONE, STATUS_RUNNING, STATUS_ERROR, STATUS_RUNNING]);
+      yield* cancelStaleAntigravityRunningSteps(profileDirectory, own);
+      assert.deepEqual(readStatuses(own), [
+        STATUS_DONE,
+        STATUS_CANCELED,
+        STATUS_ERROR,
+        STATUS_CANCELED,
+      ]);
     }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
   );
 });

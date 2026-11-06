@@ -33,7 +33,10 @@ import {
   describeAntigravitySubagentLaunches,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
-import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
+import {
+  cancelStaleAntigravityRunningSteps,
+  watchAntigravityPromptOutcome,
+} from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
   antigravitySubagentOutput,
@@ -89,7 +92,7 @@ export interface AntigravityAdapterV2Options {
   readonly onSessionEvent?: AcpAdapterV2Flavor["onSessionEvent"];
   readonly nativeLogging?: Parameters<typeof makeAcpAdapterV2>[0]["nativeLogging"];
   readonly continuationRequests?: Parameters<typeof makeAcpAdapterV2>[0]["continuationRequests"];
-  /** The agent's GEMINI_HOME. Its session logs show turns that ended on an upstream error. */
+  /** The agent's GEMINI_HOME. Its session logs record upstream turn errors and step status. */
   readonly profileDirectory?: string;
 }
 
@@ -155,6 +158,18 @@ export function makeAntigravityAcpAdapterFlavor(
       // Served reads are reported from the read handler, so they take turns with agent updates.
       const updates = yield* Semaphore.make(1);
       let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
+      const repairedSessions = new Set<string>();
+      const repairBeforeOpen = (sessionId: string | undefined) => {
+        if (
+          profileDirectory === undefined ||
+          sessionId === undefined ||
+          repairedSessions.has(sessionId)
+        ) {
+          return Effect.void;
+        }
+        repairedSessions.add(sessionId);
+        return cancelStaleAntigravityRunningSteps(profileDirectory, sessionId);
+      };
       return {
         ...runtime,
         handleReadTextFile: (handler) =>
@@ -186,14 +201,19 @@ export function makeAntigravityAcpAdapterFlavor(
             updates.withPermit(handler(reads.repair(notification))),
           );
         },
+        resumeSession: (sessionId, configOptions) =>
+          repairBeforeOpen(sessionId).pipe(
+            Effect.andThen(runtime.resumeSession(sessionId, configOptions)),
+          ),
+        loadSession: (sessionId, configOptions) =>
+          repairBeforeOpen(sessionId).pipe(
+            Effect.andThen(runtime.loadSession(sessionId, configOptions)),
+          ),
         start: () =>
-          runtime
-            .start()
-            .pipe(
-              Effect.tap(
-                (started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void,
-              ),
-            ),
+          repairBeforeOpen(input.resumeSessionId).pipe(
+            Effect.andThen(runtime.start()),
+            Effect.tap((started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void),
+          ),
       } satisfies typeof runtime;
     },
     Effect.provideService(SecureRandom.SecureRandom, options.random),

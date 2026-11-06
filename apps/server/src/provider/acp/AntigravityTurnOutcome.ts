@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off -- node:sqlite and lstat read the native session log.
+// @effect-diagnostics nodeBuiltinImport:off -- node:sqlite and lstat read and repair the native session log.
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
 import * as NodeSqlite from "node:sqlite";
@@ -15,6 +15,9 @@ import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityPro
 
 // CORTEX_STEP_TYPE_ERROR_MESSAGE in the native trajectory.
 const ERROR_STEP_TYPE = 17;
+// CORTEX_STEP_STATUS_RUNNING and CORTEX_STEP_STATUS_CANCELED in the native trajectory.
+const RUNNING_STEP_STATUS = 2;
+const CANCELED_STEP_STATUS = 6;
 // The harness error text leads the payload; a Go stack trace follows it.
 const MAX_ERROR_PAYLOAD_BYTES = 16_384;
 // The Go harness's rendering of a Google API error, as the agent's api_errors.py reads it.
@@ -53,23 +56,30 @@ class AntigravitySessionLogError extends Schema.TaggedError<AntigravitySessionLo
 
 const sessionLogError = (cause: unknown) => new AntigravitySessionLogError({ cause });
 
-const readSteps = <A>(file: string, read: (database: NodeSqlite.DatabaseSync) => A) =>
+const withSteps = <A>(
+  file: string,
+  options: NodeSqlite.DatabaseSyncOptions,
+  use: (database: NodeSqlite.DatabaseSync) => A,
+) =>
   Effect.try({
     try: () => {
-      const database = new NodeSqlite.DatabaseSync(file, { readOnly: true });
+      const database = new NodeSqlite.DatabaseSync(file, options);
       try {
         database.exec("PRAGMA busy_timeout = 100");
         const hasSteps =
           database
             .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'steps'")
             .get() !== undefined;
-        return hasSteps ? read(database) : undefined;
+        return hasSteps ? use(database) : undefined;
       } finally {
         database.close();
       }
     },
     catch: sessionLogError,
   });
+
+const readSteps = <A>(file: string, read: (database: NodeSqlite.DatabaseSync) => A) =>
+  withSteps(file, { readOnly: true }, read);
 
 const lastStepIndex = (database: NodeSqlite.DatabaseSync) => {
   const index = database.prepare("SELECT max(idx) AS idx FROM steps").get()?.idx;
@@ -143,6 +153,28 @@ function turnFailure(
 
 const conversationSegments = ["antigravity-acp", "conversations"];
 
+const resolveSessionDatabase = (profileDirectory: string, segments: ReadonlyArray<string>) =>
+  Effect.tryPromise({
+    try: async () => {
+      const root = await antigravityProfileRoot(profileDirectory);
+      if (root === undefined) return { kind: "absent" as const };
+      if ((await antigravityManagedPath(root, conversationSegments, "directory")) === undefined) {
+        return { kind: "absent" as const };
+      }
+      const database = await antigravityManagedPath(root, segments, "file");
+      // A path that exists but fails the proof is a link or other foreign entry.
+      if (database === undefined) {
+        const present = await NodeFSP.lstat(NodePath.join(root, ...segments)).then(
+          () => true,
+          () => false,
+        );
+        return present ? { kind: "foreign" as const } : { kind: "missing" as const, root };
+      }
+      return { kind: "file" as const, root, path: database.path, identity: database.info };
+    },
+    catch: sessionLogError,
+  }).pipe(Effect.orElseSucceed(() => ({ kind: "absent" as const })));
+
 /**
  * Antigravity reports an upstream API failure as a chat message and `end_turn`. Its
  * session log ends that turn with an error step, so the check reads only steps the
@@ -157,36 +189,18 @@ export const watchAntigravityPromptOutcome = Effect.fn("AntigravityTurnOutcome.w
     DateTime.now.pipe(Effect.map((now) => turnFailure(result.stopReason, undefined, now)));
   if (!NATIVE_SESSION_ID.test(sessionId)) return typedOnly;
   const segments = [...conversationSegments, `${sessionId}.db`];
-  const before = yield* Effect.tryPromise({
-    try: async () => {
-      const root = await antigravityProfileRoot(profileDirectory);
-      if (root === undefined) return undefined;
-      if ((await antigravityManagedPath(root, conversationSegments, "directory")) === undefined) {
-        return undefined;
-      }
-      const database = await antigravityManagedPath(root, segments, "file");
-      // A path that exists but fails the proof is a link or other foreign entry.
-      if (database === undefined) {
-        const present = await NodeFSP.lstat(NodePath.join(root, ...segments)).then(
-          () => true,
-          () => false,
-        );
-        return present ? undefined : { root, identity: undefined, startIndex: -1 };
-      }
-      return { root, identity: database.info, startIndex: undefined };
-    },
-    catch: sessionLogError,
-  }).pipe(Effect.orElseSucceed(() => undefined));
-  if (before === undefined) {
+  const resolved = yield* resolveSessionDatabase(profileDirectory, segments);
+  if (resolved.kind === "absent" || resolved.kind === "foreign") {
     yield* Effect.logWarning("The Antigravity session log is not this session's own file.");
     return typedOnly;
   }
   const startIndex =
-    before.startIndex ??
-    (yield* readSteps(NodePath.join(before.root, ...segments), lastStepIndex).pipe(
-      Effect.map((index) => index ?? -1),
-      Effect.orElseSucceed(() => undefined),
-    ));
+    resolved.kind === "missing"
+      ? -1
+      : yield* readSteps(resolved.path, lastStepIndex).pipe(
+          Effect.map((index) => index ?? -1),
+          Effect.orElseSucceed(() => undefined),
+        );
   if (startIndex === undefined) {
     yield* Effect.logWarning("Could not read the Antigravity session log before the prompt.");
     return typedOnly;
@@ -196,13 +210,13 @@ export const watchAntigravityPromptOutcome = Effect.fn("AntigravityTurnOutcome.w
   ) {
     // The same file as before the prompt, or one this prompt created, still unlinked.
     const after = yield* Effect.tryPromise({
-      try: () => antigravityManagedPath(before.root, segments, "file"),
+      try: () => antigravityManagedPath(resolved.root, segments, "file"),
       catch: sessionLogError,
     }).pipe(Effect.orElseSucceed(() => undefined));
     const sameFile =
       after !== undefined &&
-      (before.identity === undefined ||
-        (after.info.dev === before.identity.dev && after.info.ino === before.identity.ino));
+      (resolved.kind === "missing" ||
+        (after.info.dev === resolved.identity.dev && after.info.ino === resolved.identity.ino));
     const step = sameFile
       ? yield* readSteps(after.path, lastStepAfter(startIndex)).pipe(
           Effect.tapError(() =>
@@ -213,4 +227,31 @@ export const watchAntigravityPromptOutcome = Effect.fn("AntigravityTurnOutcome.w
       : undefined;
     return turnFailure(result.stopReason, step, yield* DateTime.now);
   });
+});
+
+/**
+ * Abrupt harness exits leave non-daemon background steps at `RUNNING (2)`, which makes
+ * reopened trajectories stop in `STATE_WAITING_FOR_TASKS` and hang `session/prompt`.
+ */
+export const cancelStaleAntigravityRunningSteps = Effect.fn(
+  "AntigravityTurnOutcome.cancelStaleRunningSteps",
+)(function* (profileDirectory: string, sessionId: string) {
+  if (!NATIVE_SESSION_ID.test(sessionId)) return;
+  const segments = [...conversationSegments, `${sessionId}.db`];
+  const resolved = yield* resolveSessionDatabase(profileDirectory, segments);
+  if (resolved.kind === "foreign") {
+    yield* Effect.logWarning("The Antigravity session log is not this session's own file.");
+    return;
+  }
+  if (resolved.kind !== "file") return;
+  yield* withSteps(resolved.path, {}, (database) => {
+    database
+      .prepare("UPDATE steps SET status = ? WHERE status = ?")
+      .run(CANCELED_STEP_STATUS, RUNNING_STEP_STATUS);
+  }).pipe(
+    Effect.tapError(() =>
+      Effect.logWarning("Could not clear stale running steps in the Antigravity session log."),
+    ),
+    Effect.ignore,
+  );
 });
