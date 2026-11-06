@@ -1,14 +1,14 @@
-# `fcakyon/t3code` Nightly Changelog
+# Nightly changelog
 
-Custom patches carried on the `nightly` branch on top of `upstream/main` (`pingdotgg/t3code`). Routine `upstream/main` sync/merge commits are omitted (`git log upstream/main..nightly --no-merges`).
+This branch tracks [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code) and adds the patches below.
 
-## Product & Provider Patches
+## Provider patches
 
-1. **Load Antigravity plugin skills** (`fe20210cf8`, `03c80e23e1`, `c4e03f9724`, `302badac71` — [PR #30476](https://github.com/pingdotgg/t3code/pull/30476)) — Discover installed Antigravity plugin skills from `~/.gemini/config/plugins` and stage them per session so `agy_acp_server.par` loads them alongside standalone skills without failing on malformed plugin manifests or preferences.
-2. **Preserve discovered workspace skills across provider snapshot merges** (`112366bcc5`) — Stop `AntigravityProvider.snapshotForCwd` and `ProviderRegistry.mergeProviderSnapshot` from overwriting discovered workspace skills with an empty `workspaceSnapshots` array during status/snapshot refreshes.
-3. **Cancel orphaned running steps before reopening Antigravity session logs** (`05953666b3`) — Mark stale `CORTEX_STEP_STATUS_RUNNING (2)` rows as `CANCELED (6)` in the session SQLite DB before `session/load` so interrupted background tasks or subagents do not trap resumed threads in `STATE_WAITING_FOR_TASKS` and hang `session/prompt`.
-4. **Stream Antigravity subagent tool calls, launch prompts, and completion reports** (`790abd1413`) — Assign each Antigravity subagent batch a deterministic `childSessionId`, hydrate auto-approved `invoke_subagent` launch prompts from the session SQLite DB while accounting for silent `PLANNER_RESPONSE` step offsets, route live child tool updates into the subagent thread, and emit child `agent_message` reports and completion status when subagents finish.
+1. Load installed Antigravity plugin skills from `~/.gemini/config/plugins` and stage them per session alongside standalone skills ([`fe20210cf8`](https://github.com/fcakyon/t3code/commit/fe20210cf8), [`03c80e23e1`](https://github.com/fcakyon/t3code/commit/03c80e23e1), [`c4e03f9724`](https://github.com/fcakyon/t3code/commit/c4e03f9724), [`302badac71`](https://github.com/fcakyon/t3code/commit/302badac71), [pingdotgg/t3code#30476](https://github.com/pingdotgg/t3code/pull/30476)).
+2. Keep discovered workspace skills when provider status snapshots refresh ([`112366bcc5`](https://github.com/fcakyon/t3code/commit/112366bcc5)).
+3. Cancel stale `RUNNING` steps in the session SQLite database before `session/load` so interrupted tasks or subagents do not hang resumed threads ([`05953666b3`](https://github.com/fcakyon/t3code/commit/05953666b3)).
+4. Stream Antigravity subagent tool calls, launch prompts, and completion reports into subagent threads ([`790abd1413`](https://github.com/fcakyon/t3code/commit/790abd1413)).
 
-## Fork Release Infrastructure
+## Release pipeline
 
-- **Fork nightly release & auto-update pipeline** (`aa3e7435e4`, `0d63edddb6`) — Auto-sync `upstream/main -> main -> nightly` hourly and build/publish multi-platform nightly desktop + CLI releases on `fcakyon/t3code` with in-app and CLI auto-updates pointed at the fork.
+- Sync `upstream/main` into `nightly` every hour and publish desktop and CLI nightly builds with fork auto-updates ([`aa3e7435e4`](https://github.com/fcakyon/t3code/commit/aa3e7435e4), [`0d63edddb6`](https://github.com/fcakyon/t3code/commit/0d63edddb6)).
