@@ -12,18 +12,34 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
+import type * as EffectAcpSchema from "effect-acp/compat";
 
 import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityProfilePaths.ts";
-import { boundAntigravityToolText, isCutAntigravityToolText } from "./AntigravityProtocol.ts";
+import {
+  boundAntigravityToolText,
+  isAntigravitySubagentToolUpdate,
+  isCutAntigravityToolText,
+  normalizeAntigravitySessionUpdate,
+} from "./AntigravityProtocol.ts";
 
 // Field numbers from the runtime's trajectory protos (exa.cortex_pb).
 const STEP_METADATA = 5;
 const METADATA_TOOL_CALL = 4;
 const STEP_PLANNER_RESPONSE = 20;
+const PLANNER_TEXT = 1;
+const PLANNER_THINKING = 3;
 const PLANNER_TOOL_CALLS = 7;
+const STEP_SYSTEM_MESSAGE = 114;
+const SYSTEM_MESSAGE_KIND = 3;
+const SYSTEM_MESSAGE_AGENT_REPORT = 4;
+const AGENT_REPORT_RECIPIENT_SESSION_ID = 2;
+const AGENT_REPORT_SENDER_CONVERSATION_ID = 3;
+const AGENT_REPORT_TEXT = 4;
 const STEP_INVOKE_SUBAGENT = 143;
 const INVOKE_SPECS = 9;
 const INVOKE_RESULTS = 10;
+const PLANNER_RESPONSE_STEP_TYPE = 15;
+const SYSTEM_MESSAGE_STEP_TYPE = 101;
 const INVOKE_SUBAGENT_STEP_TYPE = 127;
 
 // One open reads at most this much; past any bound the batch view stays as it was.
@@ -39,9 +55,30 @@ const TOOL_INPUT_CAP = 1_000;
 /** T3's title for a batch whose launch text it never saw. */
 export const ANTIGRAVITY_SUBAGENT_BATCH_TITLE = "Antigravity subagent batch";
 
-interface AntigravityChildLaunch {
+export const antigravitySubagentChildSessionId = (nativeTaskId: string) =>
+  `antigravity-task:${nativeTaskId}`;
+
+export interface AntigravityChildLaunch {
   readonly role: string;
   readonly prompt: string;
+}
+
+export interface AntigravitySubagentBatchState {
+  readonly stepUpdateIndex: number;
+  readonly toolCallId: string | undefined;
+  readonly launches: ReadonlyArray<AntigravityChildLaunch>;
+  readonly children: ReadonlyArray<{ readonly conversationId: string; readonly role: string }>;
+}
+
+export interface AntigravitySubagentReportState {
+  readonly stepIndex: number;
+  readonly conversationId: string;
+  readonly text: string;
+}
+
+export interface AntigravitySessionSubagentState {
+  readonly batches: ReadonlyArray<AntigravitySubagentBatchState>;
+  readonly reports: ReadonlyArray<AntigravitySubagentReportState>;
 }
 
 const decodeLaunchInput = Schema.decodeUnknownOption(
@@ -154,14 +191,78 @@ const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => {
   };
 });
 
-const plannerInvokeCallIds = safely((payload): ReadonlyArray<string> => {
-  const planner = message(payload, STEP_PLANNER_RESPONSE);
-  if (planner === undefined) return [];
-  return messages(planner, PLANNER_TOOL_CALLS).flatMap((call) => {
-    const id = text(call, 1);
-    return text(call, 2) === "invoke_subagent" && id !== undefined ? [id] : [];
-  });
-});
+const decodePlannerStep = safely(
+  (
+    payload,
+  ): {
+    readonly isSilent: boolean;
+    readonly invokeCallIds: ReadonlyArray<string>;
+  } => {
+    const planner = message(payload, STEP_PLANNER_RESPONSE);
+    if (planner === undefined) return { isSilent: false, invokeCallIds: [] };
+    let hasText = false;
+    let hasThinking = false;
+    const invokeCallIds: Array<string> = [];
+    for (const [field, value] of protoFields(planner)) {
+      if (field === PLANNER_TEXT && value.length > 0) {
+        hasText = true;
+      } else if (field === PLANNER_THINKING && value.length > 0) {
+        hasThinking = true;
+      } else if (field === PLANNER_TOOL_CALLS) {
+        let id: string | undefined;
+        let name: string | undefined;
+        for (const [callField, callValue] of protoFields(value)) {
+          if (callField === 1 && id === undefined) id = textDecoder.decode(callValue);
+          else if (callField === 2 && name === undefined) name = textDecoder.decode(callValue);
+        }
+        if (name === "invoke_subagent" && id !== undefined) {
+          invokeCallIds.push(id);
+        }
+      }
+    }
+    return {
+      isSilent: !hasText && !hasThinking,
+      invokeCallIds,
+    };
+  },
+);
+
+const decodeAgentReport = safely(
+  (
+    payload,
+  ):
+    | {
+        readonly recipientSessionId: string | undefined;
+        readonly conversationId: string;
+        readonly text: string;
+      }
+    | undefined => {
+    const systemMessage = message(payload, STEP_SYSTEM_MESSAGE);
+    if (
+      systemMessage === undefined ||
+      text(systemMessage, SYSTEM_MESSAGE_KIND) !== "agent_message"
+    ) {
+      return undefined;
+    }
+    const report = message(systemMessage, SYSTEM_MESSAGE_AGENT_REPORT);
+    if (report === undefined) return undefined;
+    const conversationId = text(report, AGENT_REPORT_SENDER_CONVERSATION_ID);
+    const reportText = text(report, AGENT_REPORT_TEXT);
+    if (
+      conversationId === undefined ||
+      !NATIVE_ID.test(conversationId) ||
+      reportText === undefined ||
+      reportText.trim() === ""
+    ) {
+      return undefined;
+    }
+    return {
+      recipientSessionId: text(report, AGENT_REPORT_RECIPIENT_SESSION_ID),
+      conversationId,
+      text: reportText,
+    };
+  },
+);
 
 const payloadOf = (row: unknown) =>
   row !== null &&
@@ -176,21 +277,107 @@ interface BatchLaunch {
   readonly prompt: string;
 }
 
-const plannerCallIdsAt = (database: NodeSqlite.DatabaseSync, plannerIdx: number) => {
-  const planner = payloadOf(
-    database
-      .prepare(
-        "SELECT step_payload FROM steps WHERE idx = ? AND step_format = 0 AND length(step_payload) <= ?",
-      )
-      .get(plannerIdx, MAX_STEP_BYTES),
+const matchesAntigravitySubagentLaunchDescription = (
+  expected: BatchLaunch,
+  launches: ReadonlyArray<AntigravityChildLaunch>,
+): boolean => {
+  if (launches.length === 0) return false;
+  const full = describeAntigravitySubagentLaunches(launches);
+  if (full.title === expected.title && full.prompt === expected.prompt) {
+    return true;
+  }
+  const bounded = describeAntigravitySubagentLaunches(
+    launches.map((launch) => ({
+      role: boundAntigravityToolText(launch.role),
+      prompt: boundAntigravityToolText(launch.prompt),
+    })),
   );
-  return planner === undefined ? undefined : plannerInvokeCallIds(planner);
+  return bounded.title === expected.title && bounded.prompt === expected.prompt;
+};
+
+interface IndexedInvokeRecord {
+  readonly idx: number;
+  readonly stepUpdateIndex: number;
+  readonly record: InvokeRecord | undefined;
+  readonly plannerCallIds: ReadonlyArray<string> | undefined;
+}
+
+/**
+ * Scans `PLANNER_RESPONSE` and `INVOKE_SUBAGENT` steps in order so each invoke record carries
+ * the `StepUpdate.step_index` (`idx - silentPlannerSteps`) that `localharness_external` emits
+ * in `<sessionId>:<stepUpdateIndex>` tool call ids.
+ */
+function readIndexedInvokeRecords(
+  database: NodeSqlite.DatabaseSync,
+): ReadonlyArray<IndexedInvokeRecord> | undefined {
+  let invokeRows = 0;
+  let invokeBytes = 0;
+  let silentPlannerSteps = 0;
+  let lastPlannerCallIds: ReadonlyArray<string> | undefined;
+  const records: Array<IndexedInvokeRecord> = [];
+
+  for (const row of database
+    .prepare(
+      "SELECT idx, step_type, length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_type IN (?, ?) AND step_format = 0 ORDER BY idx",
+    )
+    .iterate(MAX_STEP_BYTES, PLANNER_RESPONSE_STEP_TYPE, INVOKE_SUBAGENT_STEP_TYPE)) {
+    const stepType =
+      row !== null && typeof row === "object" && "step_type" in row ? Number(row.step_type) : 0;
+    const idx = row !== null && typeof row === "object" && "idx" in row ? Number(row.idx) : 0;
+    const size = row !== null && typeof row === "object" && "size" in row ? Number(row.size) : 0;
+    const payload = payloadOf(row);
+
+    if (stepType === PLANNER_RESPONSE_STEP_TYPE) {
+      if (payload === undefined || size > MAX_STEP_BYTES) {
+        lastPlannerCallIds = undefined;
+        continue;
+      }
+      const planner = decodePlannerStep(payload);
+      if (planner === undefined) {
+        lastPlannerCallIds = undefined;
+        continue;
+      }
+      if (planner.isSilent) {
+        silentPlannerSteps += 1;
+      }
+      lastPlannerCallIds = planner.invokeCallIds;
+      continue;
+    }
+
+    if (stepType === INVOKE_SUBAGENT_STEP_TYPE) {
+      invokeRows += 1;
+      invokeBytes += size;
+      if (invokeRows > MAX_INVOKE_ROWS || size > MAX_STEP_BYTES || invokeBytes > MAX_SCAN_BYTES) {
+        return undefined;
+      }
+      const record = payload === undefined ? undefined : decodeInvokeRecord(payload);
+      records.push({
+        idx,
+        stepUpdateIndex: idx - silentPlannerSteps,
+        record,
+        plannerCallIds: lastPlannerCallIds,
+      });
+    }
+  }
+
+  return records;
+}
+
+const provenAutoApprovedRecord = (
+  entries: ReadonlyArray<IndexedInvokeRecord>,
+  stepUpdateIndex: number,
+): InvokeRecord | undefined => {
+  const entry = entries.find((candidate) => candidate.stepUpdateIndex === stepUpdateIndex);
+  if (entry?.record === undefined || entry.plannerCallIds?.length !== 1) return undefined;
+  const [callId] = entry.plannerCallIds;
+  return callId !== undefined && entry.record.toolCallId === callId ? entry.record : undefined;
 };
 
 /**
- * Auto-approved calls carry `<sessionId>:<plannerStep>`; the record with that planner call's id
- * is the proof. Permission prompts carry a random id, so the launch text must match one record
- * no auto-approved sibling claims, and no sibling may share the text.
+ * Auto-approved calls carry `<sessionId>:<stepUpdateIndex>`; the record at that step update
+ * index with the preceding planner call's id is the proof. Permission prompts carry a random id,
+ * so the launch text must match one record no auto-approved sibling claims, and no sibling may
+ * share the text.
  */
 function findInvokeRecord(
   database: NodeSqlite.DatabaseSync,
@@ -208,28 +395,10 @@ function findInvokeRecord(
   const plannerIdx = plannerIdxOf(input.nativeTaskId);
   if (plannerIdx !== undefined) {
     if (plannerIdx < 0) return undefined;
-    const callIds = plannerCallIdsAt(database, plannerIdx) ?? [];
-    const [callId] = callIds;
-    if (callIds.length !== 1) return undefined;
-    // The record follows the planner step that issued the call.
-    let rows = 0;
-    let bytes = 0;
-    for (const row of database
-      .prepare(
-        // SQLite returns only in-bound payloads, so an oversized row never reaches this process.
-        "SELECT length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_type = ? AND step_format = 0 AND idx > ? ORDER BY idx",
-      )
-      .iterate(MAX_STEP_BYTES, INVOKE_SUBAGENT_STEP_TYPE, plannerIdx)) {
-      const size = row !== null && typeof row === "object" && "size" in row ? Number(row.size) : 0;
-      rows += 1;
-      bytes += size;
-      if (rows > MAX_INVOKE_ROWS || size > MAX_STEP_BYTES || bytes > MAX_SCAN_BYTES)
-        return undefined;
-      const payload = payloadOf(row);
-      const record = payload === undefined ? undefined : decodeInvokeRecord(payload);
-      if (record !== undefined && record.toolCallId === callId) return complete(record);
-    }
-    return undefined;
+    const entries = readIndexedInvokeRecords(database);
+    if (entries === undefined) return undefined;
+    const record = provenAutoApprovedRecord(entries, plannerIdx);
+    return record === undefined ? undefined : complete(record);
   }
   const totals = database
     .prepare(
@@ -249,6 +418,8 @@ function findInvokeRecord(
   ) {
     return undefined;
   }
+  const entries = readIndexedInvokeRecords(database);
+  if (entries === undefined) return undefined;
   const claimed = new Set<string>();
   for (const sibling of input.siblings) {
     const idx = plannerIdxOf(sibling.nativeTaskId);
@@ -265,27 +436,16 @@ function findInvokeRecord(
       continue;
     }
     if (idx < 0) continue;
-    const callIds = plannerCallIdsAt(database, idx);
-    if (callIds === undefined || callIds.length === 0) return undefined;
-    for (const callId of callIds) claimed.add(callId);
+    const claimedRecord = provenAutoApprovedRecord(entries, idx);
+    if (claimedRecord?.toolCallId === undefined) return undefined;
+    claimed.add(claimedRecord.toolCallId);
   }
   const matches: Array<InvokeRecord> = [];
-  for (const row of database
-    .prepare("SELECT step_payload FROM steps WHERE step_type = ? ORDER BY idx")
-    .iterate(INVOKE_SUBAGENT_STEP_TYPE)) {
-    const payload = payloadOf(row);
-    const record = payload === undefined ? undefined : decodeInvokeRecord(payload);
+  for (const { record } of entries) {
     // An unreadable record could be an identical launch, so uniqueness is unproven.
     if (record === undefined) return undefined;
     if (record.toolCallId !== undefined && claimed.has(record.toolCallId)) continue;
-    // T3 stored the launch from the bounded tool payload, so bound the record the same way.
-    const described = describeAntigravitySubagentLaunches(
-      record.launches.map((launch) => ({
-        role: boundAntigravityToolText(launch.role),
-        prompt: boundAntigravityToolText(launch.prompt),
-      })),
-    );
-    if (sameText(described)) {
+    if (matchesAntigravitySubagentLaunchDescription(input.launch, record.launches)) {
       matches.push(record);
     }
   }
@@ -408,6 +568,22 @@ async function readChildTranscript(
   }
 }
 
+async function resolveSessionDatabase(
+  profileDirectory: string,
+  rootSessionId: string,
+): Promise<{ readonly profileRoot: string; readonly databasePath: string } | undefined> {
+  const profileRoot = await antigravityProfileRoot(profileDirectory);
+  if (profileRoot === undefined) return undefined;
+  const databasePath = (
+    await antigravityManagedPath(
+      profileRoot,
+      ["antigravity-acp", "conversations", `${rootSessionId}.db`],
+      "file",
+    )
+  )?.path;
+  return databasePath === undefined ? undefined : { profileRoot, databasePath };
+}
+
 class AntigravityChildWorkReadError extends Schema.TaggedError<AntigravityChildWorkReadError>()(
   "AntigravityChildWorkReadError",
   { cause: Schema.Defect() },
@@ -429,19 +605,9 @@ export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(fu
   if (!NATIVE_ID.test(input.rootSessionId)) return [];
   return yield* Effect.tryPromise({
     try: async (): Promise<ReadonlyArray<OrchestrationV2NativeChildWork>> => {
-      const profileRoot = await antigravityProfileRoot(input.profileDirectory);
-      const databasePath =
-        profileRoot === undefined
-          ? undefined
-          : (
-              await antigravityManagedPath(
-                profileRoot,
-                ["antigravity-acp", "conversations", `${input.rootSessionId}.db`],
-                "file",
-              )
-            )?.path;
-      if (profileRoot === undefined || databasePath === undefined) return [];
-      const database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
+      const resolved = await resolveSessionDatabase(input.profileDirectory, input.rootSessionId);
+      if (resolved === undefined) return [];
+      const database = new NodeSqlite.DatabaseSync(resolved.databasePath, { readOnly: true });
       let record: InvokeRecord | undefined;
       try {
         record = findInvokeRecord(database, input);
@@ -458,7 +624,7 @@ export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(fu
       return Promise.all(
         children.map(async (child, index) => {
           const transcript = await readChildTranscript(
-            profileRoot,
+            resolved.profileRoot,
             child,
             launches[index]?.prompt ?? "",
             byteCap,
@@ -476,3 +642,391 @@ export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(fu
     catch: (cause) => new AntigravityChildWorkReadError({ cause }),
   });
 });
+
+/**
+ * Reads subagent batch records and child `agent_message` reports from the parent's session
+ * database so live child tool calls and completion reports route to the subagent thread.
+ */
+export const readAntigravitySessionSubagentState = Effect.fn("readAntigravitySessionSubagentState")(
+  function* (input: {
+    readonly profileDirectory: string;
+    readonly rootSessionId: string;
+    readonly includeBatches?: boolean;
+    readonly includeReports?: boolean;
+    readonly afterReportStepIndex?: number;
+  }) {
+    if (!NATIVE_ID.test(input.rootSessionId)) return undefined;
+    return yield* Effect.tryPromise({
+      try: async (): Promise<AntigravitySessionSubagentState | undefined> => {
+        const resolved = await resolveSessionDatabase(input.profileDirectory, input.rootSessionId);
+        if (resolved === undefined) return undefined;
+        const database = new NodeSqlite.DatabaseSync(resolved.databasePath, { readOnly: true });
+        try {
+          database.exec("PRAGMA busy_timeout = 100");
+          const batches: Array<AntigravitySubagentBatchState> = [];
+          if (input.includeBatches !== false) {
+            const entries = readIndexedInvokeRecords(database);
+            if (entries === undefined) return undefined;
+            for (const entry of entries) {
+              const record = entry.record === undefined ? undefined : complete(entry.record);
+              if (record === undefined) continue;
+              batches.push({
+                stepUpdateIndex: entry.stepUpdateIndex,
+                toolCallId: record.toolCallId,
+                launches: record.launches,
+                children: record.children.map((child, index) => ({
+                  conversationId: child.conversationId,
+                  role: record.launches[index]?.role ?? "",
+                })),
+              });
+            }
+          }
+          const reports: Array<AntigravitySubagentReportState> = [];
+          if (input.includeReports !== false) {
+            let reportRows = 0;
+            let reportBytes = 0;
+            for (const row of database
+              .prepare(
+                "SELECT idx, length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_type = ? AND step_format = 0 AND idx > ? ORDER BY idx",
+              )
+              .iterate(
+                MAX_STEP_BYTES,
+                SYSTEM_MESSAGE_STEP_TYPE,
+                input.afterReportStepIndex ?? -1,
+              )) {
+              const idx =
+                row !== null && typeof row === "object" && "idx" in row ? Number(row.idx) : 0;
+              const size =
+                row !== null && typeof row === "object" && "size" in row ? Number(row.size) : 0;
+              reportRows += 1;
+              reportBytes += size;
+              if (reportRows > MAX_INVOKE_ROWS * MAX_CHILDREN || reportBytes > MAX_SCAN_BYTES) {
+                break;
+              }
+              const payload = payloadOf(row);
+              if (payload === undefined) continue;
+              const report = decodeAgentReport(payload);
+              if (report === undefined) continue;
+              if (
+                report.recipientSessionId !== undefined &&
+                report.recipientSessionId !== input.rootSessionId
+              ) {
+                continue;
+              }
+              reports.push({
+                stepIndex: idx,
+                conversationId: report.conversationId,
+                text: report.text,
+              });
+            }
+          }
+          return { batches, reports };
+        } finally {
+          database.close();
+        }
+      },
+      catch: (cause) => new AntigravityChildWorkReadError({ cause }),
+    });
+  },
+);
+
+interface TrackedSubagentBatch {
+  readonly rootSessionId: string;
+  readonly nativeTaskId: string;
+  readonly childSessionId: string;
+  launches: ReadonlyArray<AntigravityChildLaunch>;
+  children: ReadonlyArray<{ readonly conversationId: string; readonly role: string }>;
+  matchedDbStepUpdateIndex: number | undefined;
+  completed: boolean;
+}
+
+/**
+ * Tracks active Antigravity subagent batches for a runtime instance, routing child tool updates
+ * to their subagent session and emitting child `agent_message` reports + batch completion updates.
+ */
+export function makeAntigravitySubagentTracker(profileDirectory: string | undefined) {
+  const trackedBatches = new Map<string, TrackedSubagentBatch>();
+  const childConversationToBatch = new Map<string, TrackedSubagentBatch>();
+  const emittedReportKeys = new Set<string>();
+  const reportsByConversationId = new Map<string, string>();
+  const lastReportStepIndexBySession = new Map<string, number>();
+  const pendingSyntheticNotifications: Array<EffectAcpSchema.SessionNotification> = [];
+  let lastChunkSyncAt = 0;
+
+  const ensureTrackedBatch = (rootSessionId: string, nativeTaskId: string) => {
+    let batch = trackedBatches.get(nativeTaskId);
+    if (batch === undefined) {
+      batch = {
+        rootSessionId,
+        nativeTaskId,
+        childSessionId: antigravitySubagentChildSessionId(nativeTaskId),
+        launches: [],
+        children: [],
+        matchedDbStepUpdateIndex: undefined,
+        completed: false,
+      };
+      trackedBatches.set(nativeTaskId, batch);
+    }
+    return batch;
+  };
+
+  const bindDbBatch = (batch: TrackedSubagentBatch, dbBatch: AntigravitySubagentBatchState) => {
+    batch.matchedDbStepUpdateIndex = dbBatch.stepUpdateIndex;
+    if (batch.launches.length === 0 && dbBatch.launches.length > 0) {
+      batch.launches = dbBatch.launches;
+    }
+    if (dbBatch.children.length > 0) {
+      batch.children = dbBatch.children;
+      for (const child of dbBatch.children) {
+        childConversationToBatch.set(child.conversationId, batch);
+      }
+    }
+  };
+
+  const syncSubagentsFromDb = (
+    rootSessionId: string,
+    options: { readonly includeBatches: boolean; readonly includeReports: boolean },
+  ) => {
+    if (profileDirectory === undefined) return Effect.void;
+    const afterReportStepIndex = lastReportStepIndexBySession.get(rootSessionId) ?? -1;
+    return readAntigravitySessionSubagentState({
+      profileDirectory,
+      rootSessionId,
+      includeBatches: options.includeBatches,
+      includeReports: options.includeReports,
+      afterReportStepIndex,
+    }).pipe(
+      Effect.orElseSucceed(() => undefined),
+      Effect.tap((state) =>
+        Effect.sync(() => {
+          if (state === undefined) return;
+          if (options.includeBatches) {
+            const sessionBatches = [...trackedBatches.values()].filter(
+              (candidate) => candidate.rootSessionId === rootSessionId,
+            );
+            const claimedStepIndices = new Set<number>();
+            for (const candidate of sessionBatches) {
+              if (candidate.matchedDbStepUpdateIndex !== undefined) {
+                claimedStepIndices.add(candidate.matchedDbStepUpdateIndex);
+              }
+            }
+
+            for (const dbBatch of state.batches) {
+              const autoTaskId = `${rootSessionId}:${dbBatch.stepUpdateIndex}`;
+              const byAutoId = trackedBatches.get(autoTaskId);
+              if (byAutoId !== undefined) {
+                claimedStepIndices.add(dbBatch.stepUpdateIndex);
+                bindDbBatch(byAutoId, dbBatch);
+                continue;
+              }
+              const byToolCallId =
+                dbBatch.toolCallId === undefined
+                  ? undefined
+                  : trackedBatches.get(dbBatch.toolCallId);
+              if (byToolCallId !== undefined) {
+                claimedStepIndices.add(dbBatch.stepUpdateIndex);
+                bindDbBatch(byToolCallId, dbBatch);
+                continue;
+              }
+              if (claimedStepIndices.has(dbBatch.stepUpdateIndex)) continue;
+              const byLaunch = sessionBatches.find(
+                (candidate) =>
+                  candidate.matchedDbStepUpdateIndex === undefined &&
+                  candidate.launches.length > 0 &&
+                  matchesAntigravitySubagentLaunchDescription(
+                    describeAntigravitySubagentLaunches(candidate.launches),
+                    dbBatch.launches,
+                  ),
+              );
+              if (byLaunch !== undefined) {
+                claimedStepIndices.add(dbBatch.stepUpdateIndex);
+                bindDbBatch(byLaunch, dbBatch);
+                continue;
+              }
+              const hasUnmatchedPermissionBatch = sessionBatches.some(
+                (candidate) =>
+                  candidate.matchedDbStepUpdateIndex === undefined &&
+                  !candidate.nativeTaskId.startsWith(`${rootSessionId}:`),
+              );
+              if (!hasUnmatchedPermissionBatch) {
+                const inferred = ensureTrackedBatch(rootSessionId, autoTaskId);
+                claimedStepIndices.add(dbBatch.stepUpdateIndex);
+                bindDbBatch(inferred, dbBatch);
+              }
+            }
+          }
+
+          if (!options.includeReports) return;
+
+          let maxReportStepIndex = afterReportStepIndex;
+          for (const report of state.reports) {
+            if (report.stepIndex > maxReportStepIndex) {
+              maxReportStepIndex = report.stepIndex;
+            }
+            const batch = childConversationToBatch.get(report.conversationId);
+            if (batch === undefined || batch.completed) continue;
+            reportsByConversationId.set(report.conversationId, report.text);
+            const reportKey = `${report.conversationId}:${report.stepIndex}`;
+            if (emittedReportKeys.has(reportKey)) continue;
+            emittedReportKeys.add(reportKey);
+            const role = batch.children.find(
+              (child) => child.conversationId === report.conversationId,
+            )?.role;
+            const text =
+              batch.children.length > 1 && role ? `### ${role}\n\n${report.text}` : report.text;
+            pendingSyntheticNotifications.push({
+              sessionId: batch.childSessionId,
+              update: {
+                sessionUpdate: "agent_message",
+                messageId: `antigravity-subagent-report:${reportKey}`,
+                content: [{ type: "text", text }],
+              },
+            });
+          }
+          if (maxReportStepIndex > afterReportStepIndex) {
+            lastReportStepIndexBySession.set(rootSessionId, maxReportStepIndex);
+          }
+
+          for (const batch of trackedBatches.values()) {
+            if (
+              batch.rootSessionId !== rootSessionId ||
+              batch.completed ||
+              batch.children.length === 0 ||
+              !batch.children.every((child) => reportsByConversationId.has(child.conversationId))
+            ) {
+              continue;
+            }
+            batch.completed = true;
+            const combinedReport =
+              batch.children.length === 1
+                ? (reportsByConversationId.get(batch.children[0]!.conversationId) ?? "")
+                : batch.children
+                    .map((child) => {
+                      const text = reportsByConversationId.get(child.conversationId) ?? "";
+                      return child.role ? `### ${child.role}\n\n${text}` : text;
+                    })
+                    .join("\n\n");
+            for (const child of batch.children) {
+              reportsByConversationId.delete(child.conversationId);
+            }
+            pendingSyntheticNotifications.push(
+              normalizeAntigravitySessionUpdate({
+                sessionId: batch.rootSessionId,
+                update: {
+                  sessionUpdate: "tool_call_update",
+                  toolCallId: batch.nativeTaskId,
+                  title: "Running invoke_subagent",
+                  kind: "other",
+                  status: "completed",
+                  ...(batch.launches.length > 0
+                    ? {
+                        rawInput: {
+                          Subagents: batch.launches.map((launch) => ({
+                            Role: launch.role,
+                            Prompt: launch.prompt,
+                          })),
+                        },
+                      }
+                    : {}),
+                  rawOutput: combinedReport,
+                  _meta: { antigravitySubagentCompleted: true },
+                },
+              }),
+            );
+          }
+        }),
+      ),
+      Effect.asVoid,
+    );
+  };
+
+  return {
+    rewriteAndDrain: Effect.fn("AntigravitySubagentTracker.rewriteAndDrain")(function* (
+      rawNotification: EffectAcpSchema.SessionNotification,
+    ) {
+      let notification = rawNotification;
+      const rootSessionId = notification.sessionId;
+      const update = notification.update;
+      let isSubagentLaunchOrUpdate = false;
+      let isChildToolUpdate = false;
+
+      if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+        if (isAntigravitySubagentToolUpdate(update) || trackedBatches.has(update.toolCallId)) {
+          isSubagentLaunchOrUpdate = true;
+          const batch = ensureTrackedBatch(rootSessionId, update.toolCallId);
+          const inputLaunches = antigravitySubagentLaunches(update.rawInput);
+          if (inputLaunches !== undefined && inputLaunches.length > 0) {
+            batch.launches = inputLaunches;
+          }
+          if (
+            batch.matchedDbStepUpdateIndex === undefined ||
+            batch.children.length === 0 ||
+            batch.launches.length === 0
+          ) {
+            yield* syncSubagentsFromDb(rootSessionId, {
+              includeBatches: true,
+              includeReports: false,
+            });
+          }
+          if (batch.launches.length > 0 && inputLaunches === undefined) {
+            notification = normalizeAntigravitySessionUpdate({
+              ...notification,
+              update: {
+                ...update,
+                rawInput: {
+                  Subagents: batch.launches.map((launch) => ({
+                    Role: launch.role,
+                    Prompt: launch.prompt,
+                  })),
+                },
+              },
+            });
+          }
+        } else {
+          const childPrefix = /^([A-Za-z0-9-]+):\d+$/.exec(update.toolCallId)?.[1];
+          if (childPrefix !== undefined && childPrefix !== rootSessionId) {
+            if (!childConversationToBatch.has(childPrefix)) {
+              yield* syncSubagentsFromDb(rootSessionId, {
+                includeBatches: true,
+                includeReports: false,
+              });
+            }
+            const childBatch = childConversationToBatch.get(childPrefix);
+            if (childBatch !== undefined) {
+              isChildToolUpdate = true;
+              notification = {
+                ...notification,
+                sessionId: childBatch.childSessionId,
+              };
+            }
+          }
+        }
+      }
+
+      const activeBatches = [...trackedBatches.values()].filter(
+        (batch) => batch.rootSessionId === rootSessionId && !batch.completed,
+      );
+      if (activeBatches.length > 0 && !isSubagentLaunchOrUpdate && !isChildToolUpdate) {
+        const isToolUpdate =
+          update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update";
+        const now = Date.now();
+        if (isToolUpdate || now - lastChunkSyncAt >= 200) {
+          lastChunkSyncAt = now;
+          const needsBatchLookup = activeBatches.some(
+            (batch) => batch.matchedDbStepUpdateIndex === undefined || batch.children.length === 0,
+          );
+          yield* syncSubagentsFromDb(rootSessionId, {
+            includeBatches: needsBatchLookup,
+            includeReports: true,
+          });
+        }
+      }
+
+      const synthetic = pendingSyntheticNotifications.splice(
+        0,
+        pendingSyntheticNotifications.length,
+      );
+      return isSubagentLaunchOrUpdate ? [notification, ...synthetic] : [...synthetic, notification];
+    }),
+  };
+}

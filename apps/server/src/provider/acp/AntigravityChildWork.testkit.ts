@@ -47,8 +47,42 @@ export const invokeStep = (input: {
       ),
     ),
   );
-export const plannerStep = (callIds: ReadonlyArray<string>) =>
-  proto(field(20, proto(...callIds.map((id) => field(7, toolCall(id))))));
+export const plannerStep = (
+  callIds: ReadonlyArray<string>,
+  options?: { readonly thought?: string },
+) =>
+  proto(
+    field(
+      20,
+      proto(
+        ...(options?.thought ? [field(3, options.thought)] : []),
+        ...callIds.map((id) => field(7, toolCall(id))),
+      ),
+    ),
+  );
+
+export const agentReportStep = (input: {
+  readonly recipientSessionId?: string;
+  readonly senderConversationId: string;
+  readonly text: string;
+}) =>
+  proto(
+    [...varint(1 * 8), ...varint(101)],
+    field(
+      114,
+      proto(
+        field(3, "agent_message"),
+        field(
+          4,
+          proto(
+            ...(input.recipientSessionId ? [field(2, input.recipientSessionId)] : []),
+            field(3, input.senderConversationId),
+            field(4, input.text),
+          ),
+        ),
+      ),
+    ),
+  );
 
 export const transcriptLines = [
   // Trimmed from 1.4.5: the launch envelope around the prompt the parent record already holds.

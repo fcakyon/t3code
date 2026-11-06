@@ -12,9 +12,11 @@ import {
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
   readAntigravityChildWork,
+  readAntigravitySessionSubagentState,
 } from "./AntigravityChildWork.ts";
 import { sanitizeAntigravityToolPayload } from "./AntigravityProtocol.ts";
 import {
+  agentReportStep,
   autoApproved,
   CHILD,
   invokeStep,
@@ -66,6 +68,69 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
       ]);
       expect(child?.steps?.[0]?.toolCalls[0]?.input).toBe('{"AbsolutePath":"/project/README.md"}');
     }),
+  );
+
+  it.effect(
+    "matches an auto-approved call id when earlier silent planner steps shift StepUpdate.step_index",
+    () =>
+      Effect.gen(function* () {
+        const { profile } = yield* makeProfile({
+          steps: (logUri) => [
+            [1, 15, plannerStep([])],
+            [4, 15, plannerStep([])],
+            [9, 15, plannerStep([])],
+            [
+              14,
+              15,
+              plannerStep(["other-call"], { thought: "Visible thought keeps its step index" }),
+            ],
+            [20, 15, plannerStep([])],
+            [29, 15, plannerStep(["call-30"])],
+            [
+              30,
+              127,
+              invokeStep({
+                callId: "call-30",
+                launches: [LAUNCH],
+                children: [{ id: CHILD, logUri }],
+              }),
+            ],
+            [
+              31,
+              101,
+              agentReportStep({
+                recipientSessionId: ROOT,
+                senderConversationId: CHILD,
+                text: "marker 4242 found in README.md",
+              }),
+            ],
+          ],
+        });
+        // 5 silent planner steps precede idx 30 (at 1, 4, 9, 20, 29), so StepUpdate.step_index is 25.
+        const [child] = yield* read(profile, `${ROOT}:25`);
+        expect(child?.conversationId).toBe(CHILD);
+        expect(child?.role).toBe(LAUNCH.role);
+
+        const state = yield* readAntigravitySessionSubagentState({
+          profileDirectory: profile,
+          rootSessionId: ROOT,
+        });
+        expect(state?.batches).toEqual([
+          {
+            stepUpdateIndex: 25,
+            toolCallId: "call-30",
+            launches: [LAUNCH],
+            children: [{ conversationId: CHILD, role: LAUNCH.role }],
+          },
+        ]);
+        expect(state?.reports).toEqual([
+          {
+            stepIndex: 31,
+            conversationId: CHILD,
+            text: "marker 4242 found in README.md",
+          },
+        ]);
+      }),
   );
 
   it.effect("needs proof that the call id belongs to the parent's record", () =>

@@ -32,6 +32,14 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
+import {
+  agentReportStep,
+  CHILD,
+  invokeStep,
+  LAUNCH,
+  makeProfile,
+  plannerStep,
+} from "../../provider/acp/AntigravityChildWork.testkit.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -75,8 +83,28 @@ describe("AntigravityAdapterV2 flavor", () => {
     });
     assert.equal(batch?.status, "running");
     assert.equal(batch?.prompt, "Started two agents.");
+    assert.equal(batch?.childSessionId, "antigravity-task:trajectory:4");
     assert.isNull(batch?.result);
     assert.isTrue(flavor.subagentsIdleOnTurnCompletion);
+
+    const completedBatch = flavor.extractSubagentUpdate?.({
+      toolCallId: "trajectory:4",
+      title: "Running invoke_subagent",
+      kind: "other",
+      status: "completed",
+      data: {
+        rawInput: {
+          Subagents: [{ TypeName: "research", Role: "Readme Reader", Prompt: "Read README.md" }],
+        },
+        rawOutput: "marker 4242 found",
+        meta: { antigravitySubagentCompleted: true },
+      },
+    });
+    assert.equal(completedBatch?.status, "completed");
+    assert.equal(completedBatch?.title, "Readme Reader");
+    assert.equal(completedBatch?.prompt, "Read README.md");
+    assert.equal(completedBatch?.result, "marker 4242 found");
+    assert.equal(completedBatch?.childSessionId, "antigravity-task:trajectory:4");
 
     // Permission prompts carry the launch; later updates for the same call do not.
     const launch = flavor.extractSubagentUpdate?.({
@@ -1044,6 +1072,233 @@ describe("AntigravityAdapterV2 subagent reads", () => {
       assert.deepEqual(read("call_denied"), failed);
       assert.deepEqual(read("call_unseen"), failed);
     }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect(
+    "hydrates auto-approved subagent launches, routes child tool calls to the child thread, and completes on child report",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const crypto = yield* SecureRandom.SecureRandom;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-subagent-timeline-",
+        });
+        const { profile } = yield* makeProfile({
+          steps: (logUri) => [
+            [1, 15, plannerStep([])],
+            [4, 15, plannerStep(["call-30"])],
+            [
+              5,
+              127,
+              invokeStep({
+                callId: "call-30",
+                launches: [LAUNCH],
+                children: [{ id: CHILD, logUri }],
+              }),
+            ],
+            [
+              6,
+              101,
+              agentReportStep({
+                recipientSessionId: "mock-session-1",
+                senderConversationId: CHILD,
+                text: "marker 4242 found in README.md",
+              }),
+            ],
+          ],
+        });
+        const conversationsDir = path.join(profile, "antigravity-acp", "conversations");
+        yield* fileSystem.copyFile(
+          path.join(conversationsDir, "7d40e54d-5977-4239-940b-246cdd81a12b.db"),
+          path.join(conversationsDir, "mock-session-1.db"),
+        );
+
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+        const instanceId = ProviderInstanceId.make("antigravity-subagent-timeline-test");
+        const threadId = ThreadId.make("thread-antigravity-subagent-timeline");
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          profileDirectory: profile,
+          selfInvocation: yield* resolveSelfInvocation(),
+          makeRuntime: (input) =>
+            makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: { T3_ACP_ANTIGRAVITY: "1" },
+              },
+            }).pipe(
+              Effect.provideService(SecureRandom.SecureRandom, crypto),
+              Effect.map((runtime): RuntimeService => ({
+                ...runtime,
+                handleSessionUpdate: (handler) =>
+                  Effect.sync(() => {
+                    sessionUpdate = handler;
+                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+                prompt: () =>
+                  Effect.gen(function* () {
+                    if (sessionUpdate === undefined) {
+                      return yield* Effect.die("the adapter must handle updates");
+                    }
+                    const send = sessionUpdate;
+                    const update = (updatePayload: EffectAcpSchema.SessionUpdate) =>
+                      send(
+                        normalizeAntigravitySessionUpdate({
+                          sessionId: "mock-session-1",
+                          update: updatePayload,
+                        }),
+                      );
+                    // StepUpdate.step_index for idx=5 with 2 silent planner steps (at 1, 4) is 3.
+                    yield* update({
+                      sessionUpdate: "tool_call",
+                      toolCallId: "mock-session-1:3",
+                      title: "Running invoke_subagent",
+                      kind: "other",
+                      status: "in_progress",
+                      rawInput: {},
+                    });
+                    yield* update({
+                      sessionUpdate: "tool_call",
+                      toolCallId: `${CHILD}:1`,
+                      title: "Running view_file",
+                      kind: "read",
+                      status: "in_progress",
+                      rawInput: { AbsolutePath: "/project/README.md" },
+                    });
+                    yield* update({
+                      sessionUpdate: "tool_call_update",
+                      toolCallId: `${CHILD}:1`,
+                      status: "completed",
+                      rawOutput: "2: child read marker 4242",
+                    });
+                    yield* update({
+                      sessionUpdate: "agent_message_chunk",
+                      content: { type: "text", text: "Subagent finished." },
+                    });
+                    return { stopReason: "end_turn" as const };
+                  }),
+              })),
+            ),
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make(
+            "provider-session-antigravity-subagent-timeline",
+          ),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        yield* session.startTurn({
+          appThread: {
+            createdBy: "user",
+            creationSource: "web",
+            id: threadId,
+            projectId: ProjectId.make("project-antigravity-subagent-timeline"),
+            title: "Antigravity subagent timeline",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: workspace,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          threadId,
+          runId: RunId.make("run-antigravity-subagent-timeline"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("attempt-antigravity-subagent-timeline"),
+          rootNodeId: NodeId.make("node-antigravity-subagent-timeline"),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: MessageId.make("message-antigravity-subagent-timeline"),
+            text: "check README marker",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+        const events = Array.from(
+          yield* session.events.pipe(
+            Stream.takeUntil((event) => event.type === "turn.terminal"),
+            Stream.runCollect,
+          ),
+        );
+
+        const subagentUpdates = events.flatMap((event) =>
+          event.type === "subagent.updated" ? [event.subagent] : [],
+        );
+        const lastSubagent = subagentUpdates.at(-1);
+        assert.isDefined(lastSubagent);
+        assert.equal(lastSubagent?.title, LAUNCH.role);
+        assert.equal(lastSubagent?.prompt, LAUNCH.prompt);
+        assert.equal(lastSubagent?.status, "completed");
+        assert.equal(lastSubagent?.result, "marker 4242 found in README.md");
+
+        const childThreadId = lastSubagent?.childThreadId;
+        assert.isNotNull(childThreadId);
+        const childToolItems = events.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.threadId === childThreadId &&
+          event.turnItem.nativeItemRef?.nativeId === `mock-session-1:3:tool:${CHILD}:1`
+            ? [event.turnItem]
+            : [],
+        );
+        assert.isNotEmpty(childToolItems);
+        assert.equal(childToolItems.at(-1)?.status, "completed");
+
+        const parentLeakedChildTools = events.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.threadId === threadId &&
+          event.turnItem.nativeItemRef?.nativeId?.includes(CHILD) === true
+            ? [event.turnItem]
+            : [],
+        );
+        assert.deepEqual(parentLeakedChildTools, []);
+
+        const childAssistantMessages = events.flatMap((event) =>
+          event.type === "message.updated" &&
+          event.message.threadId === childThreadId &&
+          event.message.role === "assistant"
+            ? [event.message.text]
+            : [],
+        );
+        assert.deepEqual(childAssistantMessages, ["marker 4242 found in README.md"]);
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });
 

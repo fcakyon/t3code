@@ -12,6 +12,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
+import * as Predicate from "effect/Predicate";
 import * as Scope from "effect/Scope";
 import * as EffectAcpErrors from "effect-acp/errors";
 
@@ -29,8 +30,10 @@ import {
 } from "../../provider/acp/AntigravityAcpSupport.ts";
 import {
   ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
+  antigravitySubagentChildSessionId,
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
+  makeAntigravitySubagentTracker,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
 import {
@@ -55,6 +58,11 @@ import {
 } from "@t3tools/provider-acp/server/adapter";
 
 const ANTIGRAVITY_PROVIDER = ProviderDriverKind.make("antigravity");
+
+const isCompletedAntigravitySubagentMeta = (meta: unknown): boolean =>
+  Predicate.isObject(meta) &&
+  "antigravitySubagentCompleted" in meta &&
+  meta.antigravitySubagentCompleted === true;
 
 const AntigravityProviderCapabilitiesV2 = {
   ...AcpProviderCapabilitiesV2,
@@ -97,8 +105,9 @@ export interface AntigravityAdapterV2Options {
 }
 
 /**
- * Native subagent tools report no child session ids, so children stay read-only.
- * Only permission prompts carry the launch; NativeChildWorkQuery matches their ids by this text.
+ * Each subagent batch gets a synthetic `antigravity-task:<nativeTaskId>` child session id so
+ * child tool calls and `agent_message` reports from the session database route to the subagent
+ * thread while keeping the child thread read-only.
  */
 const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractSubagentUpdate"]> = (
   toolCall,
@@ -106,23 +115,34 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
   if (classifyAntigravitySubagentToolCall(toolCall) !== "subagent") {
     return undefined;
   }
+  const completedByReport =
+    toolCall.status === "completed" && isCompletedAntigravitySubagentMeta(toolCall.data.meta);
   const status =
-    toolCall.status === "failed" ? "failed" : toolCall.status === "pending" ? "pending" : "running";
+    toolCall.status === "failed"
+      ? "failed"
+      : toolCall.status === "pending"
+        ? "pending"
+        : completedByReport
+          ? "completed"
+          : "running";
   const launches = antigravitySubagentLaunches(toolCall.data.rawInput);
   const launch = launches === undefined ? undefined : describeAntigravitySubagentLaunches(launches);
   return {
     nativeTaskId: toolCall.toolCallId,
     prompt:
       launch?.prompt ??
-      antigravitySubagentOutput(toolCall) ??
+      (completedByReport ? undefined : antigravitySubagentOutput(toolCall)) ??
       toolCall.detail ??
       toolCall.title ??
       ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
     title: launch?.title ?? ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
     model: null,
     status,
-    childSessionId: null,
-    result: status === "failed" ? (antigravitySubagentOutput(toolCall) ?? null) : null,
+    childSessionId: antigravitySubagentChildSessionId(toolCall.toolCallId),
+    result:
+      status === "failed" || status === "completed"
+        ? (antigravitySubagentOutput(toolCall) ?? null)
+        : null,
   };
 };
 
@@ -155,6 +175,7 @@ export function makeAntigravityAcpAdapterFlavor(
         .pipe(Effect.provideService(Scope.Scope, scope));
       // Repair keeps state across updates, so each runtime must have one session-update handler.
       const reads = makeAntigravityReadRepair();
+      const subagents = makeAntigravitySubagentTracker(profileDirectory);
       // Served reads are reported from the read handler, so they take turns with agent updates.
       const updates = yield* Semaphore.make(1);
       let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
@@ -197,8 +218,20 @@ export function makeAntigravityAcpAdapterFlavor(
           Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
         handleSessionUpdate: (handler) => {
           projectUpdate = handler;
-          return runtime.handleSessionUpdate((notification) =>
-            updates.withPermit(handler(reads.repair(notification))),
+          return runtime.handleSessionUpdate((rawNotification) =>
+            updates.withPermit(
+              subagents
+                .rewriteAndDrain(rawNotification)
+                .pipe(
+                  Effect.flatMap((notifications) =>
+                    Effect.forEach(
+                      notifications,
+                      (notification) => handler(reads.repair(notification)),
+                      { discard: true },
+                    ),
+                  ),
+                ),
+            ),
           );
         },
         resumeSession: (sessionId, configOptions) =>

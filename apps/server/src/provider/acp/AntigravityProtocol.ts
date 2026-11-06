@@ -503,6 +503,16 @@ export function classifyAntigravitySubagentToolCall(
   return Predicate.isObject(meta) && meta.is_mcp_tool_call === true ? "mcp" : "subagent";
 }
 
+export function isAntigravitySubagentToolUpdate(update: {
+  readonly title?: string | null | undefined;
+  readonly _meta?: unknown;
+}): boolean {
+  if (typeof update.title !== "string" || !ANTIGRAVITY_SUBAGENT_TITLES.has(update.title)) {
+    return false;
+  }
+  return !(Predicate.isObject(update._meta) && update._meta.is_mcp_tool_call === true);
+}
+
 export function antigravitySubagentOutput(toolCall: AcpToolCallState): string | undefined {
   const output = toolCall.data.rawOutput;
   return typeof output === "string" && output.trim() ? boundText(output.trim()) : undefined;
