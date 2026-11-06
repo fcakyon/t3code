@@ -133,6 +133,70 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
       }),
   );
 
+  it.effect(
+    "reads subagent launch specs from in-progress, compacted, and planner-only steps before child resultados exist",
+    () =>
+      Effect.gen(function* () {
+        const compactedLaunch = { role: "Compacted Reviewer", prompt: "Review compacted diff" };
+        const runningLaunch = { role: "Running Reviewer", prompt: "Inspect active files" };
+        const plannerLaunch = { role: "Planner Reviewer", prompt: "Check planner args" };
+        const { profile } = yield* makeProfile({
+          steps: () => [
+            [1, 15, plannerStep(["call-compacted"])],
+            [
+              2,
+              127,
+              invokeStep({
+                callId: "call-compacted",
+                launches: [],
+                children: [],
+                omitInvokePayload: true,
+                metadataArgsJson: JSON.stringify({
+                  Subagents: [{ Role: compactedLaunch.role, Prompt: compactedLaunch.prompt }],
+                }),
+              }),
+            ],
+            [3, 15, plannerStep(["call-running"])],
+            [
+              4,
+              127,
+              invokeStep({
+                callId: "call-running",
+                launches: [runningLaunch],
+                children: [],
+              }),
+            ],
+            [5, 15, plannerStep([{ id: "call-planner", launches: [plannerLaunch] }])],
+          ],
+        });
+        const state = yield* readAntigravitySessionSubagentState({
+          profileDirectory: profile,
+          rootSessionId: ROOT,
+          includeReports: false,
+        });
+        expect(state?.batches).toEqual([
+          {
+            stepUpdateIndex: 1,
+            toolCallId: "call-compacted",
+            launches: [compactedLaunch],
+            children: [],
+          },
+          {
+            stepUpdateIndex: 2,
+            toolCallId: "call-running",
+            launches: [runningLaunch],
+            children: [],
+          },
+          {
+            stepUpdateIndex: 3,
+            toolCallId: "call-planner",
+            launches: [plannerLaunch],
+            children: [],
+          },
+        ]);
+      }),
+  );
+
   it.effect("needs proof that the call id belongs to the parent's record", () =>
     Effect.gen(function* () {
       const { profile } = yield* makeProfile({

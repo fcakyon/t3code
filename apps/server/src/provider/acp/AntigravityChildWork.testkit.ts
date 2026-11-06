@@ -6,6 +6,8 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
+import { toAntigravitySubagentRawInput } from "./AntigravityChildWork.ts";
+
 export const ROOT = "7d40e54d-5977-4239-940b-246cdd81a12b";
 export const CHILD = "a357bf2720914589dd1ec49f7a816115";
 export const LAUNCH = { role: "Readme Reader", prompt: "Read README.md and report the marker" };
@@ -25,30 +27,46 @@ const field = (number: number, value: string | Uint8Array) => {
   return [...varint(number * 8 + 2), ...varint(bytes.length), ...bytes];
 };
 const proto = (...parts: number[][]) => Uint8Array.from(parts.flat());
-const toolCall = (id: string) => proto(field(1, id), field(2, "invoke_subagent"));
+const toolCall = (id: string, argsJson?: string) =>
+  proto(
+    field(1, id),
+    field(2, "invoke_subagent"),
+    ...(argsJson !== undefined ? [field(3, argsJson)] : []),
+  );
 
 export const invokeStep = (input: {
   readonly callId: string;
   readonly launches: ReadonlyArray<typeof LAUNCH>;
   readonly children: ReadonlyArray<{ readonly id: string; readonly logUri: string }>;
+  readonly metadataArgsJson?: string;
+  readonly omitInvokePayload?: boolean;
 }) =>
   proto(
     [...varint(1 * 8), ...varint(127)],
-    field(5, proto(field(4, toolCall(input.callId)))),
-    field(
-      143,
-      proto(
-        ...input.launches.map((launch) =>
-          field(9, proto(field(1, "research"), field(2, launch.role), field(3, launch.prompt))),
-        ),
-        ...input.children.map((child) =>
-          field(10, proto(field(1, child.id), field(2, child.logUri))),
-        ),
-      ),
-    ),
+    field(5, proto(field(4, toolCall(input.callId, input.metadataArgsJson)))),
+    ...(input.omitInvokePayload
+      ? []
+      : [
+          field(
+            143,
+            proto(
+              ...input.launches.map((launch) =>
+                field(
+                  9,
+                  proto(field(1, "research"), field(2, launch.role), field(3, launch.prompt)),
+                ),
+              ),
+              ...input.children.map((child) =>
+                field(10, proto(field(1, child.id), field(2, child.logUri))),
+              ),
+            ),
+          ),
+        ]),
   );
 export const plannerStep = (
-  callIds: ReadonlyArray<string>,
+  callIds: ReadonlyArray<
+    string | { readonly id: string; readonly launches?: ReadonlyArray<typeof LAUNCH> }
+  >,
   options?: { readonly thought?: string },
 ) =>
   proto(
@@ -56,7 +74,19 @@ export const plannerStep = (
       20,
       proto(
         ...(options?.thought ? [field(3, options.thought)] : []),
-        ...callIds.map((id) => field(7, toolCall(id))),
+        ...callIds.map((entry) => {
+          const id = typeof entry === "string" ? entry : entry.id;
+          const launches = typeof entry === "string" ? undefined : entry.launches;
+          return field(
+            7,
+            toolCall(
+              id,
+              launches === undefined
+                ? undefined
+                : JSON.stringify(toAntigravitySubagentRawInput(launches)),
+            ),
+          );
+        }),
       ),
     ),
   );
@@ -106,6 +136,7 @@ export const transcriptLines = [
 export const makeProfile = Effect.fn("makeProfile")(function* (input: {
   /** Defaults to a scoped temp directory. */
   readonly profile?: string;
+  readonly sessionId?: string;
   readonly steps: (logUri: string) => ReadonlyArray<readonly [number, number, Uint8Array]>;
   readonly transcript?: string;
 }) {
@@ -122,7 +153,9 @@ export const makeProfile = Effect.fn("makeProfile")(function* (input: {
     input.transcript ?? transcriptLines.map((line) => JSON.stringify(line)).join("\n") + "\n",
   );
   const logUri = NodeURL.pathToFileURL(transcriptPath).href;
-  const database = new NodeSqlite.DatabaseSync(path.join(acp, "conversations", `${ROOT}.db`));
+  const database = new NodeSqlite.DatabaseSync(
+    path.join(acp, "conversations", `${input.sessionId ?? ROOT}.db`),
+  );
   database.exec(
     "CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, step_format integer NOT NULL DEFAULT 0, step_payload blob)",
   );

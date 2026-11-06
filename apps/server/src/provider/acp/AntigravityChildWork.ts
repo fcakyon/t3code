@@ -8,6 +8,7 @@ import type {
   OrchestrationV2NativeChildStep,
   OrchestrationV2NativeChildWork,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
@@ -98,6 +99,13 @@ export function antigravitySubagentLaunches(
   );
 }
 
+export const toAntigravitySubagentRawInput = (launches: ReadonlyArray<AntigravityChildLaunch>) => ({
+  Subagents: launches.map((launch) => ({
+    Role: launch.role,
+    Prompt: launch.prompt,
+  })),
+});
+
 /** Batch title and prompt; reads match permission-prompt tool call ids against this exact text. */
 export function describeAntigravitySubagentLaunches(
   launches: ReadonlyArray<AntigravityChildLaunch>,
@@ -173,36 +181,63 @@ const safely =
     }
   };
 
+const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+
+const decodeLaunchJson = (value: string | undefined): ReadonlyArray<AntigravityChildLaunch> =>
+  value === undefined
+    ? []
+    : Option.getOrElse(
+        Option.flatMap(decodeJson(value), (parsed) =>
+          Option.fromNullishOr(antigravitySubagentLaunches(parsed)),
+        ),
+        () => [],
+      );
+
 const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => {
+  const metadataCall = message(message(payload, STEP_METADATA), METADATA_TOOL_CALL);
+  const toolCallId = text(metadataCall, 1);
   const invoke = message(payload, STEP_INVOKE_SUBAGENT);
-  if (invoke === undefined) return undefined;
-  const children = messages(invoke, INVOKE_RESULTS).map((result) => ({
-    conversationId: text(result, 1) ?? "",
-    logUri: text(result, 2) ?? "",
-  }));
+  const children =
+    invoke === undefined
+      ? []
+      : messages(invoke, INVOKE_RESULTS).map((result) => ({
+          conversationId: text(result, 1) ?? "",
+          logUri: text(result, 2) ?? "",
+        }));
   if (!children.every((child) => NATIVE_ID.test(child.conversationId))) return undefined;
+  const specLaunches =
+    invoke === undefined
+      ? []
+      : messages(invoke, INVOKE_SPECS).map((spec) => ({
+          role: text(spec, 2) ?? "",
+          prompt: text(spec, 3) ?? "",
+        }));
+  const launches = specLaunches.length > 0 ? specLaunches : decodeLaunchJson(text(metadataCall, 3));
+  if (invoke === undefined && launches.length === 0) return undefined;
   return {
-    toolCallId: text(message(message(payload, STEP_METADATA), METADATA_TOOL_CALL), 1),
-    launches: messages(invoke, INVOKE_SPECS).map((spec) => ({
-      role: text(spec, 2) ?? "",
-      prompt: text(spec, 3) ?? "",
-    })),
+    toolCallId,
+    launches,
     children,
   };
 });
+
+interface PlannerInvokeCall {
+  readonly id: string;
+  readonly launches: ReadonlyArray<AntigravityChildLaunch>;
+}
 
 const decodePlannerStep = safely(
   (
     payload,
   ): {
     readonly isSilent: boolean;
-    readonly invokeCallIds: ReadonlyArray<string>;
+    readonly invokeCalls: ReadonlyArray<PlannerInvokeCall>;
   } => {
     const planner = message(payload, STEP_PLANNER_RESPONSE);
-    if (planner === undefined) return { isSilent: false, invokeCallIds: [] };
+    if (planner === undefined) return { isSilent: false, invokeCalls: [] };
     let hasText = false;
     let hasThinking = false;
-    const invokeCallIds: Array<string> = [];
+    const invokeCalls: Array<PlannerInvokeCall> = [];
     for (const [field, value] of protoFields(planner)) {
       if (field === PLANNER_TEXT && value.length > 0) {
         hasText = true;
@@ -211,18 +246,24 @@ const decodePlannerStep = safely(
       } else if (field === PLANNER_TOOL_CALLS) {
         let id: string | undefined;
         let name: string | undefined;
+        let argsJson: string | undefined;
         for (const [callField, callValue] of protoFields(value)) {
           if (callField === 1 && id === undefined) id = textDecoder.decode(callValue);
           else if (callField === 2 && name === undefined) name = textDecoder.decode(callValue);
+          else if (callField === 3 && argsJson === undefined)
+            argsJson = textDecoder.decode(callValue);
         }
         if (name === "invoke_subagent" && id !== undefined) {
-          invokeCallIds.push(id);
+          invokeCalls.push({
+            id,
+            launches: decodeLaunchJson(argsJson),
+          });
         }
       }
     }
     return {
       isSilent: !hasText && !hasThinking,
-      invokeCallIds,
+      invokeCalls,
     };
   },
 );
@@ -272,6 +313,11 @@ const payloadOf = (row: unknown) =>
     ? row.step_payload
     : undefined;
 
+const rowNumber = (row: unknown, key: string): number =>
+  row !== null && typeof row === "object" && key in row
+    ? Number(row[key as keyof typeof row] ?? 0)
+    : 0;
+
 interface BatchLaunch {
   readonly title: string | null;
   readonly prompt: string;
@@ -299,7 +345,7 @@ interface IndexedInvokeRecord {
   readonly idx: number;
   readonly stepUpdateIndex: number;
   readonly record: InvokeRecord | undefined;
-  readonly plannerCallIds: ReadonlyArray<string> | undefined;
+  readonly plannerCalls: ReadonlyArray<PlannerInvokeCall> | undefined;
 }
 
 /**
@@ -313,7 +359,13 @@ function readIndexedInvokeRecords(
   let invokeRows = 0;
   let invokeBytes = 0;
   let silentPlannerSteps = 0;
-  let lastPlannerCallIds: ReadonlyArray<string> | undefined;
+  let lastPlannerStep:
+    | {
+        readonly idx: number;
+        readonly silentPlannerSteps: number;
+        readonly calls: ReadonlyArray<PlannerInvokeCall>;
+      }
+    | undefined;
   const records: Array<IndexedInvokeRecord> = [];
 
   for (const row of database
@@ -321,26 +373,24 @@ function readIndexedInvokeRecords(
       "SELECT idx, step_type, length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_type IN (?, ?) AND step_format = 0 ORDER BY idx",
     )
     .iterate(MAX_STEP_BYTES, PLANNER_RESPONSE_STEP_TYPE, INVOKE_SUBAGENT_STEP_TYPE)) {
-    const stepType =
-      row !== null && typeof row === "object" && "step_type" in row ? Number(row.step_type) : 0;
-    const idx = row !== null && typeof row === "object" && "idx" in row ? Number(row.idx) : 0;
-    const size = row !== null && typeof row === "object" && "size" in row ? Number(row.size) : 0;
+    const stepType = rowNumber(row, "step_type");
+    const idx = rowNumber(row, "idx");
+    const size = rowNumber(row, "size");
     const payload = payloadOf(row);
 
     if (stepType === PLANNER_RESPONSE_STEP_TYPE) {
-      if (payload === undefined || size > MAX_STEP_BYTES) {
-        lastPlannerCallIds = undefined;
-        continue;
-      }
-      const planner = decodePlannerStep(payload);
+      const planner = payload === undefined ? undefined : decodePlannerStep(payload);
       if (planner === undefined) {
-        lastPlannerCallIds = undefined;
+        lastPlannerStep = undefined;
         continue;
       }
       if (planner.isSilent) {
         silentPlannerSteps += 1;
       }
-      lastPlannerCallIds = planner.invokeCallIds;
+      lastPlannerStep =
+        planner.invokeCalls.length > 0
+          ? { idx, silentPlannerSteps, calls: planner.invokeCalls }
+          : undefined;
       continue;
     }
 
@@ -350,12 +400,45 @@ function readIndexedInvokeRecords(
       if (invokeRows > MAX_INVOKE_ROWS || size > MAX_STEP_BYTES || invokeBytes > MAX_SCAN_BYTES) {
         return undefined;
       }
-      const record = payload === undefined ? undefined : decodeInvokeRecord(payload);
+      const decoded = payload === undefined ? undefined : decodeInvokeRecord(payload);
+      const plannerCalls = lastPlannerStep?.calls;
+      const plannerLaunches =
+        decoded?.toolCallId === undefined
+          ? undefined
+          : plannerCalls?.find((call) => call.id === decoded.toolCallId)?.launches;
+      const record =
+        decoded !== undefined &&
+        decoded.launches.length === 0 &&
+        plannerLaunches !== undefined &&
+        plannerLaunches.length > 0
+          ? { ...decoded, launches: plannerLaunches }
+          : decoded;
       records.push({
         idx,
         stepUpdateIndex: idx - silentPlannerSteps,
         record,
-        plannerCallIds: lastPlannerCallIds,
+        plannerCalls,
+      });
+    }
+  }
+
+  if (lastPlannerStep !== undefined && lastPlannerStep.calls.length === 1) {
+    const [call] = lastPlannerStep.calls;
+    if (
+      call !== undefined &&
+      call.launches.length > 0 &&
+      !records.some((entry) => entry.record?.toolCallId === call.id)
+    ) {
+      const idx = lastPlannerStep.idx + 1;
+      records.push({
+        idx,
+        stepUpdateIndex: idx - lastPlannerStep.silentPlannerSteps,
+        record: {
+          toolCallId: call.id,
+          launches: call.launches,
+          children: [],
+        },
+        plannerCalls: lastPlannerStep.calls,
       });
     }
   }
@@ -368,9 +451,44 @@ const provenAutoApprovedRecord = (
   stepUpdateIndex: number,
 ): InvokeRecord | undefined => {
   const entry = entries.find((candidate) => candidate.stepUpdateIndex === stepUpdateIndex);
-  if (entry?.record === undefined || entry.plannerCallIds?.length !== 1) return undefined;
-  const [callId] = entry.plannerCallIds;
-  return callId !== undefined && entry.record.toolCallId === callId ? entry.record : undefined;
+  if (entry?.record === undefined || entry.plannerCalls?.length !== 1) return undefined;
+  const [call] = entry.plannerCalls;
+  return call !== undefined && entry.record.toolCallId === call.id ? entry.record : undefined;
+};
+
+const plannerIdxOfTask = (rootSessionId: string, nativeTaskId: string) => {
+  const stepId = /^(.+):(\d+)$/.exec(nativeTaskId);
+  return stepId === null ? undefined : stepId[1] === rootSessionId ? Number(stepId[2]) : -1;
+};
+
+const canLookupInvokeRecord = (input: {
+  readonly rootSessionId: string;
+  readonly nativeTaskId: string;
+  readonly launch: BatchLaunch;
+  readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
+}): boolean => {
+  const plannerIdx = plannerIdxOfTask(input.rootSessionId, input.nativeTaskId);
+  if (plannerIdx !== undefined) {
+    return plannerIdx >= 0;
+  }
+  const sameText = (launch: BatchLaunch) =>
+    launch.title === input.launch.title && launch.prompt === input.launch.prompt;
+  if (input.siblings.some(sameText)) {
+    return false;
+  }
+  for (const sibling of input.siblings) {
+    if (plannerIdxOfTask(input.rootSessionId, sibling.nativeTaskId) !== undefined) continue;
+    // A sibling whose launch text is missing or cut under the same roles cannot be ruled out.
+    if (
+      sibling.title === ANTIGRAVITY_SUBAGENT_BATCH_TITLE ||
+      (sibling.title !== null && isCutAntigravityToolText(sibling.title)) ||
+      (isCutAntigravityToolText(sibling.prompt) &&
+        (sibling.title === null || sibling.title === input.launch.title))
+    ) {
+      return false;
+    }
+  }
+  return true;
 };
 
 /**
@@ -388,13 +506,9 @@ function findInvokeRecord(
     readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
   },
 ): InvokeRecord | undefined {
-  const plannerIdxOf = (nativeTaskId: string) => {
-    const stepId = /^(.+):(\d+)$/.exec(nativeTaskId);
-    return stepId === null ? undefined : stepId[1] === input.rootSessionId ? Number(stepId[2]) : -1;
-  };
-  const plannerIdx = plannerIdxOf(input.nativeTaskId);
+  if (!canLookupInvokeRecord(input)) return undefined;
+  const plannerIdx = plannerIdxOfTask(input.rootSessionId, input.nativeTaskId);
   if (plannerIdx !== undefined) {
-    if (plannerIdx < 0) return undefined;
     const entries = readIndexedInvokeRecords(database);
     if (entries === undefined) return undefined;
     const record = provenAutoApprovedRecord(entries, plannerIdx);
@@ -405,16 +519,11 @@ function findInvokeRecord(
       "SELECT count(*) AS rows, coalesce(sum(length(step_payload)), 0) AS bytes, coalesce(max(length(step_payload)), 0) AS largest, sum(step_format != 0) AS other FROM steps WHERE step_type = ?",
     )
     .get(INVOKE_SUBAGENT_STEP_TYPE);
-  const total = (key: string) =>
-    totals !== undefined && key in totals ? Number(totals[key as keyof typeof totals] ?? 0) : 0;
-  const sameText = (launch: BatchLaunch) =>
-    launch.title === input.launch.title && launch.prompt === input.launch.prompt;
   if (
-    input.siblings.some(sameText) ||
-    total("rows") > MAX_INVOKE_ROWS ||
-    total("bytes") > MAX_SCAN_BYTES ||
-    total("largest") > MAX_STEP_BYTES ||
-    total("other") > 0
+    rowNumber(totals, "rows") > MAX_INVOKE_ROWS ||
+    rowNumber(totals, "bytes") > MAX_SCAN_BYTES ||
+    rowNumber(totals, "largest") > MAX_STEP_BYTES ||
+    rowNumber(totals, "other") > 0
   ) {
     return undefined;
   }
@@ -422,20 +531,8 @@ function findInvokeRecord(
   if (entries === undefined) return undefined;
   const claimed = new Set<string>();
   for (const sibling of input.siblings) {
-    const idx = plannerIdxOf(sibling.nativeTaskId);
-    // A sibling whose launch text is missing, or cut under the same roles, or whose planner step
-    // is unreadable, cannot be ruled out.
-    if (idx === undefined) {
-      if (
-        sibling.title === ANTIGRAVITY_SUBAGENT_BATCH_TITLE ||
-        (sibling.title !== null && isCutAntigravityToolText(sibling.title)) ||
-        (isCutAntigravityToolText(sibling.prompt) &&
-          (sibling.title === null || sibling.title === input.launch.title))
-      )
-        return undefined;
-      continue;
-    }
-    if (idx < 0) continue;
+    const idx = plannerIdxOfTask(input.rootSessionId, sibling.nativeTaskId);
+    if (idx === undefined || idx < 0) continue;
     const claimedRecord = provenAutoApprovedRecord(entries, idx);
     if (claimedRecord?.toolCallId === undefined) return undefined;
     claimed.add(claimedRecord.toolCallId);
@@ -471,13 +568,12 @@ const TranscriptLine = Schema.Struct({
 const decodeTranscriptLine = Schema.decodeUnknownOption(Schema.fromJsonString(TranscriptLine));
 
 // The runtime records each tool argument value as JSON text.
-const decodeArgument = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 const toolArguments = (args: unknown) =>
   Predicate.isObject(args)
     ? Object.fromEntries(
         Object.entries(args).map(([key, value]) => [
           key,
-          typeof value === "string" ? Option.getOrElse(decodeArgument(value), () => value) : value,
+          typeof value === "string" ? Option.getOrElse(decodeJson(value), () => value) : value,
         ]),
       )
     : (args ?? {});
@@ -602,7 +698,7 @@ export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(fu
   /** The thread's other Antigravity batches from this instance. */
   readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
 }) {
-  if (!NATIVE_ID.test(input.rootSessionId)) return [];
+  if (!NATIVE_ID.test(input.rootSessionId) || !canLookupInvokeRecord(input)) return [];
   return yield* Effect.tryPromise({
     try: async (): Promise<ReadonlyArray<OrchestrationV2NativeChildWork>> => {
       const resolved = await resolveSessionDatabase(input.profileDirectory, input.rootSessionId);
@@ -668,8 +764,16 @@ export const readAntigravitySessionSubagentState = Effect.fn("readAntigravitySes
             const entries = readIndexedInvokeRecords(database);
             if (entries === undefined) return undefined;
             for (const entry of entries) {
-              const record = entry.record === undefined ? undefined : complete(entry.record);
-              if (record === undefined) continue;
+              const record = entry.record;
+              if (
+                record === undefined ||
+                record.launches.length === 0 ||
+                record.launches.length > MAX_CHILDREN ||
+                record.children.length > MAX_CHILDREN ||
+                (record.children.length > 0 && record.children.length !== record.launches.length)
+              ) {
+                continue;
+              }
               batches.push({
                 stepUpdateIndex: entry.stepUpdateIndex,
                 toolCallId: record.toolCallId,
@@ -694,10 +798,8 @@ export const readAntigravitySessionSubagentState = Effect.fn("readAntigravitySes
                 SYSTEM_MESSAGE_STEP_TYPE,
                 input.afterReportStepIndex ?? -1,
               )) {
-              const idx =
-                row !== null && typeof row === "object" && "idx" in row ? Number(row.idx) : 0;
-              const size =
-                row !== null && typeof row === "object" && "size" in row ? Number(row.size) : 0;
+              const idx = rowNumber(row, "idx");
+              const size = rowNumber(row, "size");
               reportRows += 1;
               reportBytes += size;
               if (reportRows > MAX_INVOKE_ROWS * MAX_CHILDREN || reportBytes > MAX_SCAN_BYTES) {
@@ -735,10 +837,19 @@ interface TrackedSubagentBatch {
   readonly nativeTaskId: string;
   readonly childSessionId: string;
   launches: ReadonlyArray<AntigravityChildLaunch>;
+  launchesHydrated: boolean;
   children: ReadonlyArray<{ readonly conversationId: string; readonly role: string }>;
   matchedDbStepUpdateIndex: number | undefined;
   completed: boolean;
 }
+
+const batchNeedsDbSync = (batch: TrackedSubagentBatch) =>
+  batch.matchedDbStepUpdateIndex === undefined ||
+  batch.children.length === 0 ||
+  batch.launches.length === 0;
+
+const formatChildReport = (role: string | undefined, text: string, multiChild: boolean) =>
+  multiChild && role ? `### ${role}\n\n${text}` : text;
 
 /**
  * Tracks active Antigravity subagent batches for a runtime instance, routing child tool updates
@@ -747,11 +858,10 @@ interface TrackedSubagentBatch {
 export function makeAntigravitySubagentTracker(profileDirectory: string | undefined) {
   const trackedBatches = new Map<string, TrackedSubagentBatch>();
   const childConversationToBatch = new Map<string, TrackedSubagentBatch>();
-  const emittedReportKeys = new Set<string>();
   const reportsByConversationId = new Map<string, string>();
   const lastReportStepIndexBySession = new Map<string, number>();
   const pendingSyntheticNotifications: Array<EffectAcpSchema.SessionNotification> = [];
-  let lastChunkSyncAt = 0;
+  let lastChunkSyncAt: number | undefined;
 
   const ensureTrackedBatch = (rootSessionId: string, nativeTaskId: string) => {
     let batch = trackedBatches.get(nativeTaskId);
@@ -761,6 +871,7 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
         nativeTaskId,
         childSessionId: antigravitySubagentChildSessionId(nativeTaskId),
         launches: [],
+        launchesHydrated: false,
         children: [],
         matchedDbStepUpdateIndex: undefined,
         completed: false,
@@ -770,10 +881,30 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
     return batch;
   };
 
-  const bindDbBatch = (batch: TrackedSubagentBatch, dbBatch: AntigravitySubagentBatchState) => {
+  const bindDbBatch = (
+    batch: TrackedSubagentBatch,
+    dbBatch: AntigravitySubagentBatchState,
+    emitHydrationIfNeeded: boolean,
+  ) => {
     batch.matchedDbStepUpdateIndex = dbBatch.stepUpdateIndex;
     if (batch.launches.length === 0 && dbBatch.launches.length > 0) {
       batch.launches = dbBatch.launches;
+    }
+    if (emitHydrationIfNeeded && !batch.launchesHydrated && batch.launches.length > 0) {
+      batch.launchesHydrated = true;
+      pendingSyntheticNotifications.push(
+        normalizeAntigravitySessionUpdate({
+          sessionId: batch.rootSessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: batch.nativeTaskId,
+            title: "Running invoke_subagent",
+            kind: "other",
+            status: "in_progress",
+            rawInput: toAntigravitySubagentRawInput(batch.launches),
+          },
+        }),
+      );
     }
     if (dbBatch.children.length > 0) {
       batch.children = dbBatch.children;
@@ -785,7 +916,11 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
 
   const syncSubagentsFromDb = (
     rootSessionId: string,
-    options: { readonly includeBatches: boolean; readonly includeReports: boolean },
+    options: {
+      readonly includeBatches: boolean;
+      readonly includeReports: boolean;
+      readonly updatingTaskId?: string;
+    },
   ) => {
     if (profileDirectory === undefined) return Effect.void;
     const afterReportStepIndex = lastReportStepIndexBySession.get(rootSessionId) ?? -1;
@@ -816,7 +951,7 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
               const byAutoId = trackedBatches.get(autoTaskId);
               if (byAutoId !== undefined) {
                 claimedStepIndices.add(dbBatch.stepUpdateIndex);
-                bindDbBatch(byAutoId, dbBatch);
+                bindDbBatch(byAutoId, dbBatch, byAutoId.nativeTaskId !== options.updatingTaskId);
                 continue;
               }
               const byToolCallId =
@@ -825,7 +960,11 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
                   : trackedBatches.get(dbBatch.toolCallId);
               if (byToolCallId !== undefined) {
                 claimedStepIndices.add(dbBatch.stepUpdateIndex);
-                bindDbBatch(byToolCallId, dbBatch);
+                bindDbBatch(
+                  byToolCallId,
+                  dbBatch,
+                  byToolCallId.nativeTaskId !== options.updatingTaskId,
+                );
                 continue;
               }
               if (claimedStepIndices.has(dbBatch.stepUpdateIndex)) continue;
@@ -840,7 +979,7 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
               );
               if (byLaunch !== undefined) {
                 claimedStepIndices.add(dbBatch.stepUpdateIndex);
-                bindDbBatch(byLaunch, dbBatch);
+                bindDbBatch(byLaunch, dbBatch, byLaunch.nativeTaskId !== options.updatingTaskId);
                 continue;
               }
               const hasUnmatchedPermissionBatch = sessionBatches.some(
@@ -851,7 +990,7 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
               if (!hasUnmatchedPermissionBatch) {
                 const inferred = ensureTrackedBatch(rootSessionId, autoTaskId);
                 claimedStepIndices.add(dbBatch.stepUpdateIndex);
-                bindDbBatch(inferred, dbBatch);
+                bindDbBatch(inferred, dbBatch, false);
               }
             }
           }
@@ -867,13 +1006,10 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
             if (batch === undefined || batch.completed) continue;
             reportsByConversationId.set(report.conversationId, report.text);
             const reportKey = `${report.conversationId}:${report.stepIndex}`;
-            if (emittedReportKeys.has(reportKey)) continue;
-            emittedReportKeys.add(reportKey);
             const role = batch.children.find(
               (child) => child.conversationId === report.conversationId,
             )?.role;
-            const text =
-              batch.children.length > 1 && role ? `### ${role}\n\n${report.text}` : report.text;
+            const text = formatChildReport(role, report.text, batch.children.length > 1);
             pendingSyntheticNotifications.push({
               sessionId: batch.childSessionId,
               update: {
@@ -897,15 +1033,17 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
               continue;
             }
             batch.completed = true;
-            const combinedReport =
-              batch.children.length === 1
-                ? (reportsByConversationId.get(batch.children[0]!.conversationId) ?? "")
-                : batch.children
-                    .map((child) => {
-                      const text = reportsByConversationId.get(child.conversationId) ?? "";
-                      return child.role ? `### ${child.role}\n\n${text}` : text;
-                    })
-                    .join("\n\n");
+            batch.launchesHydrated = true;
+            const multiChild = batch.children.length > 1;
+            const combinedReport = batch.children
+              .map((child) =>
+                formatChildReport(
+                  child.role,
+                  reportsByConversationId.get(child.conversationId) ?? "",
+                  multiChild,
+                ),
+              )
+              .join("\n\n");
             for (const child of batch.children) {
               reportsByConversationId.delete(child.conversationId);
             }
@@ -919,14 +1057,7 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
                   kind: "other",
                   status: "completed",
                   ...(batch.launches.length > 0
-                    ? {
-                        rawInput: {
-                          Subagents: batch.launches.map((launch) => ({
-                            Role: launch.role,
-                            Prompt: launch.prompt,
-                          })),
-                        },
-                      }
+                    ? { rawInput: toAntigravitySubagentRawInput(batch.launches) }
                     : {}),
                   rawOutput: combinedReport,
                   _meta: { antigravitySubagentCompleted: true },
@@ -957,30 +1088,26 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
           const inputLaunches = antigravitySubagentLaunches(update.rawInput);
           if (inputLaunches !== undefined && inputLaunches.length > 0) {
             batch.launches = inputLaunches;
+            batch.launchesHydrated = true;
           }
-          if (
-            batch.matchedDbStepUpdateIndex === undefined ||
-            batch.children.length === 0 ||
-            batch.launches.length === 0
-          ) {
+          if (batchNeedsDbSync(batch)) {
             yield* syncSubagentsFromDb(rootSessionId, {
               includeBatches: true,
               includeReports: false,
+              updatingTaskId: batch.nativeTaskId,
             });
           }
-          if (batch.launches.length > 0 && inputLaunches === undefined) {
-            notification = normalizeAntigravitySessionUpdate({
-              ...notification,
-              update: {
-                ...update,
-                rawInput: {
-                  Subagents: batch.launches.map((launch) => ({
-                    Role: launch.role,
-                    Prompt: launch.prompt,
-                  })),
+          if (batch.launches.length > 0) {
+            batch.launchesHydrated = true;
+            if (inputLaunches === undefined) {
+              notification = normalizeAntigravitySessionUpdate({
+                ...notification,
+                update: {
+                  ...update,
+                  rawInput: toAntigravitySubagentRawInput(batch.launches),
                 },
-              },
-            });
+              });
+            }
           }
         } else {
           const childPrefix = /^([A-Za-z0-9-]+):\d+$/.exec(update.toolCallId)?.[1];
@@ -1003,22 +1130,21 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
         }
       }
 
-      const activeBatches = [...trackedBatches.values()].filter(
-        (batch) => batch.rootSessionId === rootSessionId && !batch.completed,
-      );
-      if (activeBatches.length > 0 && !isSubagentLaunchOrUpdate && !isChildToolUpdate) {
-        const isToolUpdate =
-          update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update";
-        const now = Date.now();
-        if (isToolUpdate || now - lastChunkSyncAt >= 200) {
-          lastChunkSyncAt = now;
-          const needsBatchLookup = activeBatches.some(
-            (batch) => batch.matchedDbStepUpdateIndex === undefined || batch.children.length === 0,
-          );
-          yield* syncSubagentsFromDb(rootSessionId, {
-            includeBatches: needsBatchLookup,
-            includeReports: true,
-          });
+      if (trackedBatches.size > 0 && !isSubagentLaunchOrUpdate && !isChildToolUpdate) {
+        const activeBatches = [...trackedBatches.values()].filter(
+          (batch) => batch.rootSessionId === rootSessionId && !batch.completed,
+        );
+        if (activeBatches.length > 0) {
+          const isToolUpdate =
+            update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update";
+          const now = yield* Clock.currentTimeMillis;
+          if (isToolUpdate || lastChunkSyncAt === undefined || now - lastChunkSyncAt >= 200) {
+            lastChunkSyncAt = now;
+            yield* syncSubagentsFromDb(rootSessionId, {
+              includeBatches: activeBatches.some(batchNeedsDbSync),
+              includeReports: true,
+            });
+          }
         }
       }
 

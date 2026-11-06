@@ -143,6 +143,7 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
       status === "failed" || status === "completed"
         ? (antigravitySubagentOutput(toolCall) ?? null)
         : null,
+    ...(launch === undefined ? { provisional: true } : {}),
   };
 };
 

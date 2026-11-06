@@ -613,6 +613,7 @@ export interface AcpAdapterV2SubagentUpdate {
     | "cancelled";
   readonly childSessionId: string | null;
   readonly result: string | null;
+  readonly provisional?: boolean;
   readonly suppressNormalTool?: boolean;
 }
 
@@ -1589,6 +1590,7 @@ interface ActiveAcpSubagent {
   readonly assistantMessages: Map<string, string>;
   readonly childItemOrdinals: Map<string, number>;
   nextChildOrdinal: number;
+  provisional: boolean;
   terminalStatusProjected: boolean;
   readonly toolState: Pick<ActiveAcpTurn, "tools" | "toolUpdatesSkipped" | "toolStartedAt">;
   readonly toolSessionIds: Map<string, string>;
@@ -3152,6 +3154,22 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           const turnItemOrdinal =
             existing?.turnItemOrdinal ?? (yield* resolveItemOrdinal(context, nativeTaskId));
           const taskStatus = update.status;
+          const previousTitle = existing?.task.title ?? null;
+          const previousPrompt = existing?.task.prompt ?? "";
+          const previousModel = existing?.task.model ?? null;
+          const replaceProvisional = existing?.provisional === true && update.provisional !== true;
+          const nextTitle =
+            update.title !== null && (previousTitle === null || replaceProvisional)
+              ? update.title
+              : previousTitle;
+          const nextPrompt =
+            existing === undefined
+              ? update.prompt
+              : update.prompt.trim().length > 0 &&
+                  (previousPrompt.trim().length === 0 || replaceProvisional)
+                ? update.prompt
+                : previousPrompt;
+          const nextModel = update.model?.trim() || previousModel;
           const task: OrchestrationV2Subagent = {
             ...(existing?.task ?? {
               id: nodeId,
@@ -3165,12 +3183,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               providerThreadId: null,
               childThreadId,
               nativeTaskRef: nativeItemRef,
-              prompt: update.prompt,
-              title: update.title,
+              prompt: nextPrompt,
+              title: nextTitle,
               result: null,
               startedAt: now,
             }),
-            model: update.model?.trim() || existing?.task.model || null,
+            prompt: nextPrompt,
+            title: nextTitle,
+            model: nextModel,
             status: taskStatus,
             result: update.result ?? existing?.task.result ?? null,
             completedAt: acpSubagentStatusIsTerminal(taskStatus) ? now : null,
@@ -3189,6 +3209,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             assistantMessages: new Map(),
             childItemOrdinals: new Map(),
             nextChildOrdinal: 101,
+            provisional: update.provisional === true,
             terminalStatusProjected: false,
             toolState: {
               tools: new Map(),
@@ -3197,10 +3218,19 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             },
             toolSessionIds: new Map(),
           };
+          subagent.provisional =
+            existing === undefined
+              ? update.provisional === true
+              : existing.provisional && !replaceProvisional;
           subagent.task = task;
           context.subagents.set(nativeTaskId, subagent);
 
-          if (existing === undefined) {
+          if (
+            existing === undefined ||
+            task.title !== previousTitle ||
+            task.prompt !== previousPrompt ||
+            task.model !== previousModel
+          ) {
             yield* emitProviderEvent({
               type: "app_thread.created",
               driver,
@@ -3216,8 +3246,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 },
                 title: subagentThreadTitle({
                   parentTitle: context.input.appThread.title,
-                  title: update.title,
-                  prompt: update.prompt,
+                  title: task.title,
+                  prompt: task.prompt,
                   ordinal: context.subagents.size,
                 }),
                 now,
@@ -3225,6 +3255,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 creationSource: "provider",
               }),
             });
+          }
+          if (existing === undefined || task.prompt !== previousPrompt) {
             const promptNativeItemId = `${nativeTaskId}:prompt`;
             const promptArtifacts = makeSubagentConversationArtifacts({
               senderThreadId: context.input.threadId,
@@ -3236,7 +3268,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               providerTurnId: null,
               nativeItemRef: { driver, nativeId: promptNativeItemId, strength: "weak" },
               role: "user",
-              text: update.prompt,
+              text: task.prompt,
               ordinal: 100,
               now,
             });
@@ -3452,6 +3484,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             prompt: subagent.task.prompt,
             title: subagent.task.title,
             model: subagent.task.model,
+            provisional: subagent.provisional,
             status,
             result: child.result,
           });
@@ -3474,6 +3507,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   prompt: subagent.task.prompt,
                   title: subagent.task.title,
                   model: subagent.task.model,
+                  provisional: subagent.provisional,
                   status: "running",
                   result: child.result,
                 });
