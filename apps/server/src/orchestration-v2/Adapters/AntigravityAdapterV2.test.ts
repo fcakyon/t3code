@@ -1269,6 +1269,21 @@ describe("AntigravityAdapterV2 subagent reads", () => {
                 rawOutput: "2: child read marker 4242",
               });
               yield* update({
+                sessionUpdate: "tool_call",
+                toolCallId: `${CHILD}:2`,
+                title: "Running command",
+                kind: "execute",
+                status: "in_progress",
+                rawInput: { command_line: "orc status" },
+              });
+              yield* update({
+                sessionUpdate: "tool_call_update",
+                toolCallId: `${CHILD}:2`,
+                title: "Ran command",
+                status: "completed",
+                rawOutput: { combinedOutput: "all green", exitCode: 0 },
+              });
+              yield* update({
                 sessionUpdate: "agent_message_chunk",
                 content: { type: "text", text: "Subagent finished." },
               });
@@ -1278,11 +1293,20 @@ describe("AntigravityAdapterV2 subagent reads", () => {
         const subagentUpdates = events.flatMap((event) =>
           event.type === "subagent.updated" ? [event.subagent] : [],
         );
+        assert.include(
+          subagentUpdates.map((entry) => entry.progress),
+          "Read file",
+        );
+        assert.include(
+          subagentUpdates.map((entry) => entry.progress),
+          "Ran command: orc status",
+        );
         const lastSubagent = subagentUpdates.at(-1);
         assert.isDefined(lastSubagent);
         assert.equal(lastSubagent?.title, LAUNCH.role);
         assert.equal(lastSubagent?.prompt, LAUNCH.prompt);
         assert.equal(lastSubagent?.status, "completed");
+        assert.isUndefined(lastSubagent?.progress);
         assert.equal(lastSubagent?.result, "marker 4242 found in README.md");
 
         const childThreadId = lastSubagent?.childThreadId;
@@ -1313,6 +1337,19 @@ describe("AntigravityAdapterV2 subagent reads", () => {
         );
         assert.isNotEmpty(childToolItems);
         assert.equal(childToolItems.at(-1)?.status, "completed");
+
+        const childCommandItems = events.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.threadId === childThreadId &&
+          event.turnItem.nativeItemRef?.nativeId === `mock-session-1:3:tool:${CHILD}:2`
+            ? [event.turnItem]
+            : [],
+        );
+        assert.isNotEmpty(childCommandItems);
+        assert.equal(childCommandItems.at(-1)?.type, "command_execution");
+        if (childCommandItems.at(-1)?.type === "command_execution") {
+          assert.equal(childCommandItems.at(-1)?.input, "orc status");
+        }
 
         const parentLeakedChildTools = events.flatMap((event) =>
           event.type === "turn_item.updated" &&

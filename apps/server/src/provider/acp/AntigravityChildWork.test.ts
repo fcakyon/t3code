@@ -10,7 +10,9 @@ import * as Path from "effect/Path";
 import {
   ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
   antigravitySubagentLaunches,
+  antigravitySubagentChildSessionId,
   describeAntigravitySubagentLaunches,
+  makeAntigravitySubagentTracker,
   readAntigravityChildWork,
   readAntigravitySessionSubagentState,
 } from "./AntigravityChildWork.ts";
@@ -469,5 +471,109 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
       expect(children.every((child) => child.truncated)).toBe(true);
       expect(JSON.stringify(children).length).toBeLessThan(600 * 1024);
     }),
+  );
+
+  it.effect(
+    "binds a drifted auto-approved call id to the newest unclaimed DB batch without synthesizing duplicate historical batches",
+    () =>
+      Effect.gen(function* () {
+        const historicalLaunch = { role: "Earlier Researcher", prompt: "Inspect earlier wave" };
+        const historicalChild = "11111111111111111111111111111111";
+        const { profile } = yield* makeProfile({
+          steps: (logUri) => [
+            [10, 15, plannerStep([{ id: "call-old", launches: [historicalLaunch] }])],
+            [
+              11,
+              127,
+              invokeStep({
+                callId: "call-old",
+                launches: [historicalLaunch],
+                children: [{ id: historicalChild, logUri }],
+              }),
+            ],
+            [1669, 15, plannerStep([{ id: "call-new", launches: [LAUNCH] }])],
+            [
+              1670,
+              127,
+              invokeStep({
+                callId: "call-new",
+                launches: [LAUNCH],
+                children: [{ id: CHILD, logUri }],
+              }),
+            ],
+            [
+              1671,
+              101,
+              agentReportStep({
+                recipientSessionId: ROOT,
+                senderConversationId: CHILD,
+                text: "marker 4242 found in README.md",
+              }),
+            ],
+          ],
+        });
+
+        const driftedTaskId = `${ROOT}:1624`;
+        const tracker = makeAntigravitySubagentTracker(profile);
+        const launchNotifications = yield* tracker.rewriteAndDrain({
+          sessionId: ROOT,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: driftedTaskId,
+            title: "Running invoke_subagent",
+            kind: "other",
+            status: "in_progress",
+          },
+        });
+        expect(launchNotifications).toHaveLength(1);
+        const launchUpdate = launchNotifications[0]?.update;
+        expect(
+          launchUpdate?.sessionUpdate === "tool_call"
+            ? antigravitySubagentLaunches(launchUpdate.rawInput)
+            : undefined,
+        ).toEqual([LAUNCH]);
+
+        const childToolNotifications = yield* tracker.rewriteAndDrain({
+          sessionId: ROOT,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: `${CHILD}:1`,
+            title: "Running command",
+            kind: "execute",
+            status: "in_progress",
+            rawInput: { command_line: "orc status" },
+          },
+        });
+        // Must route the child tool call to the drifted batch's child session and never synthesize
+        // phantom tool_call_update notifications for historical `:9` or duplicate `:1668` batches.
+        expect(childToolNotifications).toHaveLength(1);
+        expect(childToolNotifications[0]?.sessionId).toBe(
+          antigravitySubagentChildSessionId(driftedTaskId),
+        );
+
+        const settledNotifications = yield* tracker.rewriteAndDrain({
+          sessionId: ROOT,
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: "processing" },
+          },
+        });
+        expect(settledNotifications.map((entry) => entry.sessionId)).toEqual([
+          antigravitySubagentChildSessionId(driftedTaskId),
+          ROOT,
+          ROOT,
+        ]);
+        expect(settledNotifications[1]?.update).toMatchObject({
+          sessionUpdate: "tool_call_update",
+          toolCallId: driftedTaskId,
+          status: "completed",
+          rawOutput: "marker 4242 found in README.md",
+        });
+
+        const hydratedLaunch = describeAntigravitySubagentLaunches([LAUNCH]);
+        const [resolvedChild] = yield* read(profile, driftedTaskId, hydratedLaunch);
+        expect(resolvedChild?.conversationId).toBe(CHILD);
+        expect(resolvedChild?.role).toBe(LAUNCH.role);
+      }),
   );
 });

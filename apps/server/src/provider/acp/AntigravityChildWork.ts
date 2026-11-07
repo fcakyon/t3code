@@ -461,16 +461,11 @@ const plannerIdxOfTask = (rootSessionId: string, nativeTaskId: string) => {
   return stepId === null ? undefined : stepId[1] === rootSessionId ? Number(stepId[2]) : -1;
 };
 
-const canLookupInvokeRecord = (input: {
+const hasUniqueHydratedLaunchText = (input: {
   readonly rootSessionId: string;
-  readonly nativeTaskId: string;
   readonly launch: BatchLaunch;
   readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
 }): boolean => {
-  const plannerIdx = plannerIdxOfTask(input.rootSessionId, input.nativeTaskId);
-  if (plannerIdx !== undefined) {
-    return plannerIdx >= 0;
-  }
   const sameText = (launch: BatchLaunch) =>
     launch.title === input.launch.title && launch.prompt === input.launch.prompt;
   if (input.siblings.some(sameText)) {
@@ -491,11 +486,24 @@ const canLookupInvokeRecord = (input: {
   return true;
 };
 
+const canLookupInvokeRecord = (input: {
+  readonly rootSessionId: string;
+  readonly nativeTaskId: string;
+  readonly launch: BatchLaunch;
+  readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
+}): boolean => {
+  const plannerIdx = plannerIdxOfTask(input.rootSessionId, input.nativeTaskId);
+  if (plannerIdx !== undefined) {
+    return plannerIdx >= 0;
+  }
+  return hasUniqueHydratedLaunchText(input);
+};
+
 /**
  * Auto-approved calls carry `<sessionId>:<stepUpdateIndex>`; the record at that step update
- * index with the preceding planner call's id is the proof. Permission prompts carry a random id,
- * so the launch text must match one record no auto-approved sibling claims, and no sibling may
- * share the text.
+ * index with the preceding planner call's id is the proof. When compaction or cancelled turns
+ * shift `stepUpdateIndex`, an already-hydrated auto-approved batch falls back to the same
+ * bounded unique launch-text proof used for permission prompts.
  */
 function findInvokeRecord(
   database: NodeSqlite.DatabaseSync,
@@ -508,11 +516,24 @@ function findInvokeRecord(
 ): InvokeRecord | undefined {
   if (!canLookupInvokeRecord(input)) return undefined;
   const plannerIdx = plannerIdxOfTask(input.rootSessionId, input.nativeTaskId);
+  const launchIsHydrated =
+    input.launch.title !== null &&
+    input.launch.title !== ANTIGRAVITY_SUBAGENT_BATCH_TITLE &&
+    input.launch.prompt.trim() !== "";
   if (plannerIdx !== undefined) {
     const entries = readIndexedInvokeRecords(database);
     if (entries === undefined) return undefined;
     const record = provenAutoApprovedRecord(entries, plannerIdx);
-    return record === undefined ? undefined : complete(record);
+    if (
+      record !== undefined &&
+      (!launchIsHydrated ||
+        matchesAntigravitySubagentLaunchDescription(input.launch, record.launches))
+    ) {
+      return complete(record);
+    }
+    if (!launchIsHydrated || !hasUniqueHydratedLaunchText(input)) {
+      return undefined;
+    }
   }
   const totals = database
     .prepare(
@@ -920,6 +941,7 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
       readonly includeBatches: boolean;
       readonly includeReports: boolean;
       readonly updatingTaskId?: string;
+      readonly inferChildConversationId?: string;
     },
   ) => {
     if (profileDirectory === undefined) return Effect.void;
@@ -941,15 +963,25 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
             );
             const claimedStepIndices = new Set<number>();
             for (const candidate of sessionBatches) {
-              if (candidate.matchedDbStepUpdateIndex !== undefined) {
-                claimedStepIndices.add(candidate.matchedDbStepUpdateIndex);
+              if (candidate.matchedDbStepUpdateIndex === undefined) continue;
+              claimedStepIndices.add(candidate.matchedDbStepUpdateIndex);
+              const matchedDbBatch = state.batches.find(
+                (dbBatch) => dbBatch.stepUpdateIndex === candidate.matchedDbStepUpdateIndex,
+              );
+              if (matchedDbBatch !== undefined) {
+                bindDbBatch(
+                  candidate,
+                  matchedDbBatch,
+                  candidate.nativeTaskId !== options.updatingTaskId,
+                );
               }
             }
 
             for (const dbBatch of state.batches) {
+              if (claimedStepIndices.has(dbBatch.stepUpdateIndex)) continue;
               const autoTaskId = `${rootSessionId}:${dbBatch.stepUpdateIndex}`;
               const byAutoId = trackedBatches.get(autoTaskId);
-              if (byAutoId !== undefined) {
+              if (byAutoId !== undefined && byAutoId.matchedDbStepUpdateIndex === undefined) {
                 claimedStepIndices.add(dbBatch.stepUpdateIndex);
                 bindDbBatch(byAutoId, dbBatch, byAutoId.nativeTaskId !== options.updatingTaskId);
                 continue;
@@ -958,7 +990,10 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
                 dbBatch.toolCallId === undefined
                   ? undefined
                   : trackedBatches.get(dbBatch.toolCallId);
-              if (byToolCallId !== undefined) {
+              if (
+                byToolCallId !== undefined &&
+                byToolCallId.matchedDbStepUpdateIndex === undefined
+              ) {
                 claimedStepIndices.add(dbBatch.stepUpdateIndex);
                 bindDbBatch(
                   byToolCallId,
@@ -967,7 +1002,6 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
                 );
                 continue;
               }
-              if (claimedStepIndices.has(dbBatch.stepUpdateIndex)) continue;
               const byLaunch = sessionBatches.find(
                 (candidate) =>
                   candidate.matchedDbStepUpdateIndex === undefined &&
@@ -982,15 +1016,59 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
                 bindDbBatch(byLaunch, dbBatch, byLaunch.nativeTaskId !== options.updatingTaskId);
                 continue;
               }
-              const hasUnmatchedPermissionBatch = sessionBatches.some(
-                (candidate) =>
-                  candidate.matchedDbStepUpdateIndex === undefined &&
-                  !candidate.nativeTaskId.startsWith(`${rootSessionId}:`),
-              );
-              if (!hasUnmatchedPermissionBatch) {
-                const inferred = ensureTrackedBatch(rootSessionId, autoTaskId);
+            }
+
+            // After trajectory compaction or cancelled turns, Antigravity's emitted
+            // `<sessionId>:<stepIndex>` can drift from `idx - silentPlannerSteps`. Bind
+            // unmatched auto-approved batches to the newest unclaimed DB batches rather
+            // than synthesizing historical DB rows as duplicate active subagents.
+            const unmatchedAutoBatches = sessionBatches.filter(
+              (candidate) =>
+                candidate.matchedDbStepUpdateIndex === undefined &&
+                candidate.nativeTaskId.startsWith(`${rootSessionId}:`) &&
+                candidate.launches.length === 0,
+            );
+            if (unmatchedAutoBatches.length > 0) {
+              const maxClaimedStepIndex =
+                claimedStepIndices.size === 0 ? -1 : Math.max(...claimedStepIndices);
+              const candidateDbBatches = state.batches
+                .filter(
+                  (dbBatch) =>
+                    !claimedStepIndices.has(dbBatch.stepUpdateIndex) &&
+                    dbBatch.stepUpdateIndex > maxClaimedStepIndex,
+                )
+                .slice(-unmatchedAutoBatches.length);
+              for (const [index, dbBatch] of candidateDbBatches.entries()) {
+                const targetBatch = unmatchedAutoBatches[index];
+                if (targetBatch === undefined) break;
                 claimedStepIndices.add(dbBatch.stepUpdateIndex);
-                bindDbBatch(inferred, dbBatch, false);
+                bindDbBatch(
+                  targetBatch,
+                  dbBatch,
+                  targetBatch.nativeTaskId !== options.updatingTaskId,
+                );
+              }
+            }
+
+            if (
+              options.inferChildConversationId !== undefined &&
+              !childConversationToBatch.has(options.inferChildConversationId)
+            ) {
+              const hasUnmatchedBatch = sessionBatches.some(
+                (candidate) => candidate.matchedDbStepUpdateIndex === undefined,
+              );
+              const owningDbBatch = state.batches.findLast(
+                (dbBatch) =>
+                  !claimedStepIndices.has(dbBatch.stepUpdateIndex) &&
+                  dbBatch.children.some(
+                    (child) => child.conversationId === options.inferChildConversationId,
+                  ),
+              );
+              if (!hasUnmatchedBatch && owningDbBatch !== undefined) {
+                const autoTaskId = `${rootSessionId}:${owningDbBatch.stepUpdateIndex}`;
+                const inferred = ensureTrackedBatch(rootSessionId, autoTaskId);
+                claimedStepIndices.add(owningDbBatch.stepUpdateIndex);
+                bindDbBatch(inferred, owningDbBatch, false);
               }
             }
           }
@@ -1116,6 +1194,7 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
               yield* syncSubagentsFromDb(rootSessionId, {
                 includeBatches: true,
                 includeReports: false,
+                inferChildConversationId: childPrefix,
               });
             }
             const childBatch = childConversationToBatch.get(childPrefix);
