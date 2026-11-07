@@ -9,6 +9,7 @@ This branch tracks [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code) and
 3. Cancel stale `RUNNING` steps in the session SQLite database before `session/load` so interrupted tasks or subagents do not hang resumed threads ([`05953666b3`](https://github.com/fcakyon/t3code/commit/05953666b3)).
 4. Stream Antigravity subagent tool calls, launch prompts, and completion reports into subagent threads, including auto-approved `invoke_subagent` calls ([`790abd1413`](https://github.com/fcakyon/t3code/commit/790abd1413)).
 5. Show real subagent titles and prompts instead of the "Antigravity subagent batch" and "Running invoke_subagent" placeholders, including after session compaction ([`fa97c35ffb`](https://github.com/fcakyon/t3code/commit/fa97c35ffb)).
+6. Read Antigravity usage limits from the quota host the account is metered on, so a stale `cloudcode-pa` Gemini weekly reading no longer replaces the live `daily-cloudcode-pa` one for Google sign-ins ([pingdotgg/t3code#32425](https://github.com/pingdotgg/t3code/pull/32425)).
 
 ## Release pipeline
 
