@@ -1346,10 +1346,11 @@ describe("AntigravityAdapterV2 subagent reads", () => {
             : [],
         );
         assert.isNotEmpty(childCommandItems);
-        assert.equal(childCommandItems.at(-1)?.type, "command_execution");
-        if (childCommandItems.at(-1)?.type === "command_execution") {
-          assert.equal(childCommandItems.at(-1)?.input, "orc status");
-        }
+        const childCommand = childCommandItems.at(-1);
+        assert.equal(
+          childCommand?.type === "command_execution" ? childCommand.input : undefined,
+          "orc status",
+        );
 
         const parentLeakedChildTools = events.flatMap((event) =>
           event.type === "turn_item.updated" &&

@@ -2965,11 +2965,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           });
         });
 
-        const projectSubagentNotification = Effect.fnUntraced(function* (
+        // Annotated because it and emitSubagent call each other.
+        const projectSubagentNotification: (
           subagent: ActiveAcpSubagent,
           notification: EffectAcpSchema.SessionNotification,
           owner: ActiveAcpTurn,
-        ) {
+        ) => Effect.Effect<void> = Effect.fnUntraced(function* (subagent, notification, owner) {
           const update = notification.update;
           if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
             const nativeTaskId = subagent.task.nativeTaskRef?.nativeId ?? String(subagent.task.id);
