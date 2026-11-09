@@ -11,6 +11,10 @@ This branch tracks [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code) and
 5. Show real subagent titles and prompts instead of the "Antigravity subagent batch" and "Running invoke_subagent" placeholders, and prevent duplicate subagent cards when `stepUpdateIndex` drifts after session compaction ([`fa97c35ffb`](https://github.com/fcakyon/t3code/commit/fa97c35ffb), [`aa4c26ad84`](https://github.com/fcakyon/t3code/commit/aa4c26ad84)).
 6. Read Antigravity usage limits from the quota host the account is metered on, so a stale `cloudcode-pa` Gemini weekly reading no longer replaces the live `daily-cloudcode-pa` one for Google sign-ins ([pingdotgg/t3code#32425](https://github.com/pingdotgg/t3code/pull/32425)).
 
+## Server patches
+
+1. Apply `freshSession` when an agent updates a scheduled task through the `schedule_task` MCP tool. The update path ignored it, so the task kept its previous thread mode.
+
 ## Release pipeline
 
 - Build desktop and CLI nightly releases with fork auto-updates when the `fork-nightly` maintenance task dispatches them ([`aa3e7435e4`](https://github.com/fcakyon/t3code/commit/aa3e7435e4), [`0d63edddb6`](https://github.com/fcakyon/t3code/commit/0d63edddb6)).
