@@ -14,7 +14,6 @@ This branch tracks [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code) and
 ## Server patches
 
 1. Apply `freshSession` when an agent updates a scheduled task through the `schedule_task` MCP tool. The update path ignored it, so the task kept its previous thread mode.
-2. Send Cursor Origin requests through the server's shared HTTP client instead of a private undici client, so the CLI single-executable builds again after [pingdotgg/t3code#33093](https://github.com/pingdotgg/t3code/pull/33093) imported `undici` statically. Take upstream's version once it fixes the build.
 
 ## Release pipeline
 

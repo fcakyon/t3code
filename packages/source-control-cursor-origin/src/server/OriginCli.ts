@@ -1,6 +1,6 @@
 /**
  * Requests borrow the `origin` CLI's session token and go straight to `api.cursor.com/v1/origin`
- * through the server's HTTP client: spawning the CLI per request costs about 0.8s, a warm
+ * over one long-lived HTTP/2 connection: spawning the CLI per request costs about 0.8s, a warm
  * request about 0.2s.
  */
 import * as Clock from "effect/Clock";
@@ -13,6 +13,7 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import { HttpClient, HttpClientRequest } from "effect/http";
+import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStreamText";
 import { decodeJsonResult } from "@t3tools/shared/schemaJson";
 import { parseGitRemoteHost } from "@t3tools/source-control-core/shared/definition";
@@ -485,4 +486,11 @@ const make = Effect.gen(function* () {
   return OriginCli.of({ execute, api, viewer, personalNamespace, resolveRepository });
 });
 
-export const layer = Layer.effect(OriginCli, make);
+/**
+ * Origin answers from a few hundred milliseconds away, so a new TLS connection doubles a request.
+ * A keep-alive agent holds idle connections until Origin closes them. Undici would add HTTP/2, but
+ * the single-executable CLI cannot resolve its static import.
+ */
+const httpClientLayer = NodeHttpClient.layerNodeHttpOptions({ keepAlive: true });
+
+export const layer = Layer.effect(OriginCli, make).pipe(Layer.provide(httpClientLayer));
