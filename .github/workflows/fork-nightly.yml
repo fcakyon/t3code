@@ -1,11 +1,8 @@
 name: Fork Nightly Release
 
 on:
-  push:
-    branches:
-      - nightly
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -30,8 +27,6 @@ jobs:
         id: sync
         shell: bash
         env:
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_SHA: ${{ github.sha }}
           GH_TOKEN: ${{ github.token }}
           GIT_TERMINAL_PROMPT: "0"
         run: |
@@ -56,35 +51,26 @@ jobs:
             git push origin main
           fi
 
-          # 2. Check if nightly already has main merged
+          # 2. Merge main into nightly unless it already contains it
           git checkout -B nightly origin/nightly
-          before_nightly="$(git rev-parse HEAD)"
-
-          if git merge-base --is-ancestor main nightly; then
-            echo "nightly already contains upstream/main (${before_nightly})."
-            if [[ "$GITHUB_EVENT_NAME" == "push" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-              echo "should_build=true" >> "$GITHUB_OUTPUT"
-              echo "ref=${before_nightly}" >> "$GITHUB_OUTPUT"
-            else
-              echo "should_build=false" >> "$GITHUB_OUTPUT"
-              echo "ref=${before_nightly}" >> "$GITHUB_OUTPUT"
+          if ! git merge-base --is-ancestor main nightly; then
+            if ! git merge --no-edit main; then
+              git merge --abort || true
+              echo "::error::Merge conflict syncing upstream/main into nightly. T3 Code scheduled agent will resolve it."
+              exit 1
             fi
-            exit 0
+            git push origin nightly
           fi
 
-          # 3. Auto-merge main into nightly
-          if git merge --no-edit main; then
-            after_nightly="$(git rev-parse HEAD)"
-            git push origin nightly
-            echo "Merged upstream/main into nightly: ${before_nightly} -> ${after_nightly}"
-            # Pushing via GITHUB_TOKEN does not trigger a duplicate workflow run,
-            # so build the newly merged commit directly in this run.
+          # 3. Build only when nightly has commits the latest release lacks
+          ref="$(git rev-parse HEAD)"
+          released="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=1" --jq '.[0].target_commitish // ""')"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" || "$ref" != "$released" ]]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "ref=${after_nightly}" >> "$GITHUB_OUTPUT"
           else
-            git merge --abort || true
-            echo "::error::Merge conflict syncing upstream/main into nightly. T3 Code scheduled agent will resolve it."
-            exit 1
+            echo "nightly ${ref} is already released."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
           fi
 
   build_linux:

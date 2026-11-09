@@ -13,4 +13,4 @@ This branch tracks [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code) and
 
 ## Release pipeline
 
-- Sync `upstream/main` into `nightly` every hour and publish desktop and CLI nightly builds with fork auto-updates ([`aa3e7435e4`](https://github.com/fcakyon/t3code/commit/aa3e7435e4), [`0d63edddb6`](https://github.com/fcakyon/t3code/commit/0d63edddb6)).
+- Sync `upstream/main` into `nightly` every 6 hours and publish desktop and CLI nightly builds with fork auto-updates when `nightly` has unreleased commits ([`aa3e7435e4`](https://github.com/fcakyon/t3code/commit/aa3e7435e4), [`0d63edddb6`](https://github.com/fcakyon/t3code/commit/0d63edddb6)).
