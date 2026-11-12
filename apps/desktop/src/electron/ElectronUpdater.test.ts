@@ -27,6 +27,7 @@ vi.hoisted(() => {
     app: {
       getVersion: () => "1.0.0",
       getName: () => "T3 Code",
+      getPath: () => process.execPath,
       isPackaged: true,
       quit: () => undefined,
       once: () => undefined,
