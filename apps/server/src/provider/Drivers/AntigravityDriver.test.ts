@@ -390,7 +390,7 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         const helper = {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,
-          session: { notices: {} },
+          session: { notices: {}, compaction: {} },
         };
         expect(
           (yield* h.readRequests)
@@ -404,7 +404,7 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           {
             fs: { readTextFile: true, writeTextFile: false },
             terminal: false,
-            session: { notices: {} },
+            session: { notices: {}, compaction: {} },
             elicitation: { form: {} },
           },
         ]);
@@ -433,7 +433,13 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
             modelSelection,
             runtimePolicy: cliPolicy,
           });
-          expect(h.launches.at(-1)?.args).toEqual(["acp"]);
+          expect(h.launches.at(-1)?.args).toEqual([
+            "acp",
+            "--gemini-dir",
+            h.profileDirectory,
+            "--app-data-dir",
+            "antigravity-acp",
+          ]);
           expect(
             (yield* h.readRequests)
               .slice(requestsBefore)
