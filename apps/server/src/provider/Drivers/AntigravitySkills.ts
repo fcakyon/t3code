@@ -37,6 +37,8 @@ export function antigravityUserSkillDirectories(
 const MAX_SKILL_BYTES = 1_000_000;
 const MAX_SCAN_BYTES = 8_000_000;
 const MAX_SCAN_ENTRIES = 10_000;
+// Typical frontmatter fits in one chunk, so most skills cost about this much of the scan budget.
+const SKILL_READ_CHUNK_BYTES = 1024;
 
 const SkillFrontmatter = Schema.Struct({
   name: Schema.optional(Schema.NullOr(Schema.String)),
@@ -106,35 +108,60 @@ function skillPathSortKey(entry: string) {
   );
 }
 
-const readSkill = Effect.fn("readAntigravitySkill")(function* (
-  skillPath: string,
+const DASH = 0x2d;
+
+/** Finds the byte offset after the second `---`, as parseSkillFrontmatter's indexOf calls do. */
+function makeFrontmatterEndFinder() {
+  let bytesSeen = 0;
+  let dashes = 0;
+  let markers = 0;
+  return (chunk: Uint8Array) => {
+    for (const byte of chunk) {
+      bytesSeen += 1;
+      dashes = byte === DASH ? dashes + 1 : 0;
+      if (dashes === 3) {
+        dashes = 0;
+        markers += 1;
+        if (markers === 2) return bytesSeen;
+      }
+    }
+    return undefined;
+  };
+}
+
+/** Read skill frontmatter or plugin JSON within the shared scan budget. */
+const readAntigravityFile = Effect.fn("readAntigravitySkill")(function* (
+  filePath: string,
   budget: ScanBudget,
+  format: "frontmatter" | "json",
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
-  const info = yield* readIfPresent(fileSystem.stat(skillPath), skillPath);
+  const info = yield* readIfPresent(fileSystem.stat(filePath), filePath);
   if (info?.type !== "File") return undefined;
 
   const byteLimit = Math.min(MAX_SKILL_BYTES, budget.remainingBytes);
-  if (info.size > BigInt(byteLimit)) {
-    return yield* new AntigravitySkillsProbeError({
-      reason: "scan-budget-exhausted",
-      path: skillPath,
-    });
-  }
+  const findFrontmatterEnd =
+    format === "frontmatter" ? makeFrontmatterEndFinder() : () => undefined;
+  let frontmatterEnd: number | undefined;
   const chunks = yield* readIfPresent(
-    fileSystem.stream(skillPath, { bytesToRead: byteLimit + 1 }).pipe(Stream.runCollect),
-    skillPath,
+    fileSystem
+      .stream(filePath, { bytesToRead: byteLimit + 1, chunkSize: SKILL_READ_CHUNK_BYTES })
+      .pipe(
+        Stream.takeUntil((chunk) => (frontmatterEnd = findFrontmatterEnd(chunk)) !== undefined),
+        Stream.runCollect,
+      ),
+    filePath,
   );
   if (chunks === undefined) return undefined;
   const bytes = Buffer.concat(chunks);
-  if (bytes.byteLength > byteLimit) {
+  budget.remainingBytes -= bytes.byteLength;
+  if ((frontmatterEnd ?? bytes.byteLength) > byteLimit) {
     return yield* new AntigravitySkillsProbeError({
       reason: "scan-budget-exhausted",
-      path: skillPath,
+      path: filePath,
     });
   }
-  budget.remainingBytes -= bytes.byteLength;
-  return bytes.toString("utf8");
+  return bytes.toString("utf8", 0, frontmatterEnd);
 });
 
 interface SkillRoot {
@@ -172,7 +199,7 @@ const scanSkillDirectories = Effect.fn("scanAntigravitySkillDirectories")(functi
     if (skillFileName !== undefined) {
       if (!skillFileName.endsWith(".md")) return;
       const skillPath = path.join(directory, skillFileName);
-      const contents = yield* readSkill(skillPath, budget);
+      const contents = yield* readAntigravityFile(skillPath, budget, "frontmatter");
       if (contents === undefined) return;
       const skill = parseSkillFrontmatter(contents, skillFileName);
       if (!skill || skillsByName.has(skill.name)) return;
@@ -238,7 +265,7 @@ const discoverAntigravityPlugins = Effect.fn("discoverAntigravityPlugins")(funct
   }
   budget.remainingEntries -= entries.length;
   const preferencesPath = path.join(config, "config.json");
-  const preferencesContents = yield* readSkill(preferencesPath, budget);
+  const preferencesContents = yield* readAntigravityFile(preferencesPath, budget, "json");
   const preferences =
     preferencesContents === undefined
       ? { plugins: {} }
@@ -262,7 +289,7 @@ const discoverAntigravityPlugins = Effect.fn("discoverAntigravityPlugins")(funct
     const enabled = preferences.plugins?.[entry]?.enabled;
     if (enabled === false) continue;
     const manifestPath = path.join(pluginDirectory, "plugin.json");
-    const contents = yield* readSkill(manifestPath, budget);
+    const contents = yield* readAntigravityFile(manifestPath, budget, "json");
     if (contents === undefined) continue;
     const manifest = yield* decodePluginManifest(contents).pipe(
       Effect.catchTags({
