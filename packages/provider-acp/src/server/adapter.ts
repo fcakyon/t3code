@@ -24,6 +24,7 @@ import {
   type ProviderInstanceId,
   type ProviderInteractionMode,
   type ProviderDriverKind,
+  type ProviderOptionSelection,
   type ProviderRequestKind,
   type ProviderThreadId,
   type ProviderUserInputAnswers,
@@ -36,7 +37,7 @@ import {
 } from "@t3tools/contracts";
 import { AgentScope, AgentScopeThreadId } from "@t3tools/shared/AgentScope";
 import { HTML_RENDER_TOOL_NAME } from "@t3tools/shared/htmlRender";
-import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { createModelSelection, modelSelectionsEqual } from "@t3tools/shared/model";
 import { type SelfInvocation, selfInvocationArgs } from "@t3tools/shared/nodeRuntime";
 import { resolveT3McpToolId } from "@t3tools/shared/t3McpToolPresentation";
 import {
@@ -542,6 +543,7 @@ export interface AcpAdapterV2Flavor {
   ) => AcpSubagentSessionEvent | undefined;
   readonly extractSubagentUpdate?: (
     toolCall: AcpToolCallState,
+    context?: AcpSubagentUpdateContext,
   ) => AcpAdapterV2SubagentUpdate | undefined;
   readonly isProvisionalSubagentTool?: (toolCall: AcpToolCallState) => boolean;
   readonly normalizeToolCall?: (toolCall: AcpToolCallState) => AcpToolCallState;
@@ -656,11 +658,16 @@ export type AcpSubagentSessionEvent =
       readonly prompt: string;
     };
 
+export interface AcpSubagentUpdateContext {
+  readonly parentModelSelection?: ModelSelection;
+}
+
 export interface AcpAdapterV2SubagentUpdate {
   readonly nativeTaskId: string;
   readonly prompt: string;
   readonly title: string | null;
   readonly model: string | null;
+  readonly modelSelection?: ModelSelection;
   readonly status:
     | "pending"
     | "running"
@@ -673,6 +680,46 @@ export interface AcpAdapterV2SubagentUpdate {
   readonly result: string | null;
   readonly provisional?: boolean;
   readonly suppressNormalTool?: boolean;
+}
+
+function resolveAcpSubagentParentModelSelection(input: {
+  readonly requestedSelection: ModelSelection;
+  readonly configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
+  readonly setupModels: EffectAcpSchema.SessionModelState | null | undefined;
+  readonly appliedModel: string | undefined;
+}): ModelSelection {
+  const configuredModel =
+    findModelConfigOption(input.configOptions)?.currentValue.trim() ||
+    input.setupModels?.currentModelId.trim() ||
+    input.appliedModel?.trim() ||
+    input.requestedSelection.model.trim();
+  const liveOptions: Array<ProviderOptionSelection> = [];
+  const seenOptionIds = new Set<string>();
+  for (const option of input.configOptions) {
+    if (
+      option.category === "model" ||
+      option.id === "model" ||
+      option.category === "mode" ||
+      option.category === "collaboration_mode" ||
+      option.id === ACP_SESSION_MODE_OPTION_ID
+    ) {
+      continue;
+    }
+    if (option.type === "select") {
+      const value = option.currentValue.trim();
+      if (!value) continue;
+      liveOptions.push({ id: option.id, value });
+      seenOptionIds.add(option.id);
+    } else if (option.type === "boolean") {
+      liveOptions.push({ id: option.id, value: option.currentValue });
+      seenOptionIds.add(option.id);
+    }
+  }
+  const mergedOptions = [
+    ...(input.requestedSelection.options ?? []).filter((option) => !seenOptionIds.has(option.id)),
+    ...liveOptions,
+  ];
+  return createModelSelection(input.requestedSelection.instanceId, configuredModel, mergedOptions);
 }
 
 export interface AcpAdapterV2Options {
@@ -2016,10 +2063,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         > | null = null;
         const agentRequests = new Set<object>();
         const nativeChildren = new Map<string, AcpNativeChildSession>();
-        const extractSubagentUpdate = (tool: AcpToolCallState) =>
+        let lastAppliedModel: string | undefined;
+        const extractSubagentUpdate = (
+          tool: AcpToolCallState,
+          subagentContext?: AcpSubagentUpdateContext,
+        ) =>
           flavor.extractSubagentSessionEvent !== undefined && !followsAgentWorkState
             ? undefined
-            : flavor.extractSubagentUpdate?.(tool);
+            : flavor.extractSubagentUpdate?.(tool, subagentContext);
         let turnAttached = yield* Deferred.make<boolean>();
         const activeSessionId = yield* Ref.make<string | null>(null);
         const contextUsageBySessionId = yield* Ref.make(
@@ -2048,6 +2099,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           agentWork = null;
           agentRequests.clear();
           nativeChildren.clear();
+          lastAppliedModel = undefined;
           yield* Ref.set(activeSessionSetup, setup);
         });
         const activeSelection = yield* Ref.make<ModelSelection | null>(null);
@@ -2603,6 +2655,53 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             : Scope.close(runtimeScope, Exit.void).pipe(Effect.ignore),
         );
 
+        let cachedSubagentContext:
+          | {
+              readonly requestedSelection: ModelSelection;
+              readonly configOptions: ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
+              readonly setupModels: EffectAcpSchema.SessionModelState | null | undefined;
+              readonly appliedModel: string | undefined;
+              readonly value: AcpSubagentUpdateContext;
+            }
+          | undefined;
+        const extractTurnSubagentUpdate = Effect.fnUntraced(function* (
+          context: ActiveAcpTurn,
+          tool: AcpToolCallState,
+        ): Effect.fn.Return<AcpAdapterV2SubagentUpdate | undefined> {
+          if (
+            flavor.extractSubagentUpdate === undefined ||
+            (flavor.extractSubagentSessionEvent !== undefined && !followsAgentWorkState)
+          ) {
+            return undefined;
+          }
+          const configOptions = runtime === undefined ? [] : yield* runtime.getConfigOptions;
+          const setupModels = (yield* Ref.get(activeSessionSetup))?.sessionSetupResult.models;
+          const requestedSelection = context.input.modelSelection;
+          if (
+            cachedSubagentContext === undefined ||
+            cachedSubagentContext.requestedSelection !== requestedSelection ||
+            cachedSubagentContext.configOptions !== configOptions ||
+            cachedSubagentContext.setupModels !== setupModels ||
+            cachedSubagentContext.appliedModel !== lastAppliedModel
+          ) {
+            cachedSubagentContext = {
+              requestedSelection,
+              configOptions,
+              setupModels,
+              appliedModel: lastAppliedModel,
+              value: {
+                parentModelSelection: resolveAcpSubagentParentModelSelection({
+                  requestedSelection,
+                  configOptions,
+                  setupModels,
+                  appliedModel: lastAppliedModel,
+                }),
+              },
+            };
+          }
+          return flavor.extractSubagentUpdate(tool, cachedSubagentContext.value);
+        });
+
         const resolveItemOrdinal = (context: ActiveAcpTurn, nativeItemId: string) =>
           Effect.sync(() => {
             const existing = context.itemOrdinals.get(nativeItemId);
@@ -3122,7 +3221,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             for (const event of parseSessionUpdateEvent(notification).events) {
               if (event._tag !== "ToolCallUpdated") continue;
               const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
-              const subagentUpdate = extractSubagentUpdate(toolCall);
+              const subagentUpdate = yield* extractTurnSubagentUpdate(owner, toolCall);
               if (subagentUpdate !== undefined) {
                 if (
                   subagentUpdate.nativeTaskId === nativeTaskId ||
@@ -3415,6 +3514,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           const previousTitle = existing?.task.title ?? null;
           const previousPrompt = existing?.task.prompt ?? "";
           const previousModel = existing?.task.model ?? null;
+          const previousModelSelection = existing?.task.modelSelection;
           const replaceProvisional = existing?.provisional === true && update.provisional !== true;
           const nextTitle =
             update.title !== null && (previousTitle === null || replaceProvisional)
@@ -3428,27 +3528,32 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 ? update.prompt
                 : previousPrompt;
           const nextModel = update.model?.trim() || previousModel;
+          const nextModelSelection =
+            update.modelSelection !== undefined &&
+            (previousModelSelection === undefined || replaceProvisional)
+              ? update.modelSelection
+              : previousModelSelection;
+          const baseTask = existing?.task ?? {
+            id: nodeId,
+            threadId: context.input.threadId,
+            runId: context.input.runId,
+            parentNodeId: context.input.rootNodeId,
+            origin: "provider_native" as const,
+            createdBy: "agent" as const,
+            driver,
+            providerInstanceId: context.input.modelSelection.instanceId,
+            providerThreadId: null,
+            childThreadId,
+            nativeTaskRef: nativeItemRef,
+            result: null,
+            startedAt: now,
+          };
           const task: OrchestrationV2Subagent = {
-            ...(existing?.task ?? {
-              id: nodeId,
-              threadId: context.input.threadId,
-              runId: context.input.runId,
-              parentNodeId: context.input.rootNodeId,
-              origin: "provider_native" as const,
-              createdBy: "agent" as const,
-              driver,
-              providerInstanceId: context.input.modelSelection.instanceId,
-              providerThreadId: null,
-              childThreadId,
-              nativeTaskRef: nativeItemRef,
-              prompt: nextPrompt,
-              title: nextTitle,
-              result: null,
-              startedAt: now,
-            }),
+            ...baseTask,
             prompt: nextPrompt,
             title: nextTitle,
             model: nextModel,
+            ...(nextModelSelection === undefined ? {} : { modelSelection: nextModelSelection }),
             status: taskStatus,
             result: update.result ?? existing?.task.result ?? null,
             completedAt: acpSubagentStatusIsTerminal(taskStatus) ? now : null,
@@ -3484,11 +3589,17 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           subagent.task = task;
           context.subagents.set(nativeTaskId, subagent);
 
+          const modelSelectionChanged =
+            previousModelSelection === undefined
+              ? nextModelSelection !== undefined
+              : nextModelSelection === undefined ||
+                !modelSelectionsEqual(previousModelSelection, nextModelSelection);
           if (
             existing === undefined ||
             task.title !== previousTitle ||
             task.prompt !== previousPrompt ||
-            task.model !== previousModel
+            task.model !== previousModel ||
+            modelSelectionChanged
           ) {
             yield* emitProviderEvent({
               type: "app_thread.created",
@@ -3499,7 +3610,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 parentNodeId: nodeId,
                 activeProviderThreadId: null,
                 providerInstanceId: context.input.modelSelection.instanceId,
-                modelSelection: {
+                modelSelection: nextModelSelection ?? {
                   ...context.input.modelSelection,
                   model: task.model ?? context.input.modelSelection.model,
                 },
@@ -4253,7 +4364,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           // Monitor TaskOutput resembles subagent hydration; do not invent a subagent.
           const subagentUpdate = hydratedRegisteredMonitor
             ? undefined
-            : extractSubagentUpdate(toolCall);
+            : yield* extractTurnSubagentUpdate(context, toolCall);
           if (subagentUpdate !== undefined) {
             yield* emitSubagent(context, subagentUpdate);
             if (followsAgentWorkState) yield* syncNativeChildren(context);
@@ -6448,7 +6559,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             for (const event of parseSessionUpdateEvent(notification).events) {
               if (event._tag !== "ToolCallUpdated") continue;
               const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
-              const subagentUpdate = extractSubagentUpdate(toolCall);
+              const subagentUpdate = yield* extractTurnSubagentUpdate(context, toolCall);
               if (
                 subagentUpdate === undefined ||
                 !acpSubagentStatusIsTerminal(subagentUpdate.status)
@@ -7589,6 +7700,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             }
           }
           if (appliedModel !== undefined) {
+            lastAppliedModel = appliedModel;
             const applied = appliedModel;
             yield* Ref.update(activeSessionSetup, (setup) => {
               if (setup === null) {
@@ -7606,6 +7718,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 },
               };
             });
+          } else {
+            lastAppliedModel = undefined;
           }
           const configOptions = yield* runtime.getConfigOptions;
           // Under a policy ceiling, a mode the user picks applies only when the flavor can place
@@ -8388,6 +8502,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           yield* Ref.set(activeSessionId, null);
           yield* Ref.set(activeSessionSetup, null);
           yield* Ref.set(activeSelection, null);
+          lastAppliedModel = undefined;
           yield* Ref.set(activeInteractionMode, null);
           // A failed prompt may have been dropped, so the fresh runtime sends T3's notes again.
           yield* Ref.set(promptInstructionStates, new Map());

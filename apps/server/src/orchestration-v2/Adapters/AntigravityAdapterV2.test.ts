@@ -2,8 +2,10 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
+  ANTIGRAVITY_DEFAULT_MODEL,
   ChatFileAttachment,
   MessageId,
+  type ModelSelection,
   NodeId,
   ProjectId,
   ProviderInstanceId,
@@ -123,6 +125,128 @@ describe("AntigravityAdapterV2 flavor", () => {
     });
     assert.equal(launch?.title, "Readme Reader");
     assert.equal(launch?.prompt, "Read README.md");
+    assert.isNull(launch?.model);
+    assert.isUndefined(launch?.modelSelection);
+  });
+
+  it("resolves subagent model and reasoning tier from launch specs and parent selection", () => {
+    const instanceId = ProviderInstanceId.make("antigravity-test");
+    const parentModelSelection: ModelSelection = {
+      instanceId,
+      model: "gemini-3.8-pro",
+      options: [{ id: "thinking_level", value: "high" }],
+    };
+
+    const provisional = flavor.extractSubagentUpdate?.(
+      {
+        toolCallId: "trajectory:9",
+        title: "Running invoke_subagent",
+        kind: "other",
+        status: "inProgress",
+        data: {},
+      },
+      { parentModelSelection },
+    );
+    assert.isTrue(provisional?.provisional);
+    assert.isNull(provisional?.model);
+    assert.isUndefined(provisional?.modelSelection);
+
+    for (const launch of [
+      { Role: "Inherited Reader", Prompt: "Inspect auth" },
+      { Role: "Explicit Inherit", Prompt: "Inspect auth", Model: "inherit" },
+    ]) {
+      const inherited = flavor.extractSubagentUpdate?.(
+        {
+          toolCallId: "call-inherit",
+          title: "Running invoke_subagent",
+          kind: "other",
+          status: "inProgress",
+          data: { rawInput: { Subagents: [launch] } },
+        },
+        { parentModelSelection },
+      );
+      assert.equal(inherited?.model, "gemini-3.8-pro");
+      assert.deepEqual(inherited?.modelSelection, parentModelSelection);
+    }
+
+    for (const [tier, expected] of [
+      ["flash_lite", "Flash Lite"],
+      ["flash", "Flash"],
+      ["pro", "Pro"],
+      ["claude-sonnet-4-6", "claude-sonnet-4-6"],
+    ] as const) {
+      const overridden = flavor.extractSubagentUpdate?.(
+        {
+          toolCallId: `call-${tier}`,
+          title: "Running invoke_subagent",
+          kind: "other",
+          status: "inProgress",
+          data: {
+            rawInput: {
+              Subagents: [{ Role: "Specialist", Prompt: "Check", Model: tier }],
+            },
+          },
+        },
+        { parentModelSelection },
+      );
+      assert.equal(overridden?.model, expected);
+      assert.deepEqual(overridden?.modelSelection, { instanceId, model: expected });
+    }
+
+    const mixedBatch = flavor.extractSubagentUpdate?.(
+      {
+        toolCallId: "call-mixed",
+        title: "Running invoke_subagent",
+        kind: "other",
+        status: "inProgress",
+        data: {
+          rawInput: {
+            Subagents: [
+              { Role: "Fast", Prompt: "One", Model: "flash" },
+              { Role: "Deep", Prompt: "Two", Model: "pro" },
+            ],
+          },
+        },
+      },
+      { parentModelSelection },
+    );
+    assert.isNull(mixedBatch?.model);
+    assert.isUndefined(mixedBatch?.modelSelection);
+
+    const sameBatch = flavor.extractSubagentUpdate?.(
+      {
+        toolCallId: "call-same",
+        title: "Running invoke_subagent",
+        kind: "other",
+        status: "inProgress",
+        data: {
+          rawInput: {
+            Subagents: [
+              { Role: "Fast 1", Prompt: "One", Model: "flash" },
+              { Role: "Fast 2", Prompt: "Two", Model: "flash" },
+            ],
+          },
+        },
+      },
+      { parentModelSelection },
+    );
+    assert.equal(sameBatch?.model, "Flash");
+    assert.deepEqual(sameBatch?.modelSelection, { instanceId, model: "Flash" });
+
+    const defaultSentinelParent = flavor.extractSubagentUpdate?.(
+      {
+        toolCallId: "call-default-sentinel",
+        title: "Running invoke_subagent",
+        kind: "other",
+        status: "inProgress",
+        data: {
+          rawInput: { Subagents: [{ Role: "Reader", Prompt: "Check", Model: "inherit" }] },
+        },
+      },
+      { parentModelSelection: { instanceId, model: ANTIGRAVITY_DEFAULT_MODEL } },
+    );
+    assert.isNull(defaultSentinelParent?.model);
+    assert.isUndefined(defaultSentinelParent?.modelSelection);
   });
 
   it("routes interaction_* permission requests to the question card", () => {
@@ -1109,6 +1233,9 @@ describe("AntigravityAdapterV2 subagent reads", () => {
   const runSubagentTurn = (input: {
     readonly slug: string;
     readonly profile: string;
+    readonly defaultModel?: string;
+    readonly modelSelection?: (instanceId: ProviderInstanceId) => ModelSelection;
+    readonly extraConfigOptions?: ReadonlyArray<EffectAcpSchema.SessionConfigOption>;
     readonly runPrompt: (
       update: (
         payload: EffectAcpSchema.SessionUpdate,
@@ -1148,6 +1275,13 @@ describe("AntigravityAdapterV2 subagent reads", () => {
             Effect.provideService(SecureRandom.SecureRandom, crypto),
             Effect.map((runtime): RuntimeService => ({
               ...runtime,
+              getConfigOptions: runtime.getConfigOptions.pipe(
+                Effect.map((options) => [...options, ...(input.extraConfigOptions ?? [])]),
+              ),
+              setConfigOption: (configId, value, options) =>
+                input.extraConfigOptions?.some((candidate) => candidate.id === configId)
+                  ? Effect.succeed({ configOptions: [] })
+                  : runtime.setConfigOption(configId, value, options),
               handleSessionUpdate: (handler) =>
                 Effect.sync(() => {
                   sessionUpdate = handler;
@@ -1171,14 +1305,17 @@ describe("AntigravityAdapterV2 subagent reads", () => {
             })),
           ),
         withProcess: (_stop, task) => task,
-        defaultModel: Effect.undefined,
+        defaultModel: Effect.succeed(input.defaultModel),
       });
       const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
         runtimeMode: "full-access",
         interactionMode: "default",
         cwd: workspace,
       });
-      const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+      const modelSelection: ModelSelection = input.modelSelection?.(instanceId) ?? {
+        instanceId,
+        model: "gemini-test-low",
+      };
       const session = yield* adapter.openSession({
         threadId,
         providerSessionId: ProviderSessionId.make(`provider-session-ag-subagent-${input.slug}`),
@@ -1238,7 +1375,7 @@ describe("AntigravityAdapterV2 subagent reads", () => {
           Stream.runCollect,
         ),
       );
-      return { events, threadId };
+      return { events, instanceId, threadId };
     });
 
   it.effect(
@@ -1495,6 +1632,131 @@ describe("AntigravityAdapterV2 subagent reads", () => {
             : [],
         );
         assert.equal(childUserPrompts.at(-1), LAUNCH.prompt);
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect(
+    "populates inherited model + thinking_level and tier overrides on DB-hydrated subagents",
+    () =>
+      Effect.gen(function* () {
+        const inheritedLaunch = {
+          role: "Inherited Researcher",
+          prompt: "Inspect auth flow",
+          model: "inherit",
+        };
+        const flashLaunch = {
+          role: "Flash Scanner",
+          prompt: "Scan imports",
+          model: "flash",
+        };
+        const { profile } = yield* makeProfile({
+          sessionId: "mock-session-1",
+          steps: (logUri) => [
+            [1, 15, plannerStep(["call-inherit"])],
+            [
+              2,
+              127,
+              invokeStep({
+                callId: "call-inherit",
+                launches: [inheritedLaunch],
+                children: [{ id: CHILD, logUri }],
+              }),
+            ],
+            [3, 15, plannerStep(["call-flash"])],
+            [
+              4,
+              127,
+              invokeStep({
+                callId: "call-flash",
+                launches: [flashLaunch],
+                children: [{ id: "b468c0e1d2f34a5b6c7d8e9f0a1b2c3d", logUri }],
+              }),
+            ],
+          ],
+        });
+
+        const { events, instanceId } = yield* runSubagentTurn({
+          slug: "model-metadata",
+          profile,
+          defaultModel: "gemini-test-high",
+          modelSelection: (id) => ({
+            instanceId: id,
+            model: ANTIGRAVITY_DEFAULT_MODEL,
+            options: [{ id: "thinking_level", value: "high" }],
+          }),
+          extraConfigOptions: [
+            {
+              id: "thinking_level",
+              name: "Thinking",
+              category: "thought_level",
+              type: "select",
+              currentValue: "high",
+              options: [{ value: "high", name: "High" }],
+            },
+          ],
+          runPrompt: (update) =>
+            Effect.gen(function* () {
+              yield* update({
+                sessionUpdate: "tool_call",
+                toolCallId: "mock-session-1:1",
+                title: "Running invoke_subagent",
+                kind: "other",
+                status: "in_progress",
+                rawInput: {},
+              });
+              yield* update({
+                sessionUpdate: "tool_call",
+                toolCallId: "mock-session-1:3",
+                title: "Running invoke_subagent",
+                kind: "other",
+                status: "in_progress",
+                rawInput: {},
+              });
+              yield* update({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Done." },
+              });
+            }),
+        });
+
+        const subagentUpdates = events.flatMap((event) =>
+          event.type === "subagent.updated" ? [event.subagent] : [],
+        );
+        const inheritedSubagent = subagentUpdates.findLast(
+          (entry) => entry.nativeTaskRef?.nativeId === "mock-session-1:1",
+        );
+        const flashSubagent = subagentUpdates.findLast(
+          (entry) => entry.nativeTaskRef?.nativeId === "mock-session-1:3",
+        );
+
+        assert.equal(inheritedSubagent?.model, "gemini-test-high");
+        assert.deepEqual(inheritedSubagent?.modelSelection, {
+          instanceId,
+          model: "gemini-test-high",
+          options: [{ id: "thinking_level", value: "high" }],
+        });
+
+        assert.equal(flashSubagent?.model, "Flash");
+        assert.deepEqual(flashSubagent?.modelSelection, {
+          instanceId,
+          model: "Flash",
+        });
+
+        const inheritedChildThread = events.findLast(
+          (event) =>
+            event.type === "app_thread.created" &&
+            event.appThread.id === inheritedSubagent?.childThreadId,
+        );
+        assert.deepEqual(
+          inheritedChildThread?.type === "app_thread.created"
+            ? inheritedChildThread.appThread.modelSelection
+            : undefined,
+          {
+            instanceId,
+            model: "gemini-test-high",
+            options: [{ id: "thinking_level", value: "high" }],
+          },
+        );
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });

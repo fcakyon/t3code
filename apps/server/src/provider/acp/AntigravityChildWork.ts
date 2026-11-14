@@ -38,10 +38,19 @@ const AGENT_REPORT_SENDER_CONVERSATION_ID = 3;
 const AGENT_REPORT_TEXT = 4;
 const STEP_INVOKE_SUBAGENT = 143;
 const INVOKE_SPECS = 9;
+const INVOKE_SPEC_MODEL_TIER = 8;
 const INVOKE_RESULTS = 10;
 const PLANNER_RESPONSE_STEP_TYPE = 15;
 const SYSTEM_MESSAGE_STEP_TYPE = 101;
 const INVOKE_SUBAGENT_STEP_TYPE = 127;
+
+// exa.cortex_pb.ModelTier
+export const MODEL_TIER_NAMES: Readonly<Record<number, string>> = {
+  1: "inherit",
+  2: "flash_lite",
+  3: "flash",
+  4: "pro",
+};
 
 // One open reads at most this much; past any bound the batch view stays as it was.
 const MAX_STEP_BYTES = 1024 * 1024;
@@ -62,6 +71,7 @@ export const antigravitySubagentChildSessionId = (nativeTaskId: string) =>
 export interface AntigravityChildLaunch {
   readonly role: string;
   readonly prompt: string;
+  readonly model?: string;
 }
 
 export interface AntigravitySubagentBatchState {
@@ -84,7 +94,13 @@ export interface AntigravitySessionSubagentState {
 
 const decodeLaunchInput = Schema.decodeUnknownOption(
   Schema.Struct({
-    Subagents: Schema.NonEmptyArray(Schema.Struct({ Role: Schema.String, Prompt: Schema.String })),
+    Subagents: Schema.NonEmptyArray(
+      Schema.Struct({
+        Role: Schema.String,
+        Prompt: Schema.String,
+        Model: Schema.optionalKey(Schema.Unknown),
+      }),
+    ),
   }),
 );
 
@@ -94,7 +110,14 @@ export function antigravitySubagentLaunches(
 ): ReadonlyArray<AntigravityChildLaunch> | undefined {
   return Option.getOrUndefined(
     Option.map(decodeLaunchInput(input), (decoded) =>
-      decoded.Subagents.map((entry) => ({ role: entry.Role, prompt: entry.Prompt })),
+      decoded.Subagents.map((entry) => {
+        const model = typeof entry.Model === "string" ? entry.Model.trim() : "";
+        return {
+          role: entry.Role,
+          prompt: entry.Prompt,
+          ...(model ? { model } : {}),
+        };
+      }),
     ),
   );
 }
@@ -103,6 +126,7 @@ export const toAntigravitySubagentRawInput = (launches: ReadonlyArray<Antigravit
   Subagents: launches.map((launch) => ({
     Role: launch.role,
     Prompt: launch.prompt,
+    ...(launch.model ? { Model: launch.model } : {}),
   })),
 });
 
@@ -119,9 +143,11 @@ export function describeAntigravitySubagentLaunches(
       };
 }
 
-/** Length-delimited fields only; varints and fixed values are skipped. */
-function protoFields(bytes: Uint8Array): ReadonlyArray<readonly [number, Uint8Array]> {
-  const fields: Array<readonly [number, Uint8Array]> = [];
+function walkProtoFields(
+  bytes: Uint8Array,
+  onDelimited: (field: number, value: Uint8Array) => void,
+  onVarint?: (field: number, value: number) => void,
+): void {
   let offset = 0;
   const varint = () => {
     let value = 0;
@@ -137,19 +163,29 @@ function protoFields(bytes: Uint8Array): ReadonlyArray<readonly [number, Uint8Ar
     const key = varint();
     const wire = key % 8;
     const field = Math.floor(key / 8);
-    if (wire === 0) varint();
-    else if (wire === 1) offset += 8;
+    if (wire === 0) {
+      const value = varint();
+      onVarint?.(field, value);
+    } else if (wire === 1) offset += 8;
     else if (wire === 5) offset += 4;
     else if (wire === 2) {
       const length = varint();
       if (offset + length > bytes.length) throw new Error("Truncated field");
-      fields.push([field, bytes.subarray(offset, offset + length)]);
+      onDelimited(field, bytes.subarray(offset, offset + length));
       offset += length;
     } else throw new Error("Unsupported wire type");
   }
   if (offset > bytes.length) throw new Error("Truncated field");
-  return fields;
 }
+
+/** Length-delimited fields only; varints and fixed values are skipped. */
+const protoFields = (bytes: Uint8Array): ReadonlyArray<readonly [number, Uint8Array]> => {
+  const fields: Array<readonly [number, Uint8Array]> = [];
+  walkProtoFields(bytes, (field, value) => {
+    fields.push([field, value]);
+  });
+  return fields;
+};
 
 // Keep a leading byte order mark: T3 stores launch text with it.
 const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -193,6 +229,46 @@ const decodeLaunchJson = (value: string | undefined): ReadonlyArray<AntigravityC
         () => [],
       );
 
+const mergeLaunchModels = (
+  primary: ReadonlyArray<AntigravityChildLaunch>,
+  fallback: ReadonlyArray<AntigravityChildLaunch>,
+): ReadonlyArray<AntigravityChildLaunch> => {
+  if (primary.length === 0) return fallback;
+  if (primary.length !== fallback.length) return primary;
+  let changed = false;
+  const merged = primary.map((launch, index) => {
+    if (launch.model !== undefined) return launch;
+    const fallbackModel = fallback[index]?.model;
+    if (fallbackModel === undefined) return launch;
+    changed = true;
+    return { ...launch, model: fallbackModel };
+  });
+  return changed ? merged : primary;
+};
+
+const decodeInvokeSpec = (spec: Uint8Array): AntigravityChildLaunch => {
+  let role: string | undefined;
+  let prompt: string | undefined;
+  let model: string | undefined;
+  walkProtoFields(
+    spec,
+    (field, value) => {
+      if (field === 2 && role === undefined) role = textDecoder.decode(value);
+      else if (field === 3 && prompt === undefined) prompt = textDecoder.decode(value);
+    },
+    (field, value) => {
+      if (field === INVOKE_SPEC_MODEL_TIER && model === undefined) {
+        model = MODEL_TIER_NAMES[value];
+      }
+    },
+  );
+  return {
+    role: role ?? "",
+    prompt: prompt ?? "",
+    ...(model !== undefined ? { model } : {}),
+  };
+};
+
 const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => {
   const metadataCall = message(message(payload, STEP_METADATA), METADATA_TOOL_CALL);
   const toolCallId = text(metadataCall, 1);
@@ -206,13 +282,11 @@ const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => {
         }));
   if (!children.every((child) => NATIVE_ID.test(child.conversationId))) return undefined;
   const specLaunches =
-    invoke === undefined
-      ? []
-      : messages(invoke, INVOKE_SPECS).map((spec) => ({
-          role: text(spec, 2) ?? "",
-          prompt: text(spec, 3) ?? "",
-        }));
-  const launches = specLaunches.length > 0 ? specLaunches : decodeLaunchJson(text(metadataCall, 3));
+    invoke === undefined ? [] : messages(invoke, INVOKE_SPECS).map(decodeInvokeSpec);
+  const launches =
+    specLaunches.length === 0 || specLaunches.some((launch) => launch.model === undefined)
+      ? mergeLaunchModels(specLaunches, decodeLaunchJson(text(metadataCall, 3)))
+      : specLaunches;
   if (invoke === undefined && launches.length === 0) return undefined;
   return {
     toolCallId,
@@ -407,11 +481,8 @@ function readIndexedInvokeRecords(
           ? undefined
           : plannerCalls?.find((call) => call.id === decoded.toolCallId)?.launches;
       const record =
-        decoded !== undefined &&
-        decoded.launches.length === 0 &&
-        plannerLaunches !== undefined &&
-        plannerLaunches.length > 0
-          ? { ...decoded, launches: plannerLaunches }
+        decoded !== undefined && plannerLaunches !== undefined && plannerLaunches.length > 0
+          ? { ...decoded, launches: mergeLaunchModels(decoded.launches, plannerLaunches) }
           : decoded;
       records.push({
         idx,
@@ -908,10 +979,17 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
     emitHydrationIfNeeded: boolean,
   ) => {
     batch.matchedDbStepUpdateIndex = dbBatch.stepUpdateIndex;
-    if (batch.launches.length === 0 && dbBatch.launches.length > 0) {
-      batch.launches = dbBatch.launches;
+    const prevLaunches = batch.launches;
+    if (dbBatch.launches.length > 0) {
+      batch.launches = mergeLaunchModels(prevLaunches, dbBatch.launches);
     }
-    if (emitHydrationIfNeeded && !batch.launchesHydrated && batch.launches.length > 0) {
+    const modelAdded = prevLaunches.length > 0 && batch.launches !== prevLaunches;
+    if (
+      emitHydrationIfNeeded &&
+      (!batch.launchesHydrated || modelAdded) &&
+      !batch.completed &&
+      batch.launches.length > 0
+    ) {
       batch.launchesHydrated = true;
       pendingSyntheticNotifications.push(
         normalizeAntigravitySessionUpdate({
@@ -1165,9 +1243,10 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
           const batch = ensureTrackedBatch(rootSessionId, update.toolCallId);
           const inputLaunches = antigravitySubagentLaunches(update.rawInput);
           if (inputLaunches !== undefined && inputLaunches.length > 0) {
-            batch.launches = inputLaunches;
+            batch.launches = mergeLaunchModels(inputLaunches, batch.launches);
             batch.launchesHydrated = true;
           }
+          const launchesBeforeSync = batch.launches;
           if (batchNeedsDbSync(batch)) {
             yield* syncSubagentsFromDb(rootSessionId, {
               includeBatches: true,
@@ -1177,7 +1256,7 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
           }
           if (batch.launches.length > 0) {
             batch.launchesHydrated = true;
-            if (inputLaunches === undefined) {
+            if (inputLaunches === undefined || batch.launches !== launchesBeforeSync) {
               notification = normalizeAntigravitySessionUpdate({
                 ...notification,
                 update: {

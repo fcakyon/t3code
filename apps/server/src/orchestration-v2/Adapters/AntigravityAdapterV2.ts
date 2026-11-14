@@ -1,10 +1,12 @@
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
+  type ModelSelection,
   ProviderDriverKind,
   ProviderInstanceId,
   type OrchestrationV2ProviderCapabilities,
   type ProviderSetupError,
 } from "@t3tools/contracts";
+import { createModelSelection, modelSelectionsEqual } from "@t3tools/shared/model";
 import type { SelfInvocation } from "@t3tools/shared/nodeRuntime";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
@@ -30,6 +32,7 @@ import {
 } from "../../provider/acp/AntigravityAcpSupport.ts";
 import {
   ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
+  type AntigravityChildLaunch,
   antigravitySubagentChildSessionId,
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
@@ -55,6 +58,7 @@ import {
   makeAcpAdapterV2,
   type AcpAdapterV2Flavor,
   type AcpAdapterV2RuntimeInput,
+  type AcpSubagentUpdateContext,
 } from "@t3tools/provider-acp/server/adapter";
 
 const ANTIGRAVITY_PROVIDER = ProviderDriverKind.make("antigravity");
@@ -105,6 +109,65 @@ export interface AntigravityAdapterV2Options {
   readonly profileDirectory?: string;
 }
 
+const ANTIGRAVITY_MODEL_TIER_LABELS: Readonly<Record<string, string>> = {
+  flash_lite: "Flash Lite",
+  flash: "Flash",
+  pro: "Pro",
+};
+
+function resolveAntigravitySubagentModel(
+  launches: ReadonlyArray<AntigravityChildLaunch> | undefined,
+  context?: AcpSubagentUpdateContext,
+): {
+  readonly model: string | null;
+  readonly modelSelection?: ModelSelection;
+} {
+  if (launches === undefined || launches.length === 0) {
+    return { model: null };
+  }
+  const parentSelection = context?.parentModelSelection;
+  const resolveSingle = (
+    launch: AntigravityChildLaunch,
+  ): {
+    readonly model: string | null;
+    readonly modelSelection?: ModelSelection;
+  } => {
+    const rawModel = launch.model?.trim() ?? "";
+    const normalized = rawModel.toLowerCase();
+    if (!normalized || normalized === "inherit") {
+      const parentModel = parentSelection?.model.trim();
+      if (!parentSelection || !parentModel || parentModel === ANTIGRAVITY_DEFAULT_MODEL) {
+        return { model: null };
+      }
+      return {
+        model: parentModel,
+        modelSelection: parentSelection,
+      };
+    }
+    const resolvedModel = ANTIGRAVITY_MODEL_TIER_LABELS[normalized] ?? rawModel;
+    return {
+      model: resolvedModel,
+      ...(parentSelection === undefined
+        ? {}
+        : { modelSelection: createModelSelection(parentSelection.instanceId, resolvedModel) }),
+    };
+  };
+  const resolved = launches.map(resolveSingle);
+  const [first, ...rest] = resolved;
+  if (first === undefined) {
+    return { model: null };
+  }
+  const allMatch = rest.every(
+    (entry) =>
+      entry.model === first.model &&
+      (entry.modelSelection === undefined
+        ? first.modelSelection === undefined
+        : first.modelSelection !== undefined &&
+          modelSelectionsEqual(entry.modelSelection, first.modelSelection)),
+  );
+  return allMatch ? first : { model: null };
+}
+
 /**
  * Each subagent batch gets a synthetic `antigravity-task:<nativeTaskId>` child session id so
  * child tool calls and `agent_message` reports from the session database route to the subagent
@@ -112,6 +175,7 @@ export interface AntigravityAdapterV2Options {
  */
 const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractSubagentUpdate"]> = (
   toolCall,
+  context,
 ) => {
   if (classifyAntigravitySubagentToolCall(toolCall) !== "subagent") {
     return undefined;
@@ -128,6 +192,7 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
           : "running";
   const launches = antigravitySubagentLaunches(toolCall.data.rawInput);
   const launch = launches === undefined ? undefined : describeAntigravitySubagentLaunches(launches);
+  const { model, modelSelection } = resolveAntigravitySubagentModel(launches, context);
   return {
     nativeTaskId: toolCall.toolCallId,
     prompt:
@@ -137,7 +202,8 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
       toolCall.title ??
       ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
     title: launch?.title ?? ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
-    model: null,
+    model,
+    ...(modelSelection === undefined ? {} : { modelSelection }),
     status,
     childSessionId: antigravitySubagentChildSessionId(toolCall.toolCallId),
     result:

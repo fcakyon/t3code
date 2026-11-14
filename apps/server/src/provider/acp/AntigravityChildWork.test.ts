@@ -15,6 +15,7 @@ import {
   makeAntigravitySubagentTracker,
   readAntigravityChildWork,
   readAntigravitySessionSubagentState,
+  toAntigravitySubagentRawInput,
 } from "./AntigravityChildWork.ts";
 import { sanitizeAntigravityToolPayload } from "./AntigravityProtocol.ts";
 import {
@@ -574,6 +575,104 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
         const [resolvedChild] = yield* read(profile, driftedTaskId, hydratedLaunch);
         expect(resolvedChild?.conversationId).toBe(CHILD);
         expect(resolvedChild?.role).toBe(LAUNCH.role);
+      }),
+  );
+
+  it.effect(
+    "decodes and hydrates subagent launch models across rawInput, invoke proto, and planner args",
+    () =>
+      Effect.gen(function* () {
+        expect(
+          antigravitySubagentLaunches({
+            Subagents: [{ Role: LAUNCH.role, Prompt: LAUNCH.prompt }],
+          }),
+        ).toEqual([LAUNCH]);
+        expect(toAntigravitySubagentRawInput([LAUNCH])).toEqual({
+          Subagents: [{ Role: LAUNCH.role, Prompt: LAUNCH.prompt }],
+        });
+
+        const flashLaunch = { role: "Fast Reader", prompt: "Inspect index.ts", model: "flash" };
+        const proLaunch = { role: "Deep Reviewer", prompt: "Review diff", model: "pro" };
+        expect(
+          antigravitySubagentLaunches(toAntigravitySubagentRawInput([flashLaunch, proLaunch])),
+        ).toEqual([flashLaunch, proLaunch]);
+
+        const { profile } = yield* makeProfile({
+          steps: (logUri) => [
+            // Invoke specs carry field 8 model_tier directly.
+            [1, 15, plannerStep(["call-proto"])],
+            [
+              2,
+              127,
+              invokeStep({
+                callId: "call-proto",
+                launches: [
+                  { role: "Lite", prompt: "A", model: "flash_lite" },
+                  { role: "Inherited", prompt: "B", model: "inherit" },
+                ],
+                children: [
+                  { id: CHILD, logUri },
+                  { id: "b468c0e1d2f34a5b6c7d8e9f0a1b2c3d", logUri },
+                ],
+              }),
+            ],
+            // Invoke specs omit field 8, so Model merges from the planner step args.
+            [3, 15, plannerStep([{ id: "call-planner-model", launches: [flashLaunch] }])],
+            [
+              4,
+              127,
+              invokeStep({
+                callId: "call-planner-model",
+                launches: [{ role: flashLaunch.role, prompt: flashLaunch.prompt }],
+                children: [{ id: CHILD, logUri }],
+              }),
+            ],
+          ],
+        });
+
+        const state = yield* readAntigravitySessionSubagentState({
+          profileDirectory: profile,
+          rootSessionId: ROOT,
+          includeReports: false,
+        });
+        expect(state?.batches).toEqual([
+          {
+            stepUpdateIndex: 1,
+            toolCallId: "call-proto",
+            launches: [
+              { role: "Lite", prompt: "A", model: "flash_lite" },
+              { role: "Inherited", prompt: "B", model: "inherit" },
+            ],
+            children: [
+              { conversationId: CHILD, role: "Lite" },
+              { conversationId: "b468c0e1d2f34a5b6c7d8e9f0a1b2c3d", role: "Inherited" },
+            ],
+          },
+          {
+            stepUpdateIndex: 2,
+            toolCallId: "call-planner-model",
+            launches: [flashLaunch],
+            children: [{ conversationId: CHILD, role: flashLaunch.role }],
+          },
+        ]);
+
+        const tracker = makeAntigravitySubagentTracker(profile);
+        const hydrated = yield* tracker.rewriteAndDrain({
+          sessionId: ROOT,
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: `${ROOT}:2`,
+            title: "Running invoke_subagent",
+            kind: "other",
+            status: "in_progress",
+          },
+        });
+        const hydratedUpdate = hydrated[0]?.update;
+        expect(
+          hydratedUpdate?.sessionUpdate === "tool_call"
+            ? antigravitySubagentLaunches(hydratedUpdate.rawInput)
+            : undefined,
+        ).toEqual([flashLaunch]);
       }),
   );
 });

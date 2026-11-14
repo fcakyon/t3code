@@ -6,14 +6,22 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
-import { toAntigravitySubagentRawInput } from "./AntigravityChildWork.ts";
+import {
+  type AntigravityChildLaunch,
+  MODEL_TIER_NAMES,
+  toAntigravitySubagentRawInput,
+} from "./AntigravityChildWork.ts";
 
 export const ROOT = "7d40e54d-5977-4239-940b-246cdd81a12b";
 export const CHILD = "a357bf2720914589dd1ec49f7a816115";
 export const LAUNCH = { role: "Readme Reader", prompt: "Read README.md and report the marker" };
 
+const MODEL_TIER_VALUES: Readonly<Record<string, number>> = Object.fromEntries(
+  Object.entries(MODEL_TIER_NAMES).map(([id, name]) => [name, Number(id)]),
+);
+
 // Mirrors the 1.4.5 runtime: Step{5: metadata{4: tool call{1 id, 2 name}}, 20: planner{7: calls},
-// 143: invoke_subagent{9: specs{2 role, 3 prompt}, 10: results{1 conversation, 2 log uri}}}.
+// 143: invoke_subagent{9: specs{2 role, 3 prompt, 8 model_tier}, 10: results{1 conversation, 2 log uri}}}.
 const varint = (value: number): number[] => {
   const bytes: number[] = [];
   while (value >= 0x80) {
@@ -36,7 +44,7 @@ const toolCall = (id: string, argsJson?: string) =>
 
 export const invokeStep = (input: {
   readonly callId: string;
-  readonly launches: ReadonlyArray<typeof LAUNCH>;
+  readonly launches: ReadonlyArray<AntigravityChildLaunch>;
   readonly children: ReadonlyArray<{ readonly id: string; readonly logUri: string }>;
   readonly metadataArgsJson?: string;
   readonly omitInvokePayload?: boolean;
@@ -50,12 +58,19 @@ export const invokeStep = (input: {
           field(
             143,
             proto(
-              ...input.launches.map((launch) =>
-                field(
+              ...input.launches.map((launch) => {
+                const tier =
+                  launch.model === undefined ? undefined : MODEL_TIER_VALUES[launch.model];
+                return field(
                   9,
-                  proto(field(1, "research"), field(2, launch.role), field(3, launch.prompt)),
-                ),
-              ),
+                  proto(
+                    field(1, "research"),
+                    field(2, launch.role),
+                    field(3, launch.prompt),
+                    ...(tier === undefined ? [] : [[...varint(8 * 8), ...varint(tier)]]),
+                  ),
+                );
+              }),
               ...input.children.map((child) =>
                 field(10, proto(field(1, child.id), field(2, child.logUri))),
               ),
@@ -65,7 +80,7 @@ export const invokeStep = (input: {
   );
 export const plannerStep = (
   callIds: ReadonlyArray<
-    string | { readonly id: string; readonly launches?: ReadonlyArray<typeof LAUNCH> }
+    string | { readonly id: string; readonly launches?: ReadonlyArray<AntigravityChildLaunch> }
   >,
   options?: { readonly thought?: string },
 ) =>

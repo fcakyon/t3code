@@ -10534,6 +10534,213 @@ describe("AcpAdapterV2", () => {
         );
       }).pipe(Effect.provide(layerTest)),
   );
+
+  it.effect(
+    "passes resolved parentModelSelection to extractSubagentUpdate, replaces provisional selection, and preserves it on partial completion",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const selfInvocation = yield* resolveSelfInvocation();
+        const mockAgentPath = yield* bundledMockAgentPath;
+        const instanceId = ProviderInstanceId.make("acp-subagent-model-selection");
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+        const observedContexts: Array<ModelSelection | undefined> = [];
+
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          selfInvocation,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: {
+              ...AcpProviderCapabilitiesV2,
+              subagents: { ...AcpProviderCapabilitiesV2.subagents, supportsSubagents: true },
+            },
+            applyModelSelection: () => Effect.succeed("gpt-5.4"),
+            extractSubagentUpdate: (toolCall, context) => {
+              if (toolCall.toolCallId !== "call-subagent-model") {
+                return undefined;
+              }
+              observedContexts.push(context?.parentModelSelection);
+              if (toolCall.status === "pending") {
+                return {
+                  nativeTaskId: "task-model-selection",
+                  prompt: "",
+                  title: "Pending Subagent",
+                  model: "provisional-model",
+                  modelSelection: { instanceId, model: "provisional-model" },
+                  status: "pending",
+                  childSessionId: null,
+                  result: null,
+                  provisional: true,
+                };
+              }
+              if (toolCall.status === "inProgress") {
+                return {
+                  nativeTaskId: "task-model-selection",
+                  prompt: "Audit config",
+                  title: "Config Auditor",
+                  model: context?.parentModelSelection?.model ?? null,
+                  ...(context?.parentModelSelection === undefined
+                    ? {}
+                    : { modelSelection: context.parentModelSelection }),
+                  status: "running",
+                  childSessionId: null,
+                  result: null,
+                };
+              }
+              return {
+                nativeTaskId: "task-model-selection",
+                prompt: "",
+                title: null,
+                model: null,
+                status: "completed",
+                childSessionId: null,
+                result: "Audit complete",
+              };
+            },
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner,
+              mockAgentPath,
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                getConfigOptions: Effect.succeed([
+                  {
+                    id: "model",
+                    name: "Model",
+                    category: "model",
+                    type: "select",
+                    currentValue: "gpt-5.4",
+                    options: [{ value: "gpt-5.4", name: "GPT 5.4" }],
+                  },
+                  {
+                    id: "thinking_level",
+                    name: "Thinking",
+                    category: "thought_level",
+                    type: "select",
+                    currentValue: "high",
+                    options: [{ value: "high", name: "High" }],
+                  },
+                ]),
+                handleSessionUpdate: (handler) =>
+                  Effect.sync(() => {
+                    sessionUpdate = handler;
+                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+                prompt: () =>
+                  Effect.gen(function* () {
+                    if (sessionUpdate === undefined) {
+                      return yield* Effect.die("session update handler not registered");
+                    }
+                    const send = sessionUpdate;
+                    yield* send({
+                      sessionId: "mock-session-1",
+                      update: {
+                        sessionUpdate: "tool_call",
+                        toolCallId: "call-subagent-model",
+                        title: "Subagent",
+                        kind: "other",
+                        status: "pending",
+                      },
+                    });
+                    yield* send({
+                      sessionId: "mock-session-1",
+                      update: {
+                        sessionUpdate: "tool_call_update",
+                        toolCallId: "call-subagent-model",
+                        status: "in_progress",
+                      },
+                    });
+                    yield* send({
+                      sessionId: "mock-session-1",
+                      update: {
+                        sessionUpdate: "tool_call_update",
+                        toolCallId: "call-subagent-model",
+                        status: "completed",
+                      },
+                    });
+                    return { stopReason: "end_turn" as const };
+                  }),
+              }),
+            }),
+          },
+        });
+
+        const threadId = ThreadId.make("thread-acp-subagent-model-selection");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const requestedSelection: ModelSelection = { instanceId, model: "default" };
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-subagent-model-selection"),
+          modelSelection: requestedSelection,
+          runtimePolicy,
+        });
+        const eventsQueue = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        yield* session.events.pipe(
+          Stream.runForEach((event) => Queue.offer(eventsQueue, event)),
+          Effect.forkScoped,
+        );
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection: requestedSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        yield* session.startTurn(
+          makeTurnInput({
+            threadId,
+            providerThread,
+            instanceId,
+            runtimePolicy,
+            now,
+            ordinal: 1,
+          }),
+        );
+        const events: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        while (true) {
+          const event = yield* Queue.take(eventsQueue);
+          events.push(event);
+          if (event.type === "turn.terminal") break;
+        }
+
+        const expectedSelection: ModelSelection = {
+          instanceId,
+          model: "gpt-5.4",
+          options: [{ id: "thinking_level", value: "high" }],
+        };
+        assert.deepEqual(observedContexts, [
+          expectedSelection,
+          expectedSelection,
+          expectedSelection,
+        ]);
+
+        const subagentUpdates = events.flatMap((event) =>
+          event.type === "subagent.updated" ? [event.subagent] : [],
+        );
+        assert.equal(subagentUpdates.length, 3);
+        assert.equal(subagentUpdates[0]?.model, "provisional-model");
+        assert.deepEqual(subagentUpdates[0]?.modelSelection, {
+          instanceId,
+          model: "provisional-model",
+        });
+        assert.equal(subagentUpdates[1]?.model, "gpt-5.4");
+        assert.deepEqual(subagentUpdates[1]?.modelSelection, expectedSelection);
+        assert.equal(subagentUpdates[2]?.status, "completed");
+        assert.equal(subagentUpdates[2]?.model, "gpt-5.4");
+        assert.deepEqual(subagentUpdates[2]?.modelSelection, expectedSelection);
+
+        const childThreads = events.flatMap((event) =>
+          event.type === "app_thread.created" &&
+          event.appThread.id === subagentUpdates[1]?.childThreadId
+            ? [event.appThread]
+            : [],
+        );
+        assert.deepEqual(childThreads.at(-1)?.modelSelection, expectedSelection);
+      }).pipe(Effect.provide(layerTest)),
+  );
 });
 
 describe("acpPostSettleContinuationOfferEvidence", () => {
