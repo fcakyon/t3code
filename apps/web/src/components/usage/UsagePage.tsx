@@ -1,3 +1,4 @@
+import { useSearch } from "@tanstack/react-router";
 import { ChatGptUsageButton } from "../settings/ChatGptUsageButton";
 import { usesChatGptSharing } from "@t3tools/shared/usageLimits";
 import { RefreshIcon } from "~/components/ui/refresh-icon";
@@ -102,14 +103,11 @@ import {
   rankProvidersByMetric,
 } from "./usageProviders";
 import {
+  isUsageMetric,
   readUsagePagePreferences,
   saveUsagePagePreferences,
   type UsagePagePreferences,
 } from "./usagePagePreferences";
-
-function isUsageMetric(value: string | null | undefined): value is UsageMetric {
-  return METRIC_OPTIONS.some((option) => option.value === value);
-}
 
 function isUsageWindowDays(value: number): value is UsagePagePreferences["windowDays"] {
   return WINDOW_OPTIONS.some((option) => option.days === value);
@@ -175,7 +173,8 @@ function UsageModelDialogHost({
 }
 
 export function UsagePage() {
-  const [preferences, setPreferences] = useState(readUsagePagePreferences);
+  const target = useSearch({ from: "/_chat/usage" });
+  const [preferences, setPreferences] = useState(() => readUsagePagePreferences(target));
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const hour12 = usePrimarySettings((settings) => resolveHour12(settings.timestampFormat));
   const shortcutTitle = (
@@ -201,7 +200,9 @@ export function UsagePage() {
   const refreshingRef = useRef(false);
   const [priceDialog, setPriceDialog] = useState<{ readonly model?: string } | null>(null);
   const [selectedEnvironmentIds, setSelectedEnvironmentIds] =
-    useState<ReadonlySet<EnvironmentId> | null>(null);
+    useState<ReadonlySet<EnvironmentId> | null>(() =>
+      target.environmentId ? new Set([target.environmentId]) : null,
+    );
   const hiddenProviders = new Set(preferences.hiddenProviders);
   const { days: windowDays, window } = windowSelection;
   const isPast24Hours = windowDays === 1;

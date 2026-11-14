@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { readUsagePagePreferences, saveUsagePagePreferences } from "./usagePagePreferences";
+import {
+  readUsagePagePreferences,
+  saveUsagePagePreferences,
+  validateUsagePageSearch,
+} from "./usagePagePreferences";
 
 const key = "t3code:usage-page-preferences:v1";
 let values: Map<string, string>;
@@ -24,6 +28,30 @@ afterEach(() => {
 });
 
 describe("Usage page preferences", () => {
+  it("validates linked environment and provider filters", () => {
+    expect(
+      validateUsagePageSearch({
+        environmentId: "m5max",
+        provider: "claude",
+        metric: "limits",
+        token: "ignored",
+      }),
+    ).toEqual({ environmentId: "m5max", provider: "claude", metric: "limits" });
+    expect(
+      validateUsagePageSearch({ environmentId: "", provider: "not-a-provider", metric: "unknown" }),
+    ).toEqual({});
+  });
+  it("opens a linked provider's limits without changing saved filters", () => {
+    const saved = { metric: "cost", windowDays: 7, hiddenProviders: ["claude"] } as const;
+    saveUsagePagePreferences(saved);
+    const linked = readUsagePagePreferences({ provider: "claude", metric: "limits" });
+    expect(linked.metric).toBe("limits");
+    expect(linked.windowDays).toBe(7);
+    expect(linked.hiddenProviders).not.toContain("claude");
+    expect(linked.hiddenProviders).toContain("codex");
+    expect(linked.hiddenProviders).toContain("antigravity");
+    expect(readUsagePagePreferences()).toEqual(saved);
+  });
   it("round-trips hidden providers and reads older saves without them", () => {
     saveUsagePagePreferences({ metric: "cost", windowDays: 7, hiddenProviders: ["codex"] });
     expect(readUsagePagePreferences().hiddenProviders).toEqual(["codex"]);

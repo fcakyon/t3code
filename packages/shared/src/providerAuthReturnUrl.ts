@@ -13,6 +13,7 @@ export function providerAuthReturnUrl(value: string | undefined): string | undef
       url.password ||
       (!desktop && !web) ||
       (url.pathname !== "/welcome" &&
+        url.pathname !== "/usage" &&
         url.pathname !== "/settings" &&
         !url.pathname.startsWith("/settings/"))
     )
@@ -20,7 +21,11 @@ export function providerAuthReturnUrl(value: string | undefined): string | undef
     for (const key of Array.from(url.searchParams.keys())) {
       if (
         url.pathname === "/welcome" ||
-        !["machine", "project", "checkout", "environmentId", "instanceId"].includes(key)
+        !(
+          url.pathname === "/usage"
+            ? ["environmentId", "provider", "metric"]
+            : ["machine", "project", "checkout", "environmentId", "instanceId"]
+        ).includes(key)
       ) {
         url.searchParams.delete(key);
       }
