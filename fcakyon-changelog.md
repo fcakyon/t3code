@@ -9,12 +9,11 @@ This branch tracks [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code) and
 3. Cancel stale `RUNNING` steps in the session SQLite database before `session/load` so interrupted tasks or subagents do not hang resumed threads ([`05953666b3`](https://github.com/fcakyon/t3code/commit/05953666b3)).
 4. Stream Antigravity subagent tool calls, CLI command executions, live subagent card progress, launch prompts, and completion reports into subagent threads, including auto-approved `invoke_subagent` calls ([`790abd1413`](https://github.com/fcakyon/t3code/commit/790abd1413), [`aa4c26ad84`](https://github.com/fcakyon/t3code/commit/aa4c26ad84)).
 5. Show real subagent titles and prompts instead of the "Antigravity subagent batch" and "Running invoke_subagent" placeholders, and prevent duplicate subagent cards when `stepUpdateIndex` drifts after session compaction ([`fa97c35ffb`](https://github.com/fcakyon/t3code/commit/fa97c35ffb), [`aa4c26ad84`](https://github.com/fcakyon/t3code/commit/aa4c26ad84)).
-6. Read Antigravity usage limits from the quota host the account is metered on, so a stale `cloudcode-pa` Gemini weekly reading no longer replaces the live `daily-cloudcode-pa` one for Google sign-ins ([pingdotgg/t3code#32425](https://github.com/pingdotgg/t3code/pull/32425)).
 
-## Server patches
+## Desktop patches
 
-1. Apply `freshSession` when an agent updates a scheduled task through the `schedule_task` MCP tool. The update path ignored it, so the task kept its previous thread mode.
+1. Open Usage from desktop links with the selected environment, provider, and metric, including from Stream Deck quota keys ([`abeb40096f`](https://github.com/fcakyon/t3code/commit/abeb40096f37ea1064ce8eb4c5a42bc2b44c3c7d)).
 
 ## Release pipeline
 
-- Build desktop and CLI nightly releases with fork auto-updates when the `fork-nightly` maintenance task dispatches them ([`aa3e7435e4`](https://github.com/fcakyon/t3code/commit/aa3e7435e4), [`0d63edddb6`](https://github.com/fcakyon/t3code/commit/0d63edddb6)).
+- Build desktop and CLI nightly releases when the `fork-nightly` maintenance task dispatches them. Updates use fork release feeds, including for macOS apps without a Developer ID signature ([`aa3e7435e4`](https://github.com/fcakyon/t3code/commit/aa3e7435e4), [`0d63edddb6`](https://github.com/fcakyon/t3code/commit/0d63edddb6)).
