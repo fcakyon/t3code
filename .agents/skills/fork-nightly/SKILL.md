@@ -25,7 +25,7 @@ The T3 Code maintenance task on akyon-server runs this every 6 hours from `/home
    - When a dispatch is due and that run failed, read the end of its log first (`gh run view <databaseId> --repo fcakyon/t3code --log-failed | tail -n 200`). If our code or workflow caused it, push a fix before dispatching.
    - Dispatch once: `gh workflow run fork-nightly.yml --repo fcakyon/t3code --ref nightly`.
 5. If a dispatch fails with `Actions has been disabled for this repository`, GitHub disabled workflows on the fork, even though the API still reports Actions as enabled. Press "I understand my workflows, go ahead and re-enable them" on https://github.com/fcakyon/t3code/actions in the user's signed-in Chrome, then repeat step 3.
-6. If `gh release list --repo fcakyon/t3code -L 1` shows a release newer than `/home/fatih/.local/bin/t3 --version`, make this the final step so the turn ends before `t3code.service` restarts: `systemd-run --user --on-active=5s /bin/bash -c 'T3CODE_RELEASE_BASE_URL=https://github.com/fcakyon/t3code/releases/download /home/fatih/.local/bin/t3 update <VER> --yes'`.
+6. If `gh release list --repo fcakyon/t3code -L 1` shows a release newer than `/home/fatih/.local/bin/t3 --version`, make this the final step so the turn ends before `t3code.service` restarts: `XDG_RUNTIME_DIR=/run/user/$(id -u) systemd-run --user --on-active=5s /bin/bash -c 'T3CODE_RELEASE_BASE_URL=https://github.com/fcakyon/t3code/releases/download /home/fatih/.local/bin/t3 update <VER> --yes'`.
 
 ## Runtime
 
