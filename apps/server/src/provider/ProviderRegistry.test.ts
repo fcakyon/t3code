@@ -1325,7 +1325,7 @@ it.layer(
       );
     });
 
-    it("retains stale OpenCode models when a refresh fails", () => {
+    it("retains stale OpenCode models when a refresh fails or lists none", () => {
       const previousProvider = {
         instanceId: ProviderInstanceId.make("opencode"),
         driver: ProviderDriverKind.make("opencode"),
@@ -1375,6 +1375,21 @@ it.layer(
         ProviderRegistry.mergeProviderSnapshot(previousProvider, refreshedProvider).skills,
         previousProvider.skills,
       );
+
+      const emptyCatalogProvider = {
+        ...refreshedProvider,
+        status: "warning",
+        message: "OpenCode 2 is running, but it did not list any models yet.",
+        slashCommands: [],
+        skills: [],
+      } satisfies ServerProvider;
+      const mergedEmptyCatalog = ProviderRegistry.mergeProviderSnapshot(
+        previousProvider,
+        emptyCatalogProvider,
+      );
+      assert.deepStrictEqual(mergedEmptyCatalog.models, [...previousProvider.models]);
+      assert.deepStrictEqual(mergedEmptyCatalog.slashCommands, previousProvider.slashCommands);
+      assert.deepStrictEqual(mergedEmptyCatalog.skills, previousProvider.skills);
     });
 
     describe("Pi model inventories", () => {
@@ -4277,6 +4292,7 @@ it.layer(
         );
         assert.strictEqual(status.status, "ready");
         assert.strictEqual(status.auth.status, "authenticated");
+        assert.strictEqual(status.auth.label, "Claude API Key");
       }).pipe(
         Effect.provide(
           layerMockSpawner((args) => {
