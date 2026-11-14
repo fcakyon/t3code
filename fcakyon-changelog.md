@@ -9,6 +9,7 @@ This branch tracks [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code) and
 3. Cancel stale `RUNNING` steps in the session SQLite database before `session/load` so interrupted tasks or subagents do not hang resumed threads ([`05953666b3`](https://github.com/fcakyon/t3code/commit/05953666b3)).
 4. Stream Antigravity subagent tool calls, CLI command executions, live subagent card progress, launch prompts, and completion reports into subagent threads, including auto-approved `invoke_subagent` calls ([`790abd1413`](https://github.com/fcakyon/t3code/commit/790abd1413), [`aa4c26ad84`](https://github.com/fcakyon/t3code/commit/aa4c26ad84)).
 5. Show real subagent titles and prompts instead of the "Antigravity subagent batch" and "Running invoke_subagent" placeholders, and prevent duplicate subagent cards when `stepUpdateIndex` drifts after session compaction ([`fa97c35ffb`](https://github.com/fcakyon/t3code/commit/fa97c35ffb), [`aa4c26ad84`](https://github.com/fcakyon/t3code/commit/aa4c26ad84)).
+6. Resolve and propagate Antigravity subagent model selections and tier overrides (`inherit`, `flash_lite`, `flash`, `pro`) from live calls and protobuf records so subagent cards display their resolved model instead of "Not reported" ([`3d2bb2a109`](https://github.com/fcakyon/t3code/commit/3d2bb2a109)).
 
 ## Desktop patches
 
