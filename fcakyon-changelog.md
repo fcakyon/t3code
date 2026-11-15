@@ -1,5 +1,8 @@
 # t3code-fcakyon changelog
 
+- fix: Upgrade managed Antigravity before new sessions ([`848690d39e`](https://github.com/fcakyon/t3code/commit/848690d39e))
+- fix: Rename the fork changelog heading ([`0f26bb3f04`](https://github.com/fcakyon/t3code/commit/0f26bb3f04))
+- fix: Use a flat fork changelog ([`8afbdfa141`](https://github.com/fcakyon/t3code/commit/8afbdfa141))
 - fix: Show Antigravity background tasks ([`e8a84f972e`](https://github.com/fcakyon/t3code/commit/e8a84f972e))
 - fix: Preserve Antigravity sign-in during the 1.5.9 upgrade ([`d2803c084a`](https://github.com/fcakyon/t3code/commit/d2803c084a))
 - fix: Steer Antigravity without stopping tools ([`f278d14e33`](https://github.com/fcakyon/t3code/commit/f278d14e33))
