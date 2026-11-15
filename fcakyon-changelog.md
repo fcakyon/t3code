@@ -13,7 +13,9 @@ This branch tracks [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code) and
 
 7. Steer Antigravity 1.5.1+ sessions with concurrent prompts, preserving running tools and the active turn. Queue follow-ups on older runtimes ([`f278d14e33`](https://github.com/fcakyon/t3code/commit/f278d14e33)).
 
-8. Migrate existing Antigravity consumer sign-ins to the 1.5.9 CLI credential format, preserve logout, and keep quota reads working across the upgrade.
+8. Migrate existing Antigravity consumer sign-ins to the 1.5.9 CLI credential format, preserve logout, and keep quota reads working across the upgrade ([`d2803c084a`](https://github.com/fcakyon/t3code/commit/d2803c084a)).
+
+9. Track Antigravity background commands by native task ID, watch completion after the parent replies, and show running tasks with command details in the thread panel.
 
 ## Desktop patches
 

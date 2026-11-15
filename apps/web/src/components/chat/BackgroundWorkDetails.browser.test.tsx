@@ -3,6 +3,11 @@ import { EnvironmentId, ProviderDriverKind, ThreadId, TurnItemId } from "@t3tool
 import * as DateTime from "effect/DateTime";
 import { expect, it, vi } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
+const state = vi.hoisted(() => ({ projection: null as unknown }));
+vi.mock(import("../../state/entities"), () => ({
+  useQuietThreadProjection: (() =>
+    state.projection === null ? null : { projection: state.projection }) as never,
+}));
 vi.mock(import("./CommandOutputPanel"), () => ({
   useCommandOutputStreaming: () => true,
   CommandOutputPanel: () => <div>Command output stream</div>,
@@ -11,8 +16,10 @@ vi.mock(import("./CommandOutputPanel"), () => ({
 import { render } from "../../../test/render";
 import { backgroundWorkNowItem } from "./ThreadActivityBanners";
 import { ThreadNow } from "./ThreadNow";
+import { ThreadBackgroundTasksPanel } from "./BackgroundWorkDetails";
 
 it("opens full command details for short labels and keeps pending tasks current", async () => {
+  state.projection = null;
   const command = "python3 audit.py -j 6\n> scratch/audit.log 2>&1";
   const commandItem = (status: "running" | "completed") => ({
     id: TurnItemId.make("bash-1"),
@@ -49,6 +56,7 @@ it("opens full command details for short labels and keeps pending tasks current"
           {
             taskId: "native-task",
             itemId: explicitItem ? TurnItemId.make("bash-1") : undefined,
+            nativeItemId: "native-command",
             kind: "command",
             description,
             command,
@@ -62,7 +70,7 @@ it("opens full command details for short labels and keeps pending tasks current"
             id: TurnItemId.make("native-match"),
             nativeItemRef: {
               driver: ProviderDriverKind.make("codex"),
-              nativeId: "native-task",
+              nativeId: "native-command",
               strength: "strong",
             },
             ordinal: 2,
@@ -93,5 +101,58 @@ it("opens full command details for short labels and keeps pending tasks current"
   await screen.rerender(view("Native fallback", "completed", false));
   await expect.element(page.getByText("Command output stream")).toBeVisible();
   await page.getByRole("button", { name: "Close", exact: true }).click();
+  await expect.element(page.getByRole("dialog")).not.toBeInTheDocument();
+});
+
+it("shows a native command roster while its parent runs and removes finished tasks", async () => {
+  const command = "ssh ultra12 'wc -l predictions.jsonl'";
+  const projection = {
+    thread: { activeProviderThreadId: "native" },
+    runs: [{ status: "running" }],
+    turnItems: [],
+    providerThreads: [
+      {
+        id: "native",
+        pendingBackgroundTasks: [
+          {
+            kind: "command",
+            taskId: "trajectory/task-4293",
+            command,
+            description: "Check evaluation progress across hosts",
+            nativeItemId: "trajectory:2813",
+          },
+          { kind: "subagent", taskId: "real-agent", description: "Agent work belongs in Lineage" },
+        ],
+      },
+      {
+        id: "old-provider",
+        pendingBackgroundTasks: [
+          { kind: "command", taskId: "old", description: "Other provider task" },
+        ],
+      },
+    ],
+  };
+  state.projection = projection;
+  const view = () => (
+    <ThreadBackgroundTasksPanel
+      environmentId={EnvironmentId.make("test")}
+      threadId={ThreadId.make("thread")}
+    />
+  );
+  await using screen = await render(view());
+  await expect.element(screen.getByRole("region", { name: "Background tasks" })).toBeVisible();
+  await expect.element(screen.getByText("Check evaluation progress across hosts")).toBeVisible();
+  await expect.element(screen.getByText("Other provider task")).not.toBeInTheDocument();
+  await expect.element(screen.getByText("Agent work belongs in Lineage")).not.toBeInTheDocument();
+  await screen.getByRole("button", { name: "Details", exact: true }).click();
+  await vi.waitFor(() => expect(page.getByRole("dialog").element().textContent).toContain(command));
+  state.projection = {
+    ...projection,
+    providerThreads: [{ id: "native", pendingBackgroundTasks: [] }],
+  };
+  await screen.rerender(view());
+  await expect
+    .element(screen.getByRole("region", { name: "Background tasks" }))
+    .not.toBeInTheDocument();
   await expect.element(page.getByRole("dialog")).not.toBeInTheDocument();
 });

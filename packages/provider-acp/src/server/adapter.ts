@@ -7,6 +7,7 @@ import {
   type OrchestrationV2ExecutionNode,
   type OrchestrationV2PlanArtifact,
   type OrchestrationV2PlanStep,
+  type OrchestrationV2PendingBackgroundTask,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderFailure,
   type OrchestrationV2ProviderRetry,
@@ -514,6 +515,9 @@ export interface AcpAdapterV2Flavor {
     ) => string | undefined;
   };
   readonly promptSteering?: (initializeResult: EffectAcpSchema.InitializeResponse) => boolean;
+  readonly pendingBackgroundTasks?: (
+    notification: EffectAcpSchema.SessionNotification,
+  ) => Effect.Effect<ReadonlyArray<OrchestrationV2PendingBackgroundTask> | undefined>;
   /**
    * Native fork from an earlier turn. `nativeTurnId` reads the agent's id for a running
    * turn's prompt, which the turn keeps as its native ref; forking from that turn sends
@@ -2542,6 +2546,31 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
 
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
           Queue.offer(events, event).pipe(Effect.asVoid);
+        // Session updates include streaming chunks, so share their tracing boundary.
+        const syncPendingBackgroundTasks = Effect.fnUntraced(function* (
+          notification: EffectAcpSchema.SessionNotification,
+        ) {
+          const thread = (yield* Ref.get(providerThreadByNativeSessionId)).get(
+            notification.sessionId,
+          );
+          if (thread === undefined || flavor.pendingBackgroundTasks === undefined) return thread;
+          const tasks = yield* flavor.pendingBackgroundTasks(notification);
+          if (tasks === undefined) return thread;
+          const updated = {
+            ...thread,
+            pendingBackgroundTasks: tasks,
+            updatedAt: yield* DateTime.now,
+          };
+          yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+            new Map(current).set(notification.sessionId, updated),
+          );
+          yield* emitProviderEvent({
+            type: "provider_thread.updated",
+            driver,
+            providerThread: updated,
+          });
+          return updated;
+        });
         let scheduleDeferredFinalize: (context: ActiveAcpTurn) => Effect.Effect<void> = () =>
           Effect.void;
 
@@ -6914,6 +6943,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 );
               }
               const normalized = flavor.normalizeSessionUpdate?.(notification) ?? notification;
+              yield* syncPendingBackgroundTasks(normalized);
               // Turn projection misses compactions that finish while idle or after settlement.
               if (
                 normalized.update.sessionUpdate === "compaction_update" &&
@@ -8340,7 +8370,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             providerTurn: turn,
           });
           const updatedProviderThread: OrchestrationV2ProviderThread = {
-            ...context.input.providerThread,
+            ...((yield* Ref.get(providerThreadByNativeSessionId)).get(context.nativeThreadId) ??
+              context.input.providerThread),
+            ...(directStopQuarantine && flavor.pendingBackgroundTasks !== undefined
+              ? { pendingBackgroundTasks: [] }
+              : {}),
             providerSessionId: input.providerSessionId,
             status: "active",
             lastRunOrdinal: context.input.runOrdinal,
@@ -8926,7 +8960,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               providerTurn: runningTurn,
             });
             const activeProviderThread: OrchestrationV2ProviderThread = {
-              ...turnInput.providerThread,
+              ...((yield* Ref.get(providerThreadByNativeSessionId)).get(requestedSessionId) ??
+                turnInput.providerThread),
               providerSessionId: input.providerSessionId,
               status: "active",
               contextUsage: context.contextUsage,
@@ -9311,9 +9346,17 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     : flavor.getModelContextWindow?.(selection, session);
                 },
               }),
-          ...(postSettleContinuationEnabled || followsAgentWorkState
+          ...(postSettleContinuationEnabled ||
+          followsAgentWorkState ||
+          flavor.pendingBackgroundTasks !== undefined
             ? {
                 hasPendingBackgroundWork: Effect.gen(function* () {
+                  if (
+                    [...(yield* Ref.get(providerThreadByNativeSessionId)).values()].some(
+                      (thread) => (thread.pendingBackgroundTasks?.length ?? 0) > 0,
+                    )
+                  )
+                    return true;
                   const rootSessionId = yield* Ref.get(activeSessionId);
                   if (
                     followsAgentWorkState &&
@@ -9403,7 +9446,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   yield* Ref.update(providerThreadByNativeSessionId, (current) =>
                     new Map(current).set(sessionId, providerThread),
                   );
-                  return providerThread;
+                  return (
+                    (yield* syncPendingBackgroundTasks({
+                      sessionId,
+                      update: { sessionUpdate: "session_info_update" },
+                    })) ?? providerThread
+                  );
                 }),
               );
             },
@@ -9452,12 +9500,21 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     yield* Ref.set(activeInteractionMode, nextRuntimePolicy.interactionMode);
                   }
                   const now = yield* DateTime.now;
-                  return {
+                  const resumed = {
                     ...threadInput.providerThread,
                     providerSessionId: input.providerSessionId,
                     status: "idle" as const,
                     updatedAt: now,
                   };
+                  yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+                    new Map(current).set(sessionId, resumed),
+                  );
+                  return (
+                    (yield* syncPendingBackgroundTasks({
+                      sessionId,
+                      update: { sessionUpdate: "session_info_update" },
+                    })) ?? resumed
+                  );
                 }),
               );
             },

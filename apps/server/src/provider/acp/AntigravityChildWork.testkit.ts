@@ -42,6 +42,23 @@ const toolCall = (id: string, argsJson?: string) =>
     ...(argsJson !== undefined ? [field(3, argsJson)] : []),
   );
 
+export const commandTaskStep = (input: {
+  readonly stepType?: 21 | 132;
+  readonly toolName?: string;
+  readonly taskId: string;
+  readonly command: string;
+  readonly summary: string;
+  readonly callId: string;
+}) =>
+  proto(
+    [...varint(1 * 8), ...varint(input.stepType ?? 21)],
+    field(
+      5,
+      proto(field(4, proto(field(1, input.callId), field(2, input.toolName ?? "run_command")))),
+    ),
+    field(148, proto(field(1, input.taskId), field(4, input.command), field(7, input.summary))),
+  );
+
 export const invokeStep = (input: {
   readonly callId: string;
   readonly launches: ReadonlyArray<AntigravityChildLaunch>;
@@ -172,7 +189,7 @@ export const makeProfile = Effect.fn("makeProfile")(function* (input: {
     path.join(acp, "conversations", `${input.sessionId ?? ROOT}.db`),
   );
   database.exec(
-    "CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, step_format integer NOT NULL DEFAULT 0, step_payload blob)",
+    "CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 2, step_format integer NOT NULL DEFAULT 0, step_payload blob)",
   );
   const insert = database.prepare(
     "INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)",

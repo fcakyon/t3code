@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off -- the native fixture writes command completion to SQLite.
+import * as NodeSqlite from "node:sqlite";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
@@ -39,6 +41,7 @@ import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSession
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
 import {
   agentReportStep,
+  commandTaskStep,
   CHILD,
   invokeStep,
   LAUNCH,
@@ -384,6 +387,21 @@ describe("AntigravityAdapterV2 steering", () => {
       const path = yield* Path.Path;
       const fileSystem = yield* FileSystem.FileSystem;
       const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-agy-steer-" });
+      const taskId = `${ROOT}/task-4293`;
+      const { profile } = yield* makeProfile({
+        steps: () => [
+          [
+            4293,
+            21,
+            commandTaskStep({
+              taskId,
+              command: "echo correction",
+              summary: "Check task progress",
+              callId: "steering-tool",
+            }),
+          ],
+        ],
+      });
       const host = yield* ProviderHost.ProviderHost;
       const attachment = ChatFileAttachment.make({
         type: "file",
@@ -402,13 +420,17 @@ describe("AntigravityAdapterV2 steering", () => {
         `
 import { createInterface } from 'node:readline'
 import { appendFileSync } from 'node:fs'
-const sessionId = 'steering-session'
+import { DatabaseSync } from 'node:sqlite'
+const sessionId = ${JSON.stringify(ROOT)}
 let first
 const pending = []
 const reply = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n')
 const update = (update) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } }) + '\\n')
 const configOptions = [{ id: 'model', name: 'Model', type: 'select', category: 'model', currentValue: 'gemini-test-low', options: [{ value: 'gemini-test-low', name: 'Test Flash' }] }]
 const finish = (cancelled) => {
+  const database = new DatabaseSync(${JSON.stringify(path.join(profile, "antigravity-acp", "conversations", `${ROOT}.db`))})
+  database.prepare('UPDATE steps SET status = ?').run(cancelled ? 6 : 3)
+  database.close()
   update({ sessionUpdate: 'tool_call_update', toolCallId: 'steering-tool', status: cancelled ? 'failed' : 'completed' })
   update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Steering applied after the command finished.' } })
   for (const id of [first, ...pending.splice(0)]) if (id !== undefined) reply(id, { stopReason: cancelled ? 'cancelled' : 'end_turn' })
@@ -424,7 +446,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     case 'session/prompt':
       if (first === undefined && pending.length === 0) {
         first = id
-        update({ sessionUpdate: 'tool_call', toolCallId: 'steering-tool', title: 'Running command', kind: 'execute', status: 'in_progress' })
+        update({ sessionUpdate: 'tool_call', toolCallId: 'steering-tool', title: 'Running command', kind: 'execute', status: 'in_progress', rawInput: { CommandLine: 'echo correction' } })
       } else {
         pending.push(id)
         if (first !== undefined) reply(first, { stopReason: 'end_turn' })
@@ -444,6 +466,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       const instanceId = ProviderInstanceId.make("antigravity-steering-test");
       const adapter = yield* makeAntigravityAdapterV2({
         instanceId,
+        profileDirectory: profile,
         selfInvocation: yield* resolveSelfInvocation(),
         makeRuntime: (input) =>
           makeAntigravityAcpRuntime({
@@ -491,6 +514,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         modelSelection,
         runtimePolicy,
       });
+      assert.equal(providerThread.pendingBackgroundTasks?.[0]?.taskId, taskId);
       if (native.current === undefined) return yield* Effect.die("Expected the native runtime");
       const nativeRuntime = native.current;
       yield* Effect.addFinalizer(() =>
@@ -501,6 +525,30 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         Stream.runForEach((event) => Queue.offer(events, event)),
         Effect.forkChild,
       );
+      const database = new NodeSqlite.DatabaseSync(
+        path.join(profile, "antigravity-acp", "conversations", `${ROOT}.db`),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => database.close()));
+      database.prepare("UPDATE steps SET status = 3").run();
+      yield* Stream.fromQueue(events).pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.pendingBackgroundTasks?.length === 0,
+        ),
+        Stream.runHead,
+      );
+      assert.isFalse(yield* session.hasPendingBackgroundWork!);
+      database.prepare("UPDATE steps SET status = 2").run();
+      yield* Stream.fromQueue(events).pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "provider_thread.updated" &&
+            event.providerThread.pendingBackgroundTasks?.[0]?.taskId === taskId,
+        ),
+        Stream.runHead,
+      );
+      assert.isTrue(yield* session.hasPendingBackgroundWork!);
       const turn = makeTurnInput({
         threadId,
         providerThread,
@@ -543,15 +591,22 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       const before = yield* Queue.clear(events);
       if (stop) yield* session.interruptTurn({ providerThread, providerTurnId });
       else yield* nativeRuntime.request("_test/finish-steer", {});
-      const terminal = yield* Stream.fromQueue(events).pipe(
-        Stream.filter((event) => event.type === "turn.terminal"),
-        Stream.runHead,
+      let turnFinished = false;
+      let tasksFinished = false;
+      const finished = yield* Stream.fromQueue(events).pipe(
+        Stream.takeUntil((event) => {
+          turnFinished ||= event.type === "turn.terminal";
+          if (event.type === "provider_thread.updated")
+            tasksFinished = event.providerThread.pendingBackgroundTasks?.length === 0;
+          return turnFinished && tasksFinished;
+        }),
+        Stream.runCollect,
       );
-      assert.isTrue(
-        terminal._tag === "Some" &&
-          terminal.value.type === "turn.terminal" &&
-          terminal.value.status === (stop ? "interrupted" : "completed"),
-      );
+      const terminal = finished.find((event) => event.type === "turn.terminal");
+      assert.equal(terminal?.status, stop ? "interrupted" : "completed");
+      const finalThread = finished.findLast((event) => event.type === "provider_thread.updated");
+      assert.deepEqual(finalThread?.providerThread.pendingBackgroundTasks, []);
+      assert.isFalse(yield* session.hasPendingBackgroundWork!);
       assert.isFalse(before.some((event) => event.type === "turn.terminal"));
       assert.equal(session.providerSession.capabilities.turns.supportsActiveSteering, steers > 0);
       assert.isFalse(session.providerSession.capabilities.turns.supportsSteeringByInterruptRestart);

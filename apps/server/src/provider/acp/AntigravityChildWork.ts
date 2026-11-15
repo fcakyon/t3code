@@ -4,6 +4,7 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
+import { OrchestrationV2PendingBackgroundTask } from "@t3tools/contracts";
 import type {
   OrchestrationV2NativeChildStep,
   OrchestrationV2NativeChildWork,
@@ -11,6 +12,9 @@ import type {
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as Stream from "effect/Stream";
 import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import type * as EffectAcpSchema from "effect-acp/compat";
@@ -37,12 +41,19 @@ const AGENT_REPORT_RECIPIENT_SESSION_ID = 2;
 const AGENT_REPORT_SENDER_CONVERSATION_ID = 3;
 const AGENT_REPORT_TEXT = 4;
 const STEP_INVOKE_SUBAGENT = 143;
+const STEP_TASK_DETAILS = 148;
 const INVOKE_SPECS = 9;
 const INVOKE_SPEC_MODEL_TIER = 8;
 const INVOKE_RESULTS = 10;
 const PLANNER_RESPONSE_STEP_TYPE = 15;
 const SYSTEM_MESSAGE_STEP_TYPE = 101;
 const INVOKE_SUBAGENT_STEP_TYPE = 127;
+const RUN_COMMAND_STEP_TYPE = 21;
+const GENERIC_STEP_TYPE = 132;
+const RUNNING_STEP_STATUS = 2;
+const encodeCommandTasks = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Array(OrchestrationV2PendingBackgroundTask)),
+);
 
 // exa.cortex_pb.ModelTier
 export const MODEL_TIER_NAMES: Readonly<Record<number, string>> = {
@@ -923,6 +934,169 @@ export const readAntigravitySessionSubagentState = Effect.fn("readAntigravitySes
     });
   },
 );
+
+const decodeCommandTask = safely((payload) => {
+  const toolCall = message(message(payload, STEP_METADATA), METADATA_TOOL_CALL);
+  if (text(toolCall, 2) !== "run_command") return undefined;
+  const details = message(payload, STEP_TASK_DETAILS);
+  const taskId = text(details, 1);
+  const command = text(details, 4);
+  if (taskId === undefined || command === undefined || command.trim() === "") return undefined;
+  return {
+    taskId,
+    command,
+    description: text(details, 7)?.trim(),
+    toolCallId: text(toolCall, 1),
+  };
+});
+
+const readCommandTasks = Effect.fn("AntigravityCommandTaskTracker.readNative")(function* (
+  profileDirectory: string,
+  rootSessionId: string,
+) {
+  return yield* Effect.tryPromise({
+    try: async () => {
+      const resolved = await resolveSessionDatabase(profileDirectory, rootSessionId);
+      if (resolved === undefined) return undefined;
+      const database = new NodeSqlite.DatabaseSync(resolved.databasePath, { readOnly: true });
+      try {
+        database.exec("PRAGMA busy_timeout = 100");
+        const tasks: Array<NonNullable<ReturnType<typeof decodeCommandTask>>> = [];
+        let bytes = 0;
+        let rows = 0;
+        for (const row of database
+          .prepare(
+            "SELECT length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_type IN (?, ?) AND status = ? AND step_format = 0 ORDER BY idx DESC LIMIT ?",
+          )
+          .iterate(
+            MAX_STEP_BYTES,
+            RUN_COMMAND_STEP_TYPE,
+            GENERIC_STEP_TYPE,
+            RUNNING_STEP_STATUS,
+            MAX_INVOKE_ROWS + 1,
+          )) {
+          bytes += rowNumber(row, "size");
+          rows += 1;
+          if (rows > MAX_INVOKE_ROWS || bytes > MAX_SCAN_BYTES) return undefined;
+          const payload = payloadOf(row);
+          if (payload === undefined) return undefined;
+          const task = decodeCommandTask(payload);
+          if (task !== undefined && task.taskId.startsWith(`${rootSessionId}/task-`))
+            tasks.push(task);
+        }
+        return tasks.reverse();
+      } finally {
+        database.close();
+      }
+    },
+    catch: (cause) => new AntigravityChildWorkReadError({ cause }),
+  });
+});
+
+interface CommandTaskState {
+  readonly commands: Map<string, { command: string; taskId: string | undefined }>;
+  native: ReadonlyArray<NonNullable<ReturnType<typeof decodeCommandTask>>> | undefined;
+  serialized: string | undefined;
+}
+
+/** Publish native shell tasks separately from agent child conversations. */
+export function makeAntigravityCommandTaskTracker(profileDirectory: string | undefined) {
+  const sessions = new Map<string, CommandTaskState>();
+  return {
+    changes: Effect.fn("AntigravityCommandTaskTracker.changes")(function* (
+      sessionId: string,
+      onReady: () => void,
+    ) {
+      if (profileDirectory === undefined || !NATIVE_ID.test(sessionId)) return Stream.empty;
+      const root = yield* Effect.promise(() => antigravityProfileRoot(profileDirectory));
+      const directory =
+        root === undefined
+          ? undefined
+          : yield* Effect.promise(() =>
+              antigravityManagedPath(root, ["antigravity-acp", "conversations"], "directory"),
+            );
+      if (directory === undefined) return Stream.empty;
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      return fs.watch(directory.path, { onReady }).pipe(
+        Stream.filter((event) => {
+          const name = path.basename(event.path);
+          return name === `${sessionId}.db` || name === `${sessionId}.db-wal`;
+        }),
+        Stream.debounce("50 millis"),
+        Stream.map(() => undefined),
+      );
+    }),
+    read: Effect.fn("AntigravityCommandTaskTracker.read")(function* (
+      notification: EffectAcpSchema.SessionNotification,
+    ): Effect.fn.Return<ReadonlyArray<OrchestrationV2PendingBackgroundTask> | undefined> {
+      if (profileDirectory === undefined || !NATIVE_ID.test(notification.sessionId))
+        return undefined;
+      const { sessionId, update } = notification;
+      if (
+        update.sessionUpdate !== "session_info_update" &&
+        update.sessionUpdate !== "tool_call" &&
+        update.sessionUpdate !== "tool_call_update"
+      )
+        return undefined;
+      let state = sessions.get(sessionId);
+      if (state === undefined) {
+        state = { commands: new Map(), native: undefined, serialized: undefined };
+        sessions.set(sessionId, state);
+      }
+      let terminalToolId: string | undefined;
+      if (update.sessionUpdate === "session_info_update") {
+        const native = yield* readCommandTasks(profileDirectory, sessionId).pipe(
+          Effect.orElseSucceed(() => undefined),
+        );
+        if (native === undefined) return undefined;
+        state.native = native;
+        for (const [id, entry] of state.commands) {
+          if (entry.taskId !== undefined && !native.some((task) => task.taskId === entry.taskId))
+            state.commands.delete(id);
+        }
+      } else {
+        const previous = state.commands.get(update.toolCallId);
+        const input = update.rawInput;
+        const command =
+          Predicate.isObject(input) && typeof input.CommandLine === "string"
+            ? input.CommandLine
+            : previous?.command;
+        if (command !== undefined)
+          state.commands.set(update.toolCallId, { command, taskId: previous?.taskId });
+        if (update.status === "completed" || update.status === "failed")
+          terminalToolId = update.toolCallId;
+      }
+      const tasks: Array<OrchestrationV2PendingBackgroundTask> = [];
+      for (const task of state.native ?? []) {
+        const matching = [...state.commands].filter(
+          ([id, entry]) =>
+            id === task.toolCallId ||
+            (entry.command === task.command &&
+              (entry.taskId === undefined || entry.taskId === task.taskId)),
+        );
+        const exact = matching.find(([id]) => id === task.toolCallId);
+        const matched = exact ?? (matching.length === 1 ? matching[0] : undefined);
+        if (matched !== undefined) matched[1].taskId = task.taskId;
+        const nativeItemId = matched?.[0] ?? task.toolCallId;
+        tasks.push({
+          kind: "command",
+          taskId: task.taskId,
+          command: boundAntigravityToolText(task.command),
+          ...(task.description ? { description: boundAntigravityToolText(task.description) } : {}),
+          ...(nativeItemId === undefined ? {} : { nativeItemId }),
+        });
+      }
+      if (terminalToolId !== undefined && state.commands.get(terminalToolId)?.taskId === undefined)
+        state.commands.delete(terminalToolId);
+      if (state.native === undefined) return undefined;
+      const serialized = encodeCommandTasks(tasks);
+      if (state.serialized === serialized) return undefined;
+      state.serialized = serialized;
+      return tasks;
+    }),
+  };
+}
 
 interface TrackedSubagentBatch {
   readonly rootSessionId: string;

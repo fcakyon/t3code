@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off -- fixtures name transcript files by URL.
 import * as NodeURL from "node:url";
+import * as NodeSqlite from "node:sqlite";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
@@ -13,6 +14,7 @@ import {
   antigravitySubagentChildSessionId,
   describeAntigravitySubagentLaunches,
   makeAntigravitySubagentTracker,
+  makeAntigravityCommandTaskTracker,
   readAntigravityChildWork,
   readAntigravitySessionSubagentState,
   toAntigravitySubagentRawInput,
@@ -21,6 +23,7 @@ import { sanitizeAntigravityToolPayload } from "./AntigravityProtocol.ts";
 import {
   agentReportStep,
   autoApproved,
+  commandTaskStep,
   CHILD,
   invokeStep,
   LAUNCH,
@@ -52,6 +55,170 @@ const read = (
   });
 
 it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
+  it.effect("keeps a compacted background command's native task identity until completion", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const taskId = `${ROOT}/task-4293`;
+      const command = "ssh ultra12 'wc -l predictions.jsonl'";
+      const { profile } = yield* makeProfile({
+        steps: () => [
+          [
+            4293,
+            21,
+            commandTaskStep({
+              taskId,
+              command,
+              summary: "Check evaluation progress across hosts",
+              callId: "call-original",
+            }),
+          ],
+        ],
+      });
+      const tracker = makeAntigravityCommandTaskTracker(profile);
+      const notification = {
+        sessionId: ROOT,
+        update: {
+          sessionUpdate: "tool_call" as const,
+          toolCallId: `${ROOT}:2813`,
+          kind: "execute" as const,
+          title: command,
+          status: "in_progress" as const,
+          rawInput: { CommandLine: command, WaitMsBeforeAsync: 10000 },
+        },
+      };
+      const refresh = {
+        sessionId: ROOT,
+        update: { sessionUpdate: "session_info_update" as const },
+      };
+      expect(yield* tracker.read(notification)).toBeUndefined();
+      expect(yield* tracker.read(refresh)).toEqual([
+        {
+          kind: "command",
+          taskId,
+          command,
+          description: "Check evaluation progress across hosts",
+          nativeItemId: `${ROOT}:2813`,
+        },
+      ]);
+      expect(yield* tracker.read(notification)).toBeUndefined();
+      expect(
+        yield* tracker.read({
+          ...notification,
+          update: { ...notification.update, status: "completed" },
+        }),
+      ).toBeUndefined();
+      const database = new NodeSqlite.DatabaseSync(
+        path.join(profile, "antigravity-acp", "conversations", `${ROOT}.db`),
+      );
+      database.prepare("UPDATE steps SET status = 3 WHERE idx = 4293").run();
+      database.close();
+      expect(
+        yield* tracker.read({
+          sessionId: ROOT,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Still working" },
+          },
+        }),
+      ).toBeUndefined();
+      expect(yield* tracker.read(notification)).toBeUndefined();
+      expect(yield* tracker.read(refresh)).toEqual([]);
+      yield* tracker.read({
+        ...notification,
+        update: { ...notification.update, toolCallId: "completed-foreground", status: "completed" },
+      });
+      const nextDatabase = new NodeSqlite.DatabaseSync(
+        path.join(profile, "antigravity-acp", "conversations", `${ROOT}.db`),
+      );
+      nextDatabase
+        .prepare(
+          "INSERT INTO steps (idx,step_type,status,step_format,step_payload) VALUES (?,21,2,0,?)",
+        )
+        .run(
+          4294,
+          commandTaskStep({
+            taskId: `${ROOT}/task-4294`,
+            command,
+            summary: "Next check",
+            callId: "call-next",
+          }),
+        );
+      nextDatabase.close();
+      yield* tracker.read({
+        ...notification,
+        update: { ...notification.update, toolCallId: `${ROOT}:2814` },
+      });
+      expect(yield* tracker.read(refresh)).toEqual([
+        {
+          kind: "command",
+          taskId: `${ROOT}/task-4294`,
+          command,
+          description: "Next check",
+          nativeItemId: `${ROOT}:2814`,
+        },
+      ]);
+    }),
+  );
+
+  it.effect.each([
+    { stepType: 21 as const, status: 3 },
+    { stepType: 132 as const, status: 3 },
+    { stepType: 132 as const, status: 6 },
+  ])("restores native task $stepType until terminal state $status", ({ stepType, status }) =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const { profile } = yield* makeProfile({
+        steps: () => [
+          [
+            4293,
+            stepType,
+            commandTaskStep({
+              stepType,
+              taskId: `${ROOT}/task-4293`,
+              command: "run checks",
+              summary: "Check progress",
+              callId: "call-original",
+            }),
+          ],
+          [
+            4294,
+            132,
+            commandTaskStep({
+              stepType: 132,
+              toolName: "invoke_subagent",
+              taskId: `${ROOT}/task-4294`,
+              command: "agent work",
+              summary: "Other task",
+              callId: "other-call",
+            }),
+          ],
+        ],
+      });
+      const tracker = makeAntigravityCommandTaskTracker(profile);
+      const notification = {
+        sessionId: ROOT,
+        update: {
+          sessionUpdate: "session_info_update" as const,
+          title: "Research",
+        },
+      };
+      expect(yield* tracker.read(notification)).toEqual([
+        {
+          kind: "command",
+          taskId: `${ROOT}/task-4293`,
+          command: "run checks",
+          description: "Check progress",
+          nativeItemId: "call-original",
+        },
+      ]);
+      const database = new NodeSqlite.DatabaseSync(
+        path.join(profile, "antigravity-acp", "conversations", `${ROOT}.db`),
+      );
+      database.prepare("UPDATE steps SET status = ? WHERE idx = 4293").run(status);
+      database.close();
+      expect(yield* tracker.read(notification)).toEqual([]);
+    }),
+  );
   it.effect("follows an auto-approved call id through its planner step to the record", () =>
     Effect.gen(function* () {
       const { profile } = yield* makeProfile({ steps: autoApproved });

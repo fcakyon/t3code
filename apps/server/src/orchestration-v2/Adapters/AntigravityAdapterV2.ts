@@ -11,12 +11,14 @@ import type { SelfInvocation } from "@t3tools/shared/nodeRuntime";
 import { compareSemverVersions } from "@t3tools/shared/semver";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
 import * as Predicate from "effect/Predicate";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
@@ -38,6 +40,7 @@ import {
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
   makeAntigravitySubagentTracker,
+  makeAntigravityCommandTaskTracker,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
 import {
@@ -233,6 +236,7 @@ export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
+  const commandTasks = makeAntigravityCommandTaskTracker(profileDirectory);
   const antigravityClientFileRoots = (cwd: string | null) =>
     cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
@@ -255,6 +259,32 @@ export function makeAntigravityAcpAdapterFlavor(
       // Served reads are reported from the read handler, so they take turns with agent updates.
       const updates = yield* Semaphore.make(1);
       let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
+      const watchedSessions = new Set<string>();
+      const watchSession = Effect.fn("AntigravityAdapterV2.watchSession")(
+        function* (started: AcpSessionRuntime.AcpSessionRuntimeStartResult) {
+          const { sessionId } = started;
+          if (watchedSessions.has(sessionId)) return;
+          watchedSessions.add(sessionId);
+          const ready = yield* Deferred.make<void>();
+          const changes = yield* commandTasks.changes(sessionId, () =>
+            Deferred.doneUnsafe(ready, Exit.void),
+          );
+          yield* changes.pipe(
+            Stream.runForEach(() =>
+              updates.withPermit(
+                projectUpdate?.({ sessionId, update: { sessionUpdate: "session_info_update" } }) ??
+                  Effect.void,
+              ),
+            ),
+            Effect.ignoreCause({ log: true }),
+            Effect.ensuring(Deferred.succeed(ready, undefined)),
+            Effect.forkIn(scope),
+          );
+          yield* Deferred.await(ready);
+        },
+        Effect.provideService(FileSystem.FileSystem, options.fileSystem),
+        Effect.provideService(Path.Path, options.path),
+      );
       const repairedSessions = new Set<string>();
       const repairBeforeOpen = (sessionId: string | undefined) => {
         if (
@@ -315,14 +345,17 @@ export function makeAntigravityAcpAdapterFlavor(
         resumeSession: (sessionId, configOptions) =>
           repairBeforeOpen(sessionId).pipe(
             Effect.andThen(runtime.resumeSession(sessionId, configOptions)),
+            Effect.tap(watchSession),
           ),
         loadSession: (sessionId, configOptions) =>
           repairBeforeOpen(sessionId).pipe(
             Effect.andThen(runtime.loadSession(sessionId, configOptions)),
+            Effect.tap(watchSession),
           ),
         start: () =>
           repairBeforeOpen(input.resumeSessionId).pipe(
             Effect.andThen(runtime.start()),
+            Effect.tap(watchSession),
             Effect.tap((started) => options.onSessionStarted?.(started, input.cwd) ?? Effect.void),
           ),
       } satisfies typeof runtime;
@@ -339,6 +372,7 @@ export function makeAntigravityAcpAdapterFlavor(
     driver: ANTIGRAVITY_PROVIDER,
     runtimeHarness: "Antigravity",
     capabilities: AntigravityProviderCapabilitiesV2,
+    pendingBackgroundTasks: commandTasks.read,
     promptSteering: (initializeResult) => {
       const version = initializeResult.agentInfo?.version;
       return (

@@ -8,7 +8,7 @@ description: Maintain the fcakyon/t3code fork. Use when syncing upstream into ni
 Fork notes live here so the root `AGENTS.md` stays identical to upstream and merges never conflict on it.
 
 - `main` mirrors `upstream/main` (pingdotgg/t3code) with no fork commits.
-- `nightly` carries the fork patches listed in `fcakyon-changelog.md` plus `main` merged in.
+- `nightly` carries the fork patches listed in `fcakyon-changelog.md` plus `main` merged in. Add a concise note for each fork-only commit before pushing, including fixes and maintenance changes.
 - `.github/workflows/fork-nightly.yml` only builds, and only on dispatch. The sync runs locally with the user's `gh` token because the workflow's `GITHUB_TOKEN` cannot push upstream changes to `.github/workflows/`.
 
 ## Sync and release
