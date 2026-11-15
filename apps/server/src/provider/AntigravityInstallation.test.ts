@@ -290,7 +290,7 @@ const expectPreviousRelease = Effect.fn("test.expectPreviousAntigravityRelease")
 
 it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity installation", (it) => {
   it.effect.each([...new Set(["win32", hostPlatform])] as NodeJS.Platform[])(
-    "migrates the legacy managed runtime to the native CLI on %s and retains the old release",
+    "acquires the native CLI after migrating the legacy managed runtime on %s",
     (platform) =>
       Effect.gen(function* () {
         const archive =
@@ -301,15 +301,24 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
                 "base64",
               );
         const { installation, validations, requests, fs, baseDir, stagingReleased } =
-          yield* makeHarness({ native: true, archive, platform, previous: true });
-        yield* installation.start;
+          yield* makeHarness({
+            native: true,
+            nativeVersion: "1.5.9",
+            archive,
+            platform,
+            previous: true,
+            updateChecksEnabled: Effect.succeed(false),
+          });
+        expect(requests).toEqual([]);
+        const acquired = yield* installation.acquire();
+        expect(acquired).toMatchObject({ source: "managed", version: "1.5.9", harnessPath: null });
         expect(yield* terminalState(installation)).toMatchObject({
           phase: "succeeded",
-          installedVersion: "1.5.7",
+          installedVersion: "1.5.9",
         });
         yield* Deferred.await(stagingReleased);
         const resolved = yield* installation.resolve();
-        expect(resolved).toMatchObject({ source: "managed", version: "1.5.7", harnessPath: null });
+        expect(resolved.executablePath).toBe(acquired.executablePath);
         expect(validations[0]?.executable.harnessPath).toBeNull();
         expect(yield* fs.readFileString(resolved.executablePath)).toBe(serverContents);
         expect(requests.some((url) => url.includes("/manifests/"))).toBe(true);
@@ -320,13 +329,17 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
           platform,
           nativeVersion: "1.5.6",
         });
+        expect((yield* restarted.installation.acquire()).executablePath).toBe(
+          acquired.executablePath,
+        );
+        expect(restarted.requests).toEqual([]);
         expect(yield* restarted.installation.start).toMatchObject({
           phase: "verifying",
           message: "Checking the installed runtime.",
         });
         expect(yield* terminalState(restarted.installation)).toMatchObject({
           phase: "succeeded",
-          installedVersion: "1.5.7",
+          installedVersion: "1.5.9",
         });
         expect(restarted.requests.filter((url) => url.includes("storage.googleapis.com"))).toEqual(
           [],
@@ -531,9 +544,9 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
         platform: "win32",
         previous: true,
       });
-      const result = yield* Effect.result(installation.start);
-      if (result._tag === "Success")
-        expect((yield* terminalState(installation)).phase).toBe("failed");
+      expect(yield* installation.acquire().pipe(Effect.flip)).toBeInstanceOf(
+        AntigravityInstallation.AntigravityInstallationError,
+      );
       expect(validations).toEqual([]);
       yield* expectPreviousRelease(installation);
     }),
@@ -1147,11 +1160,11 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
       }),
   );
 
-  it.effect("keeps leased releases available while new sessions resolve the new release", () =>
+  it.effect("keeps custom legacy leases while concurrent managed acquisitions migrate", () =>
     Effect.gen(function* () {
       const manifestEntered = yield* Deferred.make<void>();
       const releaseManifest = yield* Deferred.make<void>();
-      const { installation, fs, stagingReleased } = yield* makeHarness({
+      const { installation, fs, requests, stagingReleased } = yield* makeHarness({
         native: true,
         platform: "win32",
         archive: Buffer.from(serverContents),
@@ -1161,13 +1174,23 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
         ),
       });
       const processScope = yield* Scope.make();
-      const oldExecutable = yield* installation.acquire().pipe(Scope.provide(processScope));
-      const starting = yield* installation.start.pipe(Effect.forkScoped);
+      const previous = yield* installation.resolve();
+      const oldExecutable = yield* installation
+        .acquire(previous.executablePath)
+        .pipe(Scope.provide(processScope));
+      expect(oldExecutable).toMatchObject({ source: "override", version: previousVersion });
+      expect(requests).toEqual([]);
+      const starting = yield* installation
+        .acquire()
+        .pipe(Scope.provide(processScope), Effect.forkScoped);
       yield* Deferred.await(manifestEntered);
-      const concurrent = yield* installation.acquire().pipe(Scope.provide(processScope));
-      expect(concurrent.executablePath).toBe(oldExecutable.executablePath);
+      const concurrent = yield* installation
+        .acquire()
+        .pipe(Scope.provide(processScope), Effect.forkScoped);
       yield* Deferred.succeed(releaseManifest, undefined);
-      yield* Fiber.join(starting);
+      const acquired = yield* Fiber.join(starting);
+      expect(acquired).toMatchObject({ version: "1.5.7", harnessPath: null });
+      expect((yield* Fiber.join(concurrent)).executablePath).toBe(acquired.executablePath);
       expect((yield* terminalState(installation)).phase).toBe("succeeded");
       yield* Deferred.await(stagingReleased);
       const current = yield* installation.resolve();
