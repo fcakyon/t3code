@@ -162,8 +162,38 @@ export interface GhosttyMouseInput {
   readonly anyButtonPressed: boolean;
 }
 
+// Ghostty sends modified F3 as CSI 13;m ~ to stay clear of cursor position reports, but the PTY
+// advertises xterm-256color, whose kf15/kf27/... are CSI 1;m R. Terminfo keys only apply in
+// keypad-transmit mode (smkx), so that mode marks a terminfo reader; raw parsers never set it.
+const MODIFIED_F3 = /^\x1b\[13;(\d+)~$/;
+
 const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
 const encoder = new TextEncoder();
+
+// The encoder only takes whole-pixel cells, so cell reports rescale the pointer onto that grid.
+function encoderAxis(
+  position: number,
+  screen: number,
+  cell: number,
+  paddingStart: number,
+  paddingEnd: number,
+  pixelReports: boolean,
+) {
+  const wholeCell = Math.max(1, Math.round(cell));
+  if (pixelReports) {
+    return { position, screen, cell: wholeCell, paddingStart, paddingEnd };
+  }
+  const scale = wholeCell / cell;
+  const start = Math.round(paddingStart);
+  const end = Math.round(paddingEnd);
+  return {
+    position: Math.max(0, start + (position - paddingStart) * scale),
+    screen: start + end + Math.floor((screen - paddingStart - paddingEnd) / cell) * wholeCell,
+    cell: wholeCell,
+    paddingStart: start,
+    paddingEnd: end,
+  };
+}
 
 function blend(foreground: GhosttyColor, background: GhosttyColor): GhosttyColor {
   const channel = (front: number, back: number) => Math.floor((front * 155 + back * 100) / 255);
@@ -223,6 +253,8 @@ export class GhosttyTerminalCore {
   private cellQuery = 0;
   private scrollbar = 0;
   private rows: GhosttyRow[] = [];
+  // Defaults the cached rows resolved; Ghostty marks no row dirty when OSC 10/11 change them.
+  private rowColors: Pick<GhosttySnapshot, "foreground" | "background"> | null = null;
   private disposed = false;
   private keyboardLayoutMap: GhosttyKeyboardLayoutMap | undefined;
 
@@ -575,7 +607,9 @@ export class GhosttyTerminalCore {
     );
     this.runtime.call("ghostty_wasm_free_usize", written);
     if (textPointer !== 0) this.runtime.free(textPointer, textBytes.length);
-    return encoded;
+    return MODIFIED_F3.test(encoded) && this.modeEnabled(66) && this.kittyKeyboardFlags() === 0
+      ? encoded.replace(MODIFIED_F3, "\x1b[1;$1R")
+      : encoded;
   }
 
   encodePaste(data: string): string {
@@ -638,18 +672,37 @@ export class GhosttyTerminalCore {
       this.terminal,
     );
 
+    // SGR pixel reports (DEC 1016) must name surface pixels, so they skip the rescale.
+    const pixelReports = this.modeEnabled(1016);
+    const x = encoderAxis(
+      input.x,
+      input.screenWidth,
+      input.cellWidth,
+      input.paddingLeft,
+      input.paddingRight,
+      pixelReports,
+    );
+    const y = encoderAxis(
+      input.y,
+      input.screenHeight,
+      input.cellHeight,
+      input.paddingTop,
+      input.paddingBottom,
+      pixelReports,
+    );
+
     const sizeLayout = this.runtime.layout("GhosttyMouseEncoderSize");
     const size = this.runtime.alloc(sizeLayout.size);
     for (const [field, value] of [
       ["size", sizeLayout.size],
-      ["screen_width", input.screenWidth],
-      ["screen_height", input.screenHeight],
-      ["cell_width", input.cellWidth],
-      ["cell_height", input.cellHeight],
-      ["padding_top", input.paddingTop],
-      ["padding_bottom", input.paddingBottom],
-      ["padding_right", input.paddingRight],
-      ["padding_left", input.paddingLeft],
+      ["screen_width", x.screen],
+      ["screen_height", y.screen],
+      ["cell_width", x.cell],
+      ["cell_height", y.cell],
+      ["padding_top", y.paddingStart],
+      ["padding_bottom", y.paddingEnd],
+      ["padding_right", x.paddingEnd],
+      ["padding_left", x.paddingStart],
     ] as const) {
       this.runtime.setField(size, "GhosttyMouseEncoderSize", field, Math.max(0, Math.round(value)));
     }
@@ -675,8 +728,8 @@ export class GhosttyTerminalCore {
     const positionLayout = this.runtime.layout("GhosttyMousePosition");
     const position = this.runtime.alloc(positionLayout.size);
     const positionView = this.runtime.view(position, positionLayout.size);
-    positionView.setFloat32(positionLayout.fields.x!.offset, input.x, true);
-    positionView.setFloat32(positionLayout.fields.y!.offset, input.y, true);
+    positionView.setFloat32(positionLayout.fields.x!.offset, x.position, true);
+    positionView.setFloat32(positionLayout.fields.y!.offset, y.position, true);
     this.runtime.call("ghostty_mouse_event_set_position", this.mouseEvent, position);
     this.runtime.free(position, positionLayout.size);
 
@@ -821,9 +874,14 @@ export class GhosttyTerminalCore {
     );
     const cols = this.getU16(RENDER_DATA.cols);
     const rowCount = this.getU16(RENDER_DATA.rows);
-    const dirty = this.getU32(RENDER_DATA.dirty);
     const foreground = this.getColor(RENDER_DATA.foreground, { r: 229, g: 231, b: 235 });
     const background = this.getColor(RENDER_DATA.background, { r: 0, g: 0, b: 0 });
+    const colorsChanged =
+      this.rowColors !== null &&
+      (!sameColor(this.rowColors.foreground, foreground) ||
+        !sameColor(this.rowColors.background, background));
+    this.rowColors = { foreground, background };
+    const dirty = colorsChanged ? 2 : this.getU32(RENDER_DATA.dirty);
     const cursorHasValue = this.getBool(RENDER_DATA.cursorHasValue);
     const cursor = cursorHasValue ? this.getColor(RENDER_DATA.cursor, foreground) : foreground;
     const cursorInViewport = this.getBool(RENDER_DATA.cursorInViewport);
@@ -987,6 +1045,12 @@ export class GhosttyTerminalCore {
     ]) {
       this.runtime.freeOpaque(slot);
     }
+  }
+
+  private kittyKeyboardFlags(): number {
+    this.runtime.bytes(this.scratch, 1)[0] = 0;
+    this.runtime.call("ghostty_terminal_get", this.terminal, 8, this.scratch);
+    return this.runtime.bytes(this.scratch, 1)[0]!;
   }
 
   /** Reads a DEC private mode; an unknown mode reads as off. */
