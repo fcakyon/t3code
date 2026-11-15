@@ -1,5 +1,6 @@
 # t3code-fcakyon changelog
 
+- build: Sync upstream through [`d21d8d8b5d`](https://github.com/pingdotgg/t3code/commit/d21d8d8b5d) and retain workspace skill discovery
 - fix: Show Antigravity background tasks ([`e8a84f972e`](https://github.com/fcakyon/t3code/commit/e8a84f972e))
 - fix: Preserve Antigravity sign-in during the 1.5.9 upgrade ([`d2803c084a`](https://github.com/fcakyon/t3code/commit/d2803c084a))
 - fix: Steer Antigravity without stopping tools ([`f278d14e33`](https://github.com/fcakyon/t3code/commit/f278d14e33))
