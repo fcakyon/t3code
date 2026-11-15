@@ -1173,6 +1173,7 @@ export class AcpSessionRuntime extends Context.Service<
       options?: {
         readonly dispatched?: Deferred.Deferred<void>;
         readonly released?: Deferred.Deferred<void>;
+        readonly steering?: boolean;
       },
     ) => Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
     readonly cancel: Effect.Effect<void, EffectAcpErrors.AcpError>;
@@ -1247,6 +1248,7 @@ interface AcpActivePrompt {
   readonly completed: Deferred.Deferred<void>;
   /** Settles once the prompt is queued to the agent, or its call has ended without that. */
   readonly queued: Deferred.Deferred<void>;
+  readonly steeringPrompts: Array<AcpActivePrompt["fiber"]>;
 }
 
 // A fiber stopped before its call began never settles queued, so its end counts too.
@@ -1295,6 +1297,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
   const stderrDrained = yield* Deferred.make<void>();
   const runtimeClosed = yield* Deferred.make<void>();
   const promptSerializationSemaphore = yield* Semaphore.make(1);
+  const steeringAdmissionSemaphore = yield* Semaphore.make(1);
   const sessionLoadSemaphore = yield* Semaphore.make(1);
   const promptDispatchSemaphore = yield* Semaphore.make(1);
   const activePromptRef = yield* Ref.make<Option.Option<AcpActivePrompt>>(Option.none());
@@ -2402,6 +2405,64 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       ),
     );
 
+  const dispatchPrompt = Effect.fn("AcpSessionRuntime.dispatchPrompt")(function* (
+    payload: Omit<EffectAcpSchema.PromptRequest, "sessionId">,
+    steering: boolean,
+  ) {
+    const started = yield* getStartedState;
+    const current = yield* Ref.get(activePromptRef);
+    if (steering && Option.isNone(current)) {
+      return yield* new EffectAcpErrors.AcpRequestError({
+        code: -32800,
+        errorMessage: "The prompt ended before it could accept steering.",
+        method: "session/prompt",
+      });
+    }
+    if (!steering) {
+      yield* closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef });
+      yield* Ref.set(assistantUpdatesOpenRef, true);
+    }
+    const requestPayload = {
+      sessionId: started.sessionId,
+      ...payload,
+    } satisfies EffectAcpSchema.PromptRequest;
+    const completed = yield* Deferred.make<void>();
+    const queued = yield* Deferred.make<void>();
+    const fiber = yield* runLoggedRequest(
+      "session/prompt",
+      requestPayload,
+      acp.agent
+        .prompt(requestPayload)
+        .pipe(
+          Effect.provideService(EffectAcpProtocol.AcpOutgoingQueued, queued),
+          Effect.ensuring(Deferred.succeed(queued, undefined)),
+        ),
+    ).pipe(Effect.forkIn(runtimeScope));
+    const active: AcpActivePrompt = { fiber, completed, queued, steeringPrompts: [] };
+    if (steering && Option.isSome(current)) current.value.steeringPrompts.push(active.fiber);
+    else yield* Ref.set(activePromptRef, Option.some(active));
+    return active;
+  });
+
+  // Antigravity can answer the first prompt while its steering prompt still streams.
+  const joinActivePrompt = Effect.fn("AcpSessionRuntime.joinActivePrompt")(function* (
+    active: AcpActivePrompt,
+  ) {
+    let result = yield* Effect.exit(joinPrompt(active.fiber));
+    while (true) {
+      const next = yield* steeringAdmissionSemaphore.withPermit(
+        Effect.gen(function* () {
+          const next = active.steeringPrompts.shift();
+          if (next === undefined) yield* Ref.set(activePromptRef, Option.none());
+          return next;
+        }),
+      );
+      if (next === undefined) return yield* result;
+      const steered = yield* Effect.exit(joinPrompt(next));
+      if (Exit.isSuccess(result) && result.value.stopReason === "end_turn") result = steered;
+    }
+  });
+
   const cancel = Effect.gen(function* () {
     const started = yield* getStartedState;
     const activePrompt = yield* Ref.get(activePromptRef);
@@ -2650,33 +2711,29 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       ),
       Effect.andThen(runLoggedRequest("logout", {}, acp.agent.logout({}))),
     ),
-    prompt: (payload, promptOptions?) =>
-      promptSerializationSemaphore
+    prompt: (payload, promptOptions?) => {
+      if (promptOptions?.steering === true) {
+        return promptDispatchSemaphore
+          .withPermit(steeringAdmissionSemaphore.withPermit(dispatchPrompt(payload, true)))
+          .pipe(
+            Effect.flatMap((active) =>
+              awaitPromptQueued(active).pipe(
+                Effect.andThen(
+                  promptOptions.dispatched
+                    ? Deferred.succeed(promptOptions.dispatched, undefined)
+                    : Effect.void,
+                ),
+                Effect.andThen(joinPrompt(active.fiber)),
+              ),
+            ),
+          );
+      }
+      return promptSerializationSemaphore
         .withPermit(
           Effect.acquireUseRelease(
             promptDispatchSemaphore.withPermit(
               Effect.gen(function* () {
-                const started = yield* getStartedState;
-                yield* closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef });
-                yield* Ref.set(assistantUpdatesOpenRef, true);
-                const requestPayload = {
-                  sessionId: started.sessionId,
-                  ...payload,
-                } satisfies EffectAcpSchema.PromptRequest;
-                const completed = yield* Deferred.make<void>();
-                const queued = yield* Deferred.make<void>();
-                const fiber = yield* runLoggedRequest(
-                  "session/prompt",
-                  requestPayload,
-                  acp.agent
-                    .prompt(requestPayload)
-                    .pipe(
-                      Effect.provideService(EffectAcpProtocol.AcpOutgoingQueued, queued),
-                      Effect.ensuring(Deferred.succeed(queued, undefined)),
-                    ),
-                ).pipe(Effect.forkIn(runtimeScope));
-                const active = { fiber, completed, queued } satisfies AcpActivePrompt;
-                yield* Ref.set(activePromptRef, Option.some(active));
+                const active = yield* dispatchPrompt(payload, false);
                 if (promptOptions?.dispatched) {
                   yield* Deferred.succeed(promptOptions.dispatched, undefined);
                 }
@@ -2684,7 +2741,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
               }).pipe(notificationSemaphore.withPermit),
             ),
             (activePrompt) => {
-              const settled = joinPrompt(activePrompt.fiber).pipe(
+              const settled = joinActivePrompt(activePrompt).pipe(
                 Effect.tap(() =>
                   closeActiveAssistantSegment({ queue: eventQueue, assistantSegmentRef }),
                 ),
@@ -2731,7 +2788,8 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
               ? Effect.succeed(outcome.response)
               : joinPrompt(outcome.fiber),
           ),
-        ),
+        );
+    },
     // A cancel that waits for its prompt holds the dispatch permit, so a next prompt cannot reach
     // the agent ahead of it and take the cancel meant for the prompt before.
     cancel:

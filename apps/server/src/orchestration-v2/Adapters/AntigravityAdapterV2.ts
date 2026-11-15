@@ -8,6 +8,7 @@ import {
 } from "@t3tools/contracts";
 import { createModelSelection, modelSelectionsEqual } from "@t3tools/shared/model";
 import type { SelfInvocation } from "@t3tools/shared/nodeRuntime";
+import { compareSemverVersions } from "@t3tools/shared/semver";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -82,6 +83,13 @@ const AntigravityProviderCapabilitiesV2 = {
   subagents: {
     ...AcpProviderCapabilitiesV2.subagents,
     supportsSubagents: true,
+  },
+  turns: {
+    ...AcpProviderCapabilitiesV2.turns,
+    supportsActiveSteering: true,
+    supportsSteeringByInterruptRestart: false,
+    activeSteeringInterruptsTools: false,
+    activeSteeringAcceptsAttachments: true,
   },
 } satisfies OrchestrationV2ProviderCapabilities;
 
@@ -283,7 +291,9 @@ export function makeAntigravityAcpAdapterFlavor(
             ),
           ),
         prompt: (payload, promptOptions) =>
-          Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
+          (promptOptions?.steering ? Effect.void : Effect.sync(reads.reset)).pipe(
+            Effect.andThen(runtime.prompt(payload, promptOptions)),
+          ),
         handleSessionUpdate: (handler) => {
           projectUpdate = handler;
           return runtime.handleSessionUpdate((rawNotification) =>
@@ -329,6 +339,14 @@ export function makeAntigravityAcpAdapterFlavor(
     driver: ANTIGRAVITY_PROVIDER,
     runtimeHarness: "Antigravity",
     capabilities: AntigravityProviderCapabilitiesV2,
+    promptSteering: (initializeResult) => {
+      const version = initializeResult.agentInfo?.version;
+      return (
+        initializeResult.protocolVersion === 1 &&
+        version !== undefined &&
+        compareSemverVersions(version, "1.5.1") >= 0
+      );
+    },
     supportsNativeGoals: options.supportsNativeGoals ?? Effect.succeed(false),
     // Agents that advertise HTTP MCP skip the stdio bridge process; others keep stdio.
     mcpOverHttp: true,

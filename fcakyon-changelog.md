@@ -11,6 +11,8 @@ This branch tracks [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code) and
 5. Show real subagent titles and prompts instead of the "Antigravity subagent batch" and "Running invoke_subagent" placeholders, and prevent duplicate subagent cards when `stepUpdateIndex` drifts after session compaction ([`fa97c35ffb`](https://github.com/fcakyon/t3code/commit/fa97c35ffb), [`aa4c26ad84`](https://github.com/fcakyon/t3code/commit/aa4c26ad84)).
 6. Resolve and propagate Antigravity subagent model selections and tier overrides (`inherit`, `flash_lite`, `flash`, `pro`) from live calls and protobuf records so subagent cards display their resolved model instead of "Not reported" ([`3d2bb2a109`](https://github.com/fcakyon/t3code/commit/3d2bb2a109)).
 
+7. Steer Antigravity 1.5.1+ sessions with concurrent prompts, preserving running tools and the active turn. Queue follow-ups on older runtimes.
+
 ## Desktop patches
 
 1. Open Usage from desktop links with the selected environment, provider, and metric, including from Stream Deck quota keys ([`abeb40096f`](https://github.com/fcakyon/t3code/commit/abeb40096f37ea1064ce8eb4c5a42bc2b44c3c7d)).

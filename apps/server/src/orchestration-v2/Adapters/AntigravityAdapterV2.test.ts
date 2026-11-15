@@ -26,6 +26,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/process";
 import type * as EffectAcpSchema from "effect-acp/compat";
@@ -49,6 +50,7 @@ import { normalizeAntigravitySessionUpdate } from "../../provider/acp/Antigravit
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { makeTurnInput } from "./AcpAdapterV2.testkit.ts";
 import {
   makeAntigravityAcpAdapterFlavor,
   makeAntigravityAdapterV2,
@@ -368,6 +370,223 @@ describe("AntigravityAdapterV2 compaction", () => {
         assert.equal(session.providerSession.capabilities.turns.supportsNativeGoals, nativeGoals);
         assert.equal((yield* adapter.getCapabilities()).turns.supportsNativeGoals, nativeGoals);
       }).pipe(Effect.provide(layerSession)),
+  );
+});
+
+describe("AntigravityAdapterV2 steering", () => {
+  it.live.each([
+    { version: "1.4.5", stop: false, steers: 0 },
+    { version: "1.5.9", stop: false, steers: 2 },
+    { version: "1.5.9", stop: true, steers: 2 },
+  ])("keeps concurrent prompts in one turn, $version, Stop: $stop", ({ version, stop, steers }) =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const path = yield* Path.Path;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-agy-steer-" });
+      const host = yield* ProviderHost.ProviderHost;
+      const attachment = ChatFileAttachment.make({
+        type: "file",
+        id: "steering-note",
+        name: "note.txt",
+        mimeType: "text/plain",
+        sizeBytes: 10,
+      });
+      const attachmentPath = host.resolveAttachmentPath(attachment);
+      if (attachmentPath === null) return yield* Effect.die("Expected the attachment path");
+      yield* fileSystem.writeFileString(attachmentPath, "correction");
+      const mockAgentPath = path.join(directory, "agent.mjs");
+      const requestLog = path.join(directory, "requests.ndjson");
+      yield* fileSystem.writeFileString(
+        mockAgentPath,
+        `
+import { createInterface } from 'node:readline'
+import { appendFileSync } from 'node:fs'
+const sessionId = 'steering-session'
+let first
+const pending = []
+const reply = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n')
+const update = (update) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId, update } }) + '\\n')
+const configOptions = [{ id: 'model', name: 'Model', type: 'select', category: 'model', currentValue: 'gemini-test-low', options: [{ value: 'gemini-test-low', name: 'Test Flash' }] }]
+const finish = (cancelled) => {
+  update({ sessionUpdate: 'tool_call_update', toolCallId: 'steering-tool', status: cancelled ? 'failed' : 'completed' })
+  update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Steering applied after the command finished.' } })
+  for (const id of [first, ...pending.splice(0)]) if (id !== undefined) reply(id, { stopReason: cancelled ? 'cancelled' : 'end_turn' })
+  first = undefined
+}
+createInterface({ input: process.stdin }).on('line', (line) => {
+  appendFileSync(process.env.T3_ACP_REQUEST_LOG_PATH, line + '\\n')
+  const { id, method } = JSON.parse(line)
+  switch (method) {
+    case 'initialize': reply(id, { protocolVersion: 1, agentInfo: { name: 'Antigravity ACP Server', version: ${JSON.stringify(version)} }, agentCapabilities: {} }); break
+    case 'authenticate': reply(id, {}); break
+    case 'session/new': reply(id, { sessionId, configOptions, modes: { currentModeId: 'yolo', availableModes: [{ id: 'yolo', name: 'Full access' }] } }); break
+    case 'session/prompt':
+      if (first === undefined && pending.length === 0) {
+        first = id
+        update({ sessionUpdate: 'tool_call', toolCallId: 'steering-tool', title: 'Running command', kind: 'execute', status: 'in_progress' })
+      } else {
+        pending.push(id)
+        if (first !== undefined) reply(first, { stopReason: 'end_turn' })
+        first = undefined
+      }
+      break
+    case 'session/cancel': finish(true); break
+    case '_test/finish-steer': finish(false); reply(id, {}); break
+    default: reply(id, { configOptions })
+  }
+})
+`,
+      );
+      const rootSettled = yield* Deferred.make<void>();
+      const crypto = yield* SecureRandom.SecureRandom;
+      const native: { current?: AcpSessionRuntime.AcpSessionRuntime["Service"] } = {};
+      const instanceId = ProviderInstanceId.make("antigravity-steering-test");
+      const adapter = yield* makeAntigravityAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        makeRuntime: (input) =>
+          makeAntigravityAcpRuntime({
+            ...input,
+            childProcessSpawner,
+            runtimeVersion: version,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: input.cwd,
+              env: {
+                T3_ACP_REQUEST_LOG_PATH: requestLog,
+              },
+            },
+            requestLogger: (event) =>
+              event.method === "session/prompt" && event.status === "succeeded"
+                ? Deferred.succeed(rootSettled, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+          }).pipe(
+            Effect.provideService(SecureRandom.SecureRandom, crypto),
+            Effect.tap((runtime) =>
+              Effect.sync(() => {
+                native.current = runtime;
+              }),
+            ),
+          ),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.undefined,
+      });
+      const threadId = ThreadId.make("thread-antigravity-steering");
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: directory,
+      });
+      const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-antigravity-steering"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      if (native.current === undefined) return yield* Effect.die("Expected the native runtime");
+      const nativeRuntime = native.current;
+      yield* Effect.addFinalizer(() =>
+        nativeRuntime.request("_test/finish-steer", {}).pipe(Effect.ignore),
+      );
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      yield* session.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkChild,
+      );
+      const turn = makeTurnInput({
+        threadId,
+        providerThread,
+        instanceId,
+        runtimePolicy,
+        modelSelection,
+        now: yield* DateTime.now,
+      });
+      yield* session.startTurn(turn);
+      const started = yield* Stream.fromQueue(events).pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "command_execution",
+        ),
+        Stream.runHead,
+      );
+      assert.isTrue(started._tag === "Some");
+      if (
+        started._tag !== "Some" ||
+        started.value.type !== "turn_item.updated" ||
+        started.value.turnItem.providerTurnId === null
+      )
+        return yield* Effect.die("Expected the running command");
+      const providerTurnId = started.value.turnItem.providerTurnId;
+      for (let index = 0; index < steers; index += 1)
+        yield* session.steerTurn({
+          threadId,
+          runId: turn.runId,
+          providerThread,
+          providerTurnId,
+          message: {
+            ...turn.message,
+            messageId: MessageId.make(`steer-message-${index}`),
+            text: "Continue with this correction",
+            attachments: index === 0 ? [attachment] : [],
+          },
+        });
+      if (steers > 0) yield* Deferred.await(rootSettled);
+      yield* nativeRuntime.drainEvents;
+      const before = yield* Queue.clear(events);
+      if (stop) yield* session.interruptTurn({ providerThread, providerTurnId });
+      else yield* nativeRuntime.request("_test/finish-steer", {});
+      const terminal = yield* Stream.fromQueue(events).pipe(
+        Stream.filter((event) => event.type === "turn.terminal"),
+        Stream.runHead,
+      );
+      assert.isTrue(
+        terminal._tag === "Some" &&
+          terminal.value.type === "turn.terminal" &&
+          terminal.value.status === (stop ? "interrupted" : "completed"),
+      );
+      assert.isFalse(before.some((event) => event.type === "turn.terminal"));
+      assert.equal(session.providerSession.capabilities.turns.supportsActiveSteering, steers > 0);
+      assert.isFalse(session.providerSession.capabilities.turns.supportsSteeringByInterruptRestart);
+      if (!stop && steers > 0) {
+        const late = yield* session
+          .steerTurn({
+            threadId,
+            runId: turn.runId,
+            providerThread,
+            providerTurnId,
+            message: turn.message,
+          })
+          .pipe(Effect.flip);
+        assert.equal(late._tag, "ProviderAdapterSteerDeclinedError");
+      }
+      const requests = (yield* fileSystem.readFileString(requestLog))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      for (const request of requests
+        .filter((request) => request.method === "session/prompt")
+        .slice(1)) {
+        const text = JSON.stringify(request.params.prompt);
+        assert.notInclude(text, "<t3_code_instructions>");
+        assert.notInclude(text, "<runtime_info>");
+      }
+      const methods = requests
+        .map((request) => request.method)
+        .filter((method) => ["session/prompt", "session/cancel"].includes(method));
+      assert.deepEqual(methods, [
+        "session/prompt",
+        ...Array.from({ length: steers }, () => "session/prompt"),
+        ...(stop ? ["session/cancel"] : []),
+      ]);
+    }).pipe(Effect.provide(layerSession)),
   );
 });
 
