@@ -1,4 +1,4 @@
-# Nightly changelog
+# t3code-fcakyon changelog
 
 - fix: Show Antigravity background tasks ([`e8a84f972e`](https://github.com/fcakyon/t3code/commit/e8a84f972e))
 - fix: Preserve Antigravity sign-in during the 1.5.9 upgrade ([`d2803c084a`](https://github.com/fcakyon/t3code/commit/d2803c084a))
