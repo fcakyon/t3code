@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-11-14T15:58:47Z",
+  "updatedAt": "2026-11-15T11:26:04Z",
   "compatibility": [
     {
       "driver": "codex",
@@ -75,7 +75,8 @@
     {
       "driver": "antigravity",
       "t3CodeRange": ">=0.0.42",
-      "recommendedRange": ">=1.5.1 <2",
+      "recommendedRange": ">=1.5.9 <2",
+      "recommendedVersion": "1.5.9",
       "ranges": [
         { "range": ">=1.5.1 <2", "status": "supported" },
         { "range": "=1.4.5", "status": "supported" },

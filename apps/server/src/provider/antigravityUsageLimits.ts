@@ -14,6 +14,7 @@ import {
   makeUnavailableUsageLimits,
   makeUsageLimits,
 } from "@t3tools/provider-core/server/usageLimits";
+import { AntigravityCliTokenFile } from "./antigravityAuthSupport.ts";
 
 export function antigravityUserAgent(platform: NodeJS.Platform, architecture: NodeJS.Architecture) {
   return `antigravity/hub/2.24.0 (aidev_client; os_type=${platform}; arch=${architecture}; cl=963137146)`;
@@ -78,6 +79,7 @@ const Models = Schema.Struct({
 });
 
 const decodeTokenFile = Schema.decodeEffect(Schema.fromJsonString(TokenFile));
+const decodeCliTokenFile = Schema.decodeEffect(Schema.fromJsonString(AntigravityCliTokenFile));
 const decodeTokenResponse = Schema.decodeUnknownEffect(TokenResponse);
 const decodeUserInfo = Schema.decodeUnknownEffect(UserInfo);
 const decodeSummary = Schema.decodeUnknownEffect(Summary);
@@ -207,9 +209,17 @@ function modelWindows(models: typeof Models.Type) {
   return [...windows.values()];
 }
 
-export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(function* (input: {
+class AntigravityUsageRefreshError extends Schema.TaggedError<AntigravityUsageRefreshError>()(
+  "AntigravityUsageRefreshError",
+  {},
+) {}
+
+export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(function* <
+  E,
+>(input: {
   readonly profileDirectory: string;
   readonly authMethod: AntigravitySettings["authMethod"];
+  readonly refreshCliToken?: () => Effect.Effect<void, E>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -218,6 +228,11 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   const platform = yield* HostProcess.Platform;
   const architecture = yield* HostProcess.Architecture;
   const tokenPath = path.join(input.profileDirectory, "antigravity-acp", "acp_token.json");
+  const cliTokenPath = path.join(
+    input.profileDirectory,
+    "antigravity-acp",
+    "antigravity-oauth-token",
+  );
   let cached:
     | { fingerprint: string; account: string; accessToken: string; expiresAt: number }
     | undefined;
@@ -236,7 +251,14 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
     if (input.authMethod !== "oauth-personal" && input.authMethod !== "oauth-business") {
       return makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" });
     }
-    if (!(yield* fs.exists(tokenPath))) {
+    const cliToken =
+      input.authMethod === "oauth-personal"
+        ? yield* fs.readFileString(cliTokenPath).pipe(
+            Effect.flatMap(decodeCliTokenFile),
+            Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
+          )
+        : undefined;
+    if (cliToken === undefined && !(yield* fs.exists(tokenPath))) {
       cached = undefined;
       return makeUnavailableUsageLimits({
         checkedAt,
@@ -244,25 +266,58 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
         message: "Sign in with Google to see Antigravity limits.",
       });
     }
-    const token = yield* fs.readFileString(tokenPath).pipe(Effect.flatMap(decodeTokenFile));
+    const token =
+      cliToken === undefined
+        ? {
+            format: "legacy" as const,
+            value: yield* fs.readFileString(tokenPath).pipe(Effect.flatMap(decodeTokenFile)),
+          }
+        : { format: "cli" as const, value: cliToken.token };
     const fingerprint = yield* sha256(
-      `${token.client_id}\0${token.refresh_token}\0${token.project_id ?? ""}`,
+      token.format === "cli"
+        ? `consumer\0${token.value.refresh_token}`
+        : `${token.value.client_id}\0${token.value.refresh_token}\0${token.value.project_id ?? ""}`,
     );
     const now = yield* Clock.currentTimeMillis;
     let accessToken: string;
     let account: string;
     if (cached?.fingerprint !== fingerprint || cached.expiresAt <= now + 60_000) {
       cached = undefined;
-      const refreshed = yield* request(
-        HttpClientRequest.post("https://oauth2.googleapis.com/token").pipe(
-          HttpClientRequest.bodyUrlParams({
-            client_id: token.client_id,
-            client_secret: token.client_secret,
-            refresh_token: token.refresh_token,
-            grant_type: "refresh_token",
-          }),
-        ),
-      ).pipe(Effect.flatMap(decodeTokenResponse));
+      const refreshed =
+        token.format === "legacy"
+          ? yield* request(
+              HttpClientRequest.post("https://oauth2.googleapis.com/token").pipe(
+                HttpClientRequest.bodyUrlParams({
+                  client_id: token.value.client_id,
+                  client_secret: token.value.client_secret,
+                  refresh_token: token.value.refresh_token,
+                  grant_type: "refresh_token",
+                }),
+              ),
+            ).pipe(Effect.flatMap(decodeTokenResponse))
+          : yield* Effect.gen(function* () {
+              let native = token.value;
+              let expiresAt = native.expiry ? DateTime.make(native.expiry) : Option.none();
+              if (
+                !native.access_token ||
+                Option.isNone(expiresAt) ||
+                DateTime.toEpochMillis(expiresAt.value) <= now + 60_000
+              ) {
+                if (input.refreshCliToken === undefined)
+                  return yield* new AntigravityUsageRefreshError();
+                yield* input.refreshCliToken();
+                native = (yield* fs
+                  .readFileString(cliTokenPath)
+                  .pipe(Effect.flatMap(decodeCliTokenFile))).token;
+                expiresAt = native.expiry ? DateTime.make(native.expiry) : Option.none();
+              }
+              if (!native.access_token || Option.isNone(expiresAt))
+                return yield* new AntigravityUsageRefreshError();
+              return {
+                access_token: native.access_token,
+                expires_in: (DateTime.toEpochMillis(expiresAt.value) - now) / 1000,
+              };
+            });
       accessToken = refreshed.access_token;
       // Use Google account IDs to merge accounts across environments; refresh tokens differ per machine.
       account = yield* request(
@@ -307,7 +362,9 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
                   "User-Agent": antigravityUserAgent(platform, architecture),
                 }),
                 HttpClientRequest.bodyJsonUnsafe(
-                  token.project_id ? { project: token.project_id } : {},
+                  token.format === "legacy" && token.value.project_id
+                    ? { project: token.value.project_id }
+                    : {},
                 ),
               ),
             ).pipe(

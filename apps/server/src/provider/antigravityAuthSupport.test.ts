@@ -603,6 +603,54 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
     }),
   );
 
+  it.effect.each([false, true])(
+    "moves consumer credentials to the CLI once, existing CLI token: %s",
+    (existing) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped();
+        const profileDirectory = path.join(root, "profile");
+        const userHome = path.join(root, "home");
+        const legacy = yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        yield* fs.writeFileString(
+          legacy.tokenPath,
+          JSON.stringify({
+            refresh_token: "legacy-refresh",
+            client_id: "public-client",
+            client_secret: "public-app-secret",
+          }),
+        );
+        const nativePath = path.join(legacy.acpDirectory, "antigravity-oauth-token");
+        const native = {
+          token: { refresh_token: "native-refresh", access_token: "native-access" },
+          auth_method: "consumer",
+        };
+        if (existing)
+          yield* fs.writeFileString(nativePath, JSON.stringify(native), { mode: 0o600 });
+        const cli = yield* prepareAntigravityProfile({ profileDirectory, userHome, cli: true });
+        expect(cli.tokenPath).toBe(nativePath);
+        expect(JSON.parse(yield* fs.readFileString(nativePath))).toEqual(
+          existing
+            ? native
+            : {
+                token: {
+                  refresh_token: "legacy-refresh",
+                  token_type: "Bearer",
+                  expiry: "2000-01-01T00:00:00Z",
+                },
+                auth_method: "consumer",
+              },
+        );
+        expect(yield* fs.exists(legacy.tokenPath)).toBe(false);
+        if ((yield* HostProcess.Platform) !== "win32")
+          expect((yield* fs.stat(nativePath)).mode & 0o777).toBe(0o600);
+        yield* fs.remove(nativePath);
+        yield* prepareAntigravityProfile({ profileDirectory, userHome, cli: true });
+        expect(yield* fs.exists(nativePath)).toBe(false);
+      }),
+  );
+
   it.effect.skipIf(!symlinksSupported)(
     "links only the user's existing global skill directories without touching real content",
     () =>

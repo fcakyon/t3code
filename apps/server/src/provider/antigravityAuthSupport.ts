@@ -29,6 +29,20 @@ export const ANTIGRAVITY_AUTH_BROWSER_MARKER = "__T3_ANTIGRAVITY_AUTH_URL__";
 export const ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE =
   "Sign in to Antigravity in Settings before you continue.";
 
+export const AntigravityCliTokenFile = Schema.Struct({
+  auth_method: Schema.Literal("consumer"),
+  token: Schema.Struct({
+    refresh_token: Schema.NonEmptyString,
+    token_type: Schema.optional(Schema.String),
+    access_token: Schema.optional(Schema.String),
+    expiry: Schema.optional(Schema.String),
+  }),
+});
+const encodeCliTokenFile = Schema.encodeSync(Schema.fromJsonString(AntigravityCliTokenFile));
+const decodeLegacyRefreshToken = Schema.decodeEffect(
+  Schema.fromJsonString(Schema.Struct({ refresh_token: Schema.NonEmptyString })),
+);
+
 const maxAuthorizationUrlLength = 16_384;
 const maxBrowserHelperLineLength =
   Math.max(ANTIGRAVITY_AUTH_BROWSER_MARKER.length, ANTIGRAVITY_AUTH_STDOUT_PREFIX.length) +
@@ -309,6 +323,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
   readonly auth?: AntigravityAuthConfig;
   readonly userHome?: string;
   readonly tempDirectory?: string;
+  readonly cli?: boolean;
 }) {
   const auth = input.auth ?? ANTIGRAVITY_PERSONAL_AUTH;
   const fs = yield* FileSystem.FileSystem;
@@ -377,7 +392,7 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
     platform,
     geminiHome,
     acpDirectory,
-    tokenPath: path.join(acpDirectory, "acp_token.json"),
+    tokenPath: path.join(acpDirectory, input.cli ? "antigravity-oauth-token" : "acp_token.json"),
     tempDirectory,
     browserCommand,
     ...(caBundlePath === undefined ? {} : { caBundlePath }),
@@ -448,6 +463,48 @@ export const prepareAntigravityProfile = Effect.fn("prepareAntigravityProfile")(
       ),
     );
   yield* linkAntigravityUserSkills({ profileDirectory: geminiHome, userHome, platform });
+  if (input.cli && auth.authMethod === "oauth-personal") {
+    yield* Effect.gen(function* () {
+      const legacyPath = path.join(acpDirectory, "acp_token.json");
+      const legacy = yield* fs
+        .readFileString(legacyPath)
+        .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined));
+      if (legacy === undefined) return;
+      if (!(yield* fs.exists(profile.tokenPath))) {
+        const token = yield* decodeLegacyRefreshToken(legacy);
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const directory = yield* fs.makeTempDirectoryScoped({
+              directory: acpDirectory,
+              prefix: "t3-oauth-",
+            });
+            const staging = path.join(directory, "token");
+            yield* fs.writeFileString(
+              staging,
+              encodeCliTokenFile({
+                token: {
+                  refresh_token: token.refresh_token,
+                  token_type: "Bearer",
+                  expiry: "2000-01-01T00:00:00Z",
+                },
+                auth_method: "consumer",
+              }),
+              { mode: 0o600 },
+            );
+            yield* fs
+              .link(staging, profile.tokenPath)
+              .pipe(Effect.catchReason("PlatformError", "AlreadyExists", () => Effect.void));
+          }),
+        );
+      }
+      // The CLI's logout removes its token, so retaining the old file would sign the user back in.
+      yield* fs.remove(legacyPath, { force: true });
+    }).pipe(
+      Effect.mapError(() =>
+        authSupportError("Antigravity sign-in could not be migrated. Sign in again."),
+      ),
+    );
+  }
   return profile;
 });
 

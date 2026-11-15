@@ -228,6 +228,7 @@ export const AntigravityDriver: ProviderDriver<
       );
       const profile = yield* prepareAntigravityProfile({
         profileDirectory,
+        cli: executable.harnessPath === null,
         baseEnv: processEnvironment,
         auth,
         userHome,
@@ -444,6 +445,11 @@ export const AntigravityDriver: ProviderDriver<
     const usage = yield* makeAntigravityUsageProbe({
       profileDirectory,
       authMethod: auth.authMethod,
+      refreshCliToken: Effect.fn("AntigravityDriver.refreshCliToken")(function* () {
+        const runtime = yield* makeDisposableRuntime({});
+        yield* runtime.initialize();
+        yield* runtime.request("authenticate", { methodId: "oauth-personal" });
+      }, Effect.scoped),
     }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
