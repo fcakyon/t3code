@@ -23,6 +23,39 @@ export const ServerProviderUsageWindow = Schema.Struct({
 });
 export type ServerProviderUsageWindow = typeof ServerProviderUsageWindow.Type;
 
+export const UsageLimitsSummary = Schema.Struct({
+  calculatedAt: IsoDateTime,
+  pools: Schema.Array(
+    Schema.Struct({
+      driver: ProviderDriverKind,
+      accounts: Schema.Array(
+        Schema.Struct({
+          id: TrimmedNonEmptyString,
+          providerInstanceIds: Schema.Array(ProviderInstanceId),
+          checkedAt: IsoDateTime,
+          windows: Schema.Array(ServerProviderUsageWindow),
+        }),
+      ),
+      windows: Schema.Array(
+        Schema.Struct({
+          id: TrimmedNonEmptyString,
+          kind: ServerProviderUsageWindow.fields.kind,
+          label: TrimmedNonEmptyString,
+          usedPercent: ServerProviderUsageWindow.fields.usedPercent,
+          remainingPercent: ServerProviderUsageWindow.fields.usedPercent,
+          /** Positive means headroom relative to even spending, measured in percentage points. */
+          paceMarginPoints: Schema.NullOr(Schema.Number),
+          evenPaceRemainingPercent: Schema.NullOr(ServerProviderUsageWindow.fields.usedPercent),
+          pace: Schema.NullOr(Schema.Literals(["ahead", "on", "under"])),
+          resets: Schema.Array(Schema.Struct({ at: IsoDateTime, restoresPercent: Schema.Number })),
+        }),
+      ),
+    }),
+  ),
+  notices: Schema.Array(Schema.String),
+});
+export type UsageLimitsSummary = typeof UsageLimitsSummary.Type;
+
 /** One kind of banked reset, such as Claude's weekly reset or its Fable-only reset. */
 export const ServerProviderResetCreditOption = Schema.Struct({
   creditId: TrimmedNonEmptyString,

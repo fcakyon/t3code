@@ -72,6 +72,8 @@ import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
 import { threadPullRequestUpdatedAtMs } from "@t3tools/shared/threadPullRequests";
+import { collectUsageLimitsSummary } from "@t3tools/shared/usageLimits";
+import * as UsageLimitSources from "../usage/UsageLimitSources.ts";
 import {
   normalizeThreadPullRequestKey,
   visibleThreadPullRequests,
@@ -1260,6 +1262,7 @@ const make = Effect.gen(function* () {
   const random = yield* SecureRandom.SecureRandom;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
+  const usageLimitSources = yield* UsageLimitSources.UsageLimitSources;
   const providerAdapters = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
   const scheduledTasks = yield* ScheduledTaskService.ScheduledTaskService;
   const projects = yield* ProjectService.ProjectService;
@@ -2574,6 +2577,12 @@ const make = Effect.gen(function* () {
           ) ?? [],
         runtimeMode: limits.runtimeMode,
         interactionMode: limits.interactionMode,
+        usageLimitsSummary: collectUsageLimitsSummary(
+          scope.environmentId,
+          providers,
+          yield* usageLimitSources.current,
+          DateTime.toEpochMillis(yield* DateTime.now),
+        ),
         providers: providers.map((provider) => {
           // Snapshots list instances any project enables; delegate_task checks the caller's project.
           const enabledForCaller =
@@ -3602,6 +3611,7 @@ export const layer: Layer.Layer<
   | ThreadLaunchService.ThreadLaunchService
   | GitVcsDriver.GitVcsDriver
   | ProviderRegistry.ProviderRegistry
+  | UsageLimitSources.UsageLimitSources
   | ProviderAdapterRegistry.ProviderAdapterRegistryV2
   | ScheduledTaskService.ScheduledTaskService
   | ProjectService.ProjectService

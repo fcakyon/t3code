@@ -1,5 +1,6 @@
 # t3code-fcakyon changelog
 
+- feat: Share native usage pace with agents and Stream Deck
 - build: Sync upstream through [`26b63a44f9`](https://github.com/pingdotgg/t3code/commit/26b63a44f9)
 - fix: Upgrade managed Antigravity before new sessions ([`848690d39e`](https://github.com/fcakyon/t3code/commit/848690d39e))
 - fix: Rename the fork changelog heading ([`0f26bb3f04`](https://github.com/fcakyon/t3code/commit/0f26bb3f04))

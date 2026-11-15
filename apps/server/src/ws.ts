@@ -277,6 +277,7 @@ import {
 import { isTelemetryIdHash } from "@t3tools/shared/telemetryId";
 import {
   sameUsageLimitCommandCoverage,
+  collectUsageLimitsSummary,
   withUsageLimitsCommands,
 } from "@t3tools/shared/usageLimits";
 import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
@@ -1805,6 +1806,7 @@ export const layerWsRpc = (
 
       const loadServerConfig = Effect.fn("ws.loadServerConfig")(function* (options: {
         readonly usageLimitsCommand: boolean;
+        readonly usageLimitsSummary?: boolean;
         readonly workspaceSnapshotsOnDemand: boolean;
         readonly deferNetworkDiscovery: boolean;
         readonly catalogsPerCwd?: ReadonlySet<string>;
@@ -1850,6 +1852,16 @@ export const layerWsRpc = (
           keybindings: keybindingsConfig.keybindings,
           issues: keybindingsConfig.issues,
           providers,
+          ...(options.usageLimitsSummary
+            ? {
+                usageLimitsSummary: collectUsageLimitsSummary(
+                  environment.environmentId,
+                  currentProviders,
+                  yield* usageLimitSources.current,
+                  DateTime.toEpochMillis(yield* DateTime.now),
+                ),
+              }
+            : {}),
           ...discovery,
           observability: {
             logsDirectoryPath: config.logsDir,
@@ -3338,6 +3350,7 @@ export const layerWsRpc = (
               );
               const config = yield* loadServerConfig({
                 usageLimitsCommand,
+                usageLimitsSummary: input.usageLimitsSummary === true,
                 workspaceSnapshotsOnDemand,
                 deferNetworkDiscovery: true,
                 catalogsPerCwd: yield* currentCatalogsPerCwd,

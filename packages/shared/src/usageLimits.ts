@@ -5,6 +5,7 @@ import {
   type ProjectId,
   resolveProjectProviderInstanceEnabled,
   type UsageLimitsReport,
+  type UsageLimitsSummary,
   type ProviderInstanceId,
   type ProviderConsumeResetCreditInput,
   type ServerProviderSlashCommand,
@@ -280,6 +281,10 @@ export interface LimitAccount {
     readonly environmentId: EnvironmentId;
     readonly label: string;
   }>;
+  readonly providerInstances: ReadonlyArray<{
+    readonly environmentId: EnvironmentId;
+    readonly instanceId: ProviderInstanceId;
+  }>;
   readonly sourceLabel: string | null;
   readonly redeem: {
     readonly environmentId: EnvironmentId;
@@ -349,6 +354,17 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
       plan: planSources.get(key)?.plan ?? previous.plan ?? next.plan,
       accentColor: previous.accentColor ?? next.accentColor,
       environments,
+      providerInstances: [
+        ...previous.providerInstances,
+        ...next.providerInstances.filter(
+          (candidate) =>
+            !previous.providerInstances.some(
+              (seen) =>
+                seen.environmentId === candidate.environmentId &&
+                seen.instanceId === candidate.instanceId,
+            ),
+        ),
+      ],
       sourceLabel: environments.length > 0 ? null : (previous.sourceLabel ?? next.sourceLabel),
       redeem:
         hubRedeems.get(key)?.redeem ??
@@ -369,8 +385,19 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
       ...(presentation.serverConfig?.usageLimitSources ?? []).flatMap((source) => source.accounts),
     ]),
   );
+  const nativeInstances = new Map<string, LimitAccount["providerInstances"]>();
   for (const [environmentId, presentation] of presentations) {
     const label = presentation.entry.target.label;
+    for (const provider of presentation.serverConfig?.providers ?? []) {
+      if (!provider.enabled) continue;
+      const key = resolveKey(nativeReport(provider));
+      if (key !== null) {
+        nativeInstances.set(key, [
+          ...(nativeInstances.get(key) ?? []),
+          { environmentId, instanceId: provider.instanceId },
+        ]);
+      }
+    }
     for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
       if (!provider.usageLimits || limitsNotice(provider.usageLimits) !== null) continue;
       merge(resolveKey(nativeReport(provider)) ?? `${environmentId}:${provider.instanceId}`, {
@@ -381,6 +408,7 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
         plan: provider.auth.label,
         accentColor: provider.accentColor,
         environments: [{ environmentId, label }],
+        providerInstances: [{ environmentId, instanceId: provider.instanceId }],
         sourceLabel: null,
         redeem: { environmentId, input: { instanceId: provider.instanceId } },
         limits: provider.usageLimits,
@@ -407,6 +435,7 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
           plan: account.plan,
           accentColor: undefined,
           environments: [],
+          providerInstances: resolved === null ? [] : (nativeInstances.get(resolved) ?? []),
           sourceLabel,
           redeem: account.usageLimits.resetCredits?.nextCreditId
             ? {
@@ -466,6 +495,8 @@ export interface LimitPoolWindow {
   readonly remainingPercent: number;
   readonly usedPercent: number;
   readonly pace: LimitPace | null;
+  readonly paceMarginPoints: number | null;
+  readonly evenPaceRemainingPercent: number | null;
   readonly resets: ReadonlyArray<{
     readonly member: LimitPoolMember;
     readonly at: number;
@@ -699,10 +730,51 @@ function poolWindows(accounts: readonly LimitAccount[], now: number): readonly L
       usedPercent: Math.round(usedPercent),
       remainingPercent: Math.round(100 - usedPercent),
       pace: meanElapsed === null ? null : paceOfShares(timedUsed, meanElapsed),
+      paceMarginPoints: meanElapsed === null ? null : Math.round(meanElapsed * 100 - timedUsed),
+      evenPaceRemainingPercent: meanElapsed === null ? null : Math.round((1 - meanElapsed) * 100),
       resets,
     };
   });
   return pools.sort((left, right) => WINDOW_KIND_ORDER[left.kind] - WINDOW_KIND_ORDER[right.kind]);
+}
+
+export function collectUsageLimitsSummary(
+  environmentId: EnvironmentId,
+  providers: readonly ServerProvider[],
+  sources: UsageLimitSourceSnapshots,
+  now: number,
+): UsageLimitsSummary {
+  const presentations: LimitPresentations = new Map([
+    [
+      environmentId,
+      {
+        entry: { target: { label: environmentId } },
+        serverConfig: { providers, usageLimitSources: sources },
+      },
+    ],
+  ]);
+  return {
+    calculatedAt: DateTime.formatIso(DateTime.makeUnsafe(now)),
+    pools: collectLimitPools(collectLimitAccounts(presentations), now).map((pool) => ({
+      driver: pool.driver,
+      accounts: pool.accounts.map((account) => ({
+        id: account.key,
+        providerInstanceIds: account.providerInstances.map((instance) => instance.instanceId),
+        checkedAt: account.limits.checkedAt,
+        windows: account.limits.windows,
+      })),
+      windows: displayLimitWindows(pool).map(
+        ({ members: _members, columns: _columns, resets, ...window }) => ({
+          ...window,
+          resets: resets.map(({ at, restoresPercent }) => ({
+            at: DateTime.formatIso(DateTime.makeUnsafe(at)),
+            restoresPercent,
+          })),
+        }),
+      ),
+    })),
+    notices: collectLimitNotices(presentations),
+  };
 }
 
 export function limitsNotice(limits: ServerProviderUsageLimits): string | null {

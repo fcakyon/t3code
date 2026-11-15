@@ -57,6 +57,7 @@ import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
+import * as UsageLimitSources from "../usage/UsageLimitSources.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -565,9 +566,12 @@ const boxToolkitLayer = (thread: BoxThread) => {
       ),
     ),
     Layer.provide(
-      Layer.mock(ProviderRegistry.ProviderRegistry)({
-        getProviders: Effect.succeed([boxClaude]),
-      }),
+      Layer.mergeAll(
+        Layer.mock(UsageLimitSources.UsageLimitSources)({ current: Effect.succeed([]) }),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({
+          getProviders: Effect.succeed([boxClaude]),
+        }),
+      ),
     ),
     Layer.provide(
       Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
@@ -672,6 +676,9 @@ const makeLaptop = (
       Layer.provideMerge(Layer.merge(layerOrchestrator, ServerSettings.layerTest())),
     );
     const layerHere = McpHttpServer.layerOrchestratorToolkit.pipe(
+      Layer.provide(
+        Layer.mock(UsageLimitSources.UsageLimitSources)({ current: Effect.succeed([]) }),
+      ),
       Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
       Layer.provideMerge(
         RemoteDelegation.layer.pipe(

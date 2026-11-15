@@ -27,7 +27,11 @@ import { ManagedPolicySummary } from "./managedPolicy.ts";
 import { ModelCapabilities, ProviderOptionDescriptor } from "./model.ts";
 import { RuntimeMode } from "./providerPolicy.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
-import { ServerProviderUsageLimits, UsageLimitSourceSnapshots } from "./providerUsageLimits.ts";
+import {
+  ServerProviderUsageLimits,
+  UsageLimitSourceSnapshots,
+  UsageLimitsSummary,
+} from "./providerUsageLimits.ts";
 import { ServerSettings } from "./settings.ts";
 import { DesktopUpdateChannelSchema } from "./ipc.ts";
 
@@ -696,6 +700,8 @@ export const ServerConfig = Schema.Struct({
   keybindings: ResolvedKeybindingsConfig,
   issues: ServerConfigIssues,
   providers: ServerProviders,
+  /** Snapshot-only, requested with usageLimitsSummary and timed by calculatedAt. */
+  usageLimitsSummary: Schema.optionalKey(UsageLimitsSummary),
   availableEditors: ForwardCompatibleArray(EditorId),
   remoteOpenTargets: Schema.optionalKey(ForwardCompatibleArray(RemoteOpenTarget)),
   /** Hints only; verify each address answers as this environment. */

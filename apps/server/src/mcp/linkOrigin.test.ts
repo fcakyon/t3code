@@ -34,6 +34,7 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as UsageLimitSources from "../usage/UsageLimitSources.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -124,7 +125,10 @@ const layerTools = Layer.mergeAll(
   Layer.provide(layerLaunches),
   Layer.provide(NodeCrypto.layer),
   Layer.provide(
-    Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+    Layer.mergeAll(
+      Layer.mock(UsageLimitSources.UsageLimitSources)({ current: Effect.succeed([]) }),
+      Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+    ),
   ),
   Layer.provide(
     Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({

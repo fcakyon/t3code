@@ -64,6 +64,7 @@ import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterReg
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as UsageLimitSources from "../usage/UsageLimitSources.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import { buildUnavailableProviderSnapshot } from "../provider/unavailableProviderSnapshot.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -81,6 +82,7 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 const decodeTarget = Schema.decodeUnknownEffect(OrchestratorMcpTarget);
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(Layer.mock(UsageLimitSources.UsageLimitSources)({ current: Effect.succeed([]) })),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -1857,11 +1859,27 @@ describe("OrchestratorMcpService provider resolution", () => {
           checkedAt: "2026-09-13T00:00:00.000Z",
         });
         let providers: ReadonlyArray<ServerProvider> = [
-          providerSnapshot({
-            instanceId: codexInstanceId,
-            driver: ProviderDriverKind.make("codex"),
-            model: "gpt-5.4",
-          }),
+          {
+            ...providerSnapshot({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+              model: "gpt-5.4",
+            }),
+            usageLimits: {
+              checkedAt: "2026-09-13T00:00:00.000Z",
+              windows: [
+                {
+                  id: "primary",
+                  kind: "session",
+                  label: "Session",
+                  usedPercent: 30,
+                  modelIds: ["gpt-5.4"],
+                  resetsAt: "2026-09-13T02:30:00.000Z",
+                  windowDurationMins: 300,
+                },
+              ],
+            },
+          },
           providerSnapshot({
             instanceId: ProviderInstanceId.make("claudeAgent"),
             driver: ProviderDriverKind.make("claudeAgent"),
@@ -1949,7 +1967,21 @@ describe("OrchestratorMcpService provider resolution", () => {
 
         yield* Effect.gen(function* () {
           const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          yield* TestClock.setTime(Date.parse("2026-09-13T00:00:00.000Z"));
           const capabilities = yield* service.capabilities(scope);
+          assert.include(capabilities.usageLimitsSummary?.pools[0]?.windows[0], {
+            remainingPercent: 70,
+            paceMarginPoints: 20,
+            pace: "under",
+          });
+          assert.deepEqual(
+            capabilities.usageLimitsSummary?.pools[0]?.accounts[0]?.providerInstanceIds,
+            [codexInstanceId],
+          );
+          assert.deepEqual(
+            capabilities.usageLimitsSummary?.pools[0]?.accounts[0]?.windows[0]?.modelIds,
+            ["gpt-5.4"],
+          );
           const byId = new Map(
             capabilities.providers.map((provider) => [provider.providerInstanceId, provider]),
           );
@@ -3426,6 +3458,9 @@ describe("OrchestratorMcpService provider resolution", () => {
       saved: ScheduledTask = tasks[0]!,
     ) =>
       OrchestratorMcpService.layer.pipe(
+        Layer.provide(
+          Layer.mock(UsageLimitSources.UsageLimitSources)({ current: Effect.succeed([]) }),
+        ),
         Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
         Layer.provide(
           Layer.mock(GitVcsDriver.GitVcsDriver)({
@@ -3661,6 +3696,9 @@ describe("OrchestratorMcpService provider resolution", () => {
       } = { project: existing.modelSelection },
     ) =>
       OrchestratorMcpService.layer.pipe(
+        Layer.provide(
+          Layer.mock(UsageLimitSources.UsageLimitSources)({ current: Effect.succeed([]) }),
+        ),
         Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
         Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)(git)),
         Layer.provide(

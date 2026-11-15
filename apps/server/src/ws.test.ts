@@ -1049,7 +1049,10 @@ it.effect.each([
           getProviders: Effect.succeed([]),
           streamChanges: Stream.never,
         }),
-        Layer.mock(UsageLimitSources.UsageLimitSources)({ streamChanges: Stream.make([]) }),
+        Layer.mock(UsageLimitSources.UsageLimitSources)({
+          current: Effect.succeed([]),
+          streamChanges: Stream.make([]),
+        }),
         Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({
           resolveTargets: () =>
             Deferred.succeed(remoteDiscoveryStarted, undefined).pipe(
@@ -1147,7 +1150,7 @@ it.effect.each([
         _tag: "Request",
         id: requestId,
         tag: WS_METHODS.subscribeServerConfig,
-        payload: {},
+        payload: { usageLimitsSummary: discovery === "pending" },
         headers: Headers.empty,
       });
       yield* Deferred.await(discoveryStarted);
@@ -1158,6 +1161,12 @@ it.effect.each([
       const snapshot = yield* Queue.take(responses);
       assert.equal(snapshot.type, "snapshot");
       if (snapshot.type !== "snapshot") return yield* Effect.die("Missing initial snapshot");
+      assert.deepEqual(
+        snapshot.config.usageLimitsSummary,
+        discovery === "pending"
+          ? { calculatedAt: DateTime.formatIso(yield* DateTime.now), pools: [], notices: [] }
+          : undefined,
+      );
       assert.deepEqual(
         snapshot.config.remoteOpenTargets,
         discovery === "cached" || direct ? targets : [],

@@ -37,6 +37,7 @@ import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderRepl
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as UsageLimitSources from "../usage/UsageLimitSources.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
@@ -173,6 +174,9 @@ it.effect.each([
       );
       const layerTest = Layer.merge(
         OrchestratorMcpService.layer.pipe(
+          Layer.provide(
+            Layer.mock(UsageLimitSources.UsageLimitSources)({ current: Effect.succeed([]) }),
+          ),
           Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
           Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
         ),

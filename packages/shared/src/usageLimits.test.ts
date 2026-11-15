@@ -19,6 +19,7 @@ import {
   collectExternalUsageLinks,
   collectLimitNotices,
   collectLimitPools,
+  collectUsageLimitsSummary,
   elapsedShare,
   exhaustedUsageWindow,
   paceOf,
@@ -1096,6 +1097,8 @@ describe("pools", () => {
       remainingPercent: 40,
       usedPercent: 60,
       pace: "under",
+      paceMarginPoints: 10,
+      evenPaceRemainingPercent: 30,
     });
     expect(
       session?.resets.map((reset) => [reset.member.account.key, reset.restoresPercent]),
@@ -1116,6 +1119,7 @@ describe("pools", () => {
           plan: undefined,
           accentColor: undefined,
           environments: [],
+          providerInstances: [],
           sourceLabel: null,
           redeem: null,
           limits: {
@@ -1151,6 +1155,63 @@ describe("pools", () => {
   });
 });
 
+describe("usage summary", () => {
+  it("shares deduplicated native pools with instance and model restrictions", () => {
+    const environmentId = EnvironmentId.make("env-summary");
+    const checkedAt = "2026-09-03T11:00:00.000Z";
+    const limits = { checkedAt, windows: [{ ...window, modelIds: ["model-a"] }] };
+    const native = provider({
+      auth: { status: "authenticated", email: "account@example.com" },
+      usageLimits: limits,
+    });
+    const summary = collectUsageLimitsSummary(
+      environmentId,
+      [native, { ...native, instanceId: ProviderInstanceId.make("codex-alt") }],
+      [],
+      now,
+    );
+    expect(summary.calculatedAt).toBe("2026-09-03T12:00:00.000Z");
+    expect(summary.pools).toHaveLength(1);
+    expect(summary.pools[0]?.accounts).toEqual([
+      {
+        id: "env-summary:codex",
+        providerInstanceIds: ["codex", "codex-alt"],
+        checkedAt,
+        windows: [{ ...window, modelIds: ["model-a"] }],
+      },
+    ]);
+    expect(summary.pools[0]?.windows[0]).toMatchObject({
+      remainingPercent: 60,
+      paceMarginPoints: 20,
+      evenPaceRemainingPercent: 40,
+      pace: "under",
+    });
+    expect(summary.notices).toEqual([]);
+    const hubSummary = collectUsageLimitsSummary(
+      environmentId,
+      [{ ...native, usageLimits: undefined }],
+      [
+        {
+          id: UsageLimitSourceId.make("hub-summary"),
+          kind: "cliproxy",
+          label: "Hub",
+          checkedAt,
+          accounts: [
+            {
+              id: "hub-account",
+              driver: native.driver,
+              email: native.auth.email,
+              usageLimits: limits,
+            },
+          ],
+        },
+      ],
+      now,
+    );
+    expect(hubSummary.pools[0]?.accounts[0]?.providerInstanceIds).toEqual([native.instanceId]);
+  });
+});
+
 describe("pooled account columns", () => {
   const weekly = {
     ...window,
@@ -1167,6 +1228,7 @@ describe("pooled account columns", () => {
     plan: undefined,
     accentColor: undefined,
     environments: [],
+    providerInstances: [],
     sourceLabel: "Hub",
     redeem: null,
     limits: { checkedAt: "2026-09-03T11:00:00.000Z", windows },
@@ -1310,7 +1372,13 @@ describe("pooled account columns", () => {
         ],
         now,
       );
-      expect(pool!.windows[0]).toMatchObject({ remainingPercent: 0, pace: null, resets: [] });
+      expect(pool!.windows[0]).toMatchObject({
+        remainingPercent: 0,
+        pace: null,
+        paceMarginPoints: null,
+        evenPaceRemainingPercent: null,
+        resets: [],
+      });
       expect(pool!.windows[0]!.columns.map((column) => column.window?.resetsAt)).toEqual([
         undefined,
         undefined,
