@@ -18,6 +18,7 @@ import {
 } from "@t3tools/contracts";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
 import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
+import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -1946,6 +1947,24 @@ describe("AntigravityAdapterV2 subagent reads", () => {
                 children: [{ id: "b468c0e1d2f34a5b6c7d8e9f0a1b2c3d", logUri }],
               }),
             ],
+            [
+              5,
+              101,
+              agentReportStep({
+                recipientSessionId: "mock-session-1",
+                senderConversationId: CHILD,
+                text: "inherited done",
+              }),
+            ],
+            [
+              6,
+              101,
+              agentReportStep({
+                recipientSessionId: "mock-session-1",
+                senderConversationId: "b468c0e1d2f34a5b6c7d8e9f0a1b2c3d",
+                text: "flash done",
+              }),
+            ],
           ],
         });
 
@@ -1985,6 +2004,18 @@ describe("AntigravityAdapterV2 subagent reads", () => {
                 kind: "other",
                 status: "in_progress",
                 rawInput: {},
+              });
+              yield* update({
+                sessionUpdate: "tool_call_update",
+                toolCallId: "mock-session-1:1",
+                status: "completed",
+                rawOutput: {},
+              });
+              yield* update({
+                sessionUpdate: "tool_call_update",
+                toolCallId: "mock-session-1:3",
+                status: "completed",
+                rawOutput: {},
               });
               yield* update({
                 sessionUpdate: "agent_message_chunk",
@@ -2229,5 +2260,158 @@ describe("AntigravityAdapterV2 session system prompt", () => {
           assert.include(sent, "<pull_request_linking>");
         }
       }).pipe(Effect.provide(layerSession)),
+  );
+});
+
+describe("AntigravityAdapterV2 background command continuation", () => {
+  it.live(
+    "defers turn finalization while a background command runs and prompts continuation when it finishes",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const path = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-agy-bg-" });
+        const sessionId = "mock-session-1";
+        const taskId = `${sessionId}/task-97`;
+        const { profile } = yield* makeProfile({
+          sessionId,
+          steps: () => [
+            [
+              97,
+              21,
+              commandTaskStep({
+                taskId,
+                command: "vp run check:changed",
+                summary: "Run check:changed",
+                callId: "bg-tool",
+              }),
+            ],
+          ],
+        });
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const logs = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-agy-bg-log-" });
+        const requestLog = path.join(logs, "requests.ndjson");
+        const crypto = yield* SecureRandom.SecureRandom;
+        const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
+          [];
+        const promptCalls: Array<string> = [];
+        const firstPromptSettled = yield* Deferred.make<void>();
+        const instanceId = ProviderInstanceId.make("antigravity-bg-test");
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          profileDirectory: profile,
+          selfInvocation: yield* resolveSelfInvocation(),
+          continuationRequests: {
+            offer: (request) =>
+              Effect.sync(() => {
+                continuationRequests.push(request);
+              }),
+          },
+          makeRuntime: (input) =>
+            makeAntigravityAcpRuntime({
+              ...input,
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: {
+                  T3_ACP_ANTIGRAVITY: "1",
+                  T3_ACP_REQUEST_LOG_PATH: requestLog,
+                },
+              },
+              requestLogger: (event) =>
+                event.method === "session/prompt" && event.status === "started"
+                  ? Effect.sync(() => {
+                      promptCalls.push(event.method);
+                    })
+                  : event.method === "session/prompt" && event.status === "succeeded"
+                    ? Deferred.succeed(firstPromptSettled, undefined).pipe(Effect.asVoid)
+                    : Effect.void,
+            }).pipe(Effect.provideService(SecureRandom.SecureRandom, crypto)),
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+        const threadId = ThreadId.make("thread-antigravity-bg");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: directory,
+        });
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-bg"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.equal(providerThread.pendingBackgroundTasks?.[0]?.taskId, taskId);
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        yield* session.events.pipe(
+          Stream.runForEach((event) => Queue.offer(events, event)),
+          Effect.forkChild,
+        );
+        const turn = makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          runtimePolicy,
+          modelSelection,
+          now: yield* DateTime.now,
+        });
+        yield* session.startTurn(turn);
+        yield* Deferred.await(firstPromptSettled);
+        const settledEarly = yield* Queue.takeAll(events);
+        assert.isFalse(
+          [...settledEarly].some((event) => event.type === "turn.terminal"),
+          "turn must stay running while a background command task is active",
+        );
+        assert.lengthOf(continuationRequests, 0);
+
+        const database = new NodeSqlite.DatabaseSync(
+          path.join(profile, "antigravity-acp", "conversations", `${sessionId}.db`),
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(() => database.close()));
+        database.prepare("UPDATE steps SET status = 3").run();
+
+        const terminal = yield* Stream.fromQueue(events).pipe(
+          Stream.filter((event) => event.type === "turn.terminal"),
+          Stream.runHead,
+        );
+        assert.isTrue(terminal._tag === "Some");
+        if (terminal._tag === "Some" && terminal.value.type === "turn.terminal") {
+          assert.equal(terminal.value.status, "completed");
+        }
+        assert.lengthOf(continuationRequests, 1);
+
+        const promptCountBefore = promptCalls.length;
+        yield* session.startTurn({
+          ...turn,
+          runId: RunId.make("run:antigravity-bg:2"),
+          runOrdinal: 2,
+          providerTurnOrdinal: 2,
+          message: {
+            ...turn.message,
+            messageId: MessageId.make("bg-continuation-msg"),
+            createdBy: "agent",
+            creationSource: "provider",
+            text: "Background task completed.",
+          },
+        });
+        const secondTerminal = yield* Stream.fromQueue(events).pipe(
+          Stream.filter((event) => event.type === "turn.terminal"),
+          Stream.runHead,
+        );
+        assert.isTrue(secondTerminal._tag === "Some");
+        assert.isAbove(promptCalls.length, promptCountBefore);
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });

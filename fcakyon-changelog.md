@@ -1,5 +1,8 @@
 # t3code-fcakyon changelog
 
+- fix: Keep Antigravity turns running during background tasks and continue on completion
+- feat: Map Auto runtime mode to full access for Antigravity
+- fix: Limit agent capabilities usage pace to non-Fable weekly windows
 - fix: Show managed Antigravity updates beside the provider version
 - build: Sync upstream through [`47f90ee2e9`](https://github.com/pingdotgg/t3code/commit/47f90ee2e9) and keep fork release and Antigravity patches
 - build: Sync upstream through [`6b7027b1f4`](https://github.com/pingdotgg/t3code/commit/6b7027b1f4) and keep Antigravity prompt steering with Grok attachment steering

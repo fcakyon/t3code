@@ -587,6 +587,8 @@ export interface AcpAdapterV2Flavor {
     notification: EffectAcpSchema.SessionNotification,
   ) => boolean;
   readonly deferFinalizeForBackgroundWork?: boolean;
+  /** Send an ACP prompt when a continuation turn has no buffered wake notifications. */
+  readonly promptOnEmptyContinuationWake?: boolean;
   readonly assertComplete?: Effect.Effect<void, EffectAcpErrors.AcpError>;
   /** Interrupt the local prompt fiber before `session/cancel` (Grok wedged prompts). */
   readonly interruptPromptOnCancel?: boolean;
@@ -1592,6 +1594,7 @@ interface ActiveAcpTurn {
   readonly promptStarted: Deferred.Deferred<void, never>;
   promptUsage: EffectAcpSchema.Usage | undefined;
   backgroundFinalizeGeneration: number;
+  deferredForBackgroundWork?: boolean;
   /** The agent's own id for this turn's prompt, from `forkFromTurn.nativeTurnId`. */
   nativePromptId: string | undefined;
   /** Clock millis of the prompt's last progress, for `promptInactivityTimeout`. */
@@ -2551,6 +2554,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
 
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
           Queue.offer(events, event).pipe(Effect.asVoid);
+        const sessionsWithPendingBackgroundTasks = new Set<string>();
         // Session updates include streaming chunks, so share their tracing boundary.
         const syncPendingBackgroundTasks = Effect.fnUntraced(function* (
           notification: EffectAcpSchema.SessionNotification,
@@ -2561,6 +2565,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (thread === undefined || flavor.pendingBackgroundTasks === undefined) return thread;
           const tasks = yield* flavor.pendingBackgroundTasks(notification);
           if (tasks === undefined) return thread;
+          const hadPending = sessionsWithPendingBackgroundTasks.has(notification.sessionId);
+          if (tasks.length > 0) {
+            sessionsWithPendingBackgroundTasks.add(notification.sessionId);
+          } else {
+            sessionsWithPendingBackgroundTasks.delete(notification.sessionId);
+          }
           const updated = {
             ...thread,
             pendingBackgroundTasks: tasks,
@@ -2574,6 +2584,24 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             driver,
             providerThread: updated,
           });
+          if (hadPending && tasks.length === 0) {
+            const context = yield* Ref.get(activeTurn);
+            if (
+              context !== null &&
+              context.nativeThreadId === notification.sessionId &&
+              context.promptSettled &&
+              !context.finalized &&
+              !context.interrupted &&
+              !hasDeferredBackgroundWork(context)
+            ) {
+              if (flavor.deferFinalizeForBackgroundWork === true) {
+                yield* finalizeTurn(context, context.promptSettledStatus ?? "completed");
+              }
+              if (postSettleContinuationEnabled) {
+                yield* offerContinuationRun(notification.sessionId);
+              }
+            }
+          }
           return updated;
         });
         let scheduleDeferredFinalize: (context: ActiveAcpTurn) => Effect.Effect<void> = () =>
@@ -4293,6 +4321,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           /Monitor\s+["']?[0-9a-f-]{8,}/i.test(text) && /ended/i.test(text);
 
         const hasDeferredBackgroundWork = (context: ActiveAcpTurn): boolean => {
+          if (sessionsWithPendingBackgroundTasks.has(context.nativeThreadId)) return true;
           if (context.awaitingBackgroundHydration.size > 0) return true;
           if (context.pendingInjectedReport.size > 0) return true;
           for (const [taskId, toolCallId] of context.toolCallIdsByBackgroundTaskId) {
@@ -8503,6 +8532,18 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             if (hasDeferredBackgroundWork(context)) return;
             const status = context.promptSettledStatus ?? "completed";
             yield* finalizeTurn(context, status);
+            if (
+              context.deferredForBackgroundWork === true &&
+              status === "completed" &&
+              postSettleContinuationEnabled &&
+              flavor.promptOnEmptyContinuationWake === true &&
+              !(yield* Ref.get(continuationRequested))
+            ) {
+              const sessionId = yield* Ref.get(activeSessionId);
+              if (sessionId !== null) {
+                yield* offerContinuationRun(sessionId);
+              }
+            }
           }).pipe(Effect.forkIn(sessionScope), Effect.asVoid);
           yield* (
             options.testHooks?.onDeferredFinalizeScheduled?.(ACP_DEFERRED_FINALIZE_DEBOUNCE) ??
@@ -8877,7 +8918,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 return wasRequested;
               }),
             );
-            const promptParts = isContinuationTurn
+            let promptParts = isContinuationTurn
               ? null
               : yield* resolvePromptParts(turnInput, requestedSessionId);
             const startedAt = yield* DateTime.now;
@@ -9076,26 +9117,32 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               }
               context.promptSettled = true;
               context.promptSettledStatus = "completed";
-              if (drainedWakeCount === 0) {
-                if (continuationWasRequested && flavor.deferFinalizeForBackgroundWork === true) {
+              if (drainedWakeCount === 0 && flavor.promptOnEmptyContinuationWake === true) {
+                promptParts = yield* resolvePromptParts(turnInput, requestedSessionId);
+                context.promptSettled = false;
+                context.promptSettledStatus = null;
+              } else {
+                if (drainedWakeCount === 0) {
+                  if (continuationWasRequested && flavor.deferFinalizeForBackgroundWork === true) {
+                    if (hasDeferredBackgroundWork(context)) {
+                      yield* rearmDeferredFinalize(context);
+                    } else {
+                      yield* scheduleDeferredFinalize(context);
+                    }
+                  } else {
+                    yield* finalizeTurn(context, "completed");
+                  }
+                  return;
+                }
+                if (!context.finalized) {
                   if (hasDeferredBackgroundWork(context)) {
                     yield* rearmDeferredFinalize(context);
                   } else {
                     yield* scheduleDeferredFinalize(context);
                   }
-                } else {
-                  yield* finalizeTurn(context, "completed");
                 }
                 return;
               }
-              if (!context.finalized) {
-                if (hasDeferredBackgroundWork(context)) {
-                  yield* rearmDeferredFinalize(context);
-                } else {
-                  yield* scheduleDeferredFinalize(context);
-                }
-              }
-              return;
             }
             const checkPromptOutcome =
               flavor.watchPromptOutcome === undefined
@@ -9228,6 +9275,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       !context.interrupted &&
                       hasDeferredBackgroundWork(context)
                     ) {
+                      context.deferredForBackgroundWork = true;
                       yield* closeTextStreams(context);
                       yield* (
                         options.testHooks?.afterPromptSettledWithBackgroundWork?.() ?? Effect.void

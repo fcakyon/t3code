@@ -1872,19 +1872,49 @@ describe("OrchestratorMcpService provider resolution", () => {
                   id: "primary",
                   kind: "session",
                   label: "Session",
-                  usedPercent: 30,
+                  usedPercent: 10,
                   modelIds: ["gpt-5.4"],
                   resetsAt: "2026-09-13T02:30:00.000Z",
                   windowDurationMins: 300,
                 },
+                {
+                  id: "secondary",
+                  kind: "weekly",
+                  label: "Weekly",
+                  usedPercent: 30,
+                  modelIds: ["gpt-5.4"],
+                  resetsAt: "2026-09-16T12:00:00.000Z",
+                  windowDurationMins: 10080,
+                },
+                {
+                  id: "monthly",
+                  kind: "monthly",
+                  label: "Monthly",
+                  usedPercent: 5,
+                },
               ],
             },
           },
-          providerSnapshot({
-            instanceId: ProviderInstanceId.make("claudeAgent"),
-            driver: ProviderDriverKind.make("claudeAgent"),
-            model: "claude-sonnet-4-6",
-          }),
+          {
+            ...providerSnapshot({
+              instanceId: ProviderInstanceId.make("claudeAgent"),
+              driver: ProviderDriverKind.make("claudeAgent"),
+              model: "claude-sonnet-4-6",
+            }),
+            usageLimits: {
+              checkedAt: "2026-09-13T00:00:00.000Z",
+              windows: [
+                { id: "five_hour", kind: "session", label: "Session", usedPercent: 10 },
+                { id: "seven_day", kind: "weekly", label: "Weekly", usedPercent: 80 },
+                {
+                  id: "seven_day_fable",
+                  kind: "weekly",
+                  label: "Weekly · Fable",
+                  usedPercent: 5,
+                },
+              ],
+            },
+          },
           providerSnapshot({
             instanceId: ProviderInstanceId.make("pi"),
             driver: ProviderDriverKind.make("pi"),
@@ -1981,6 +2011,17 @@ describe("OrchestratorMcpService provider resolution", () => {
           assert.deepEqual(
             capabilities.usageLimitsSummary?.pools[0]?.accounts[0]?.windows[0]?.modelIds,
             ["gpt-5.4"],
+          );
+          assert.deepEqual(
+            capabilities.usageLimitsSummary?.pools.map((pool) => ({
+              driver: pool.driver,
+              windows: pool.windows.map((window) => window.id),
+              accounts: pool.accounts.map((account) => account.windows.map((window) => window.id)),
+            })),
+            [
+              { driver: "codex", windows: ["weekly"], accounts: [["secondary"]] },
+              { driver: "claudeAgent", windows: ["seven_day"], accounts: [["seven_day"]] },
+            ],
           );
           const byId = new Map(
             capabilities.providers.map((provider) => [provider.providerInstanceId, provider]),

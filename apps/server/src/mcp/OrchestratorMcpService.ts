@@ -60,6 +60,7 @@ import {
   scheduledTaskThreadMode,
   type ServerProvider,
   type ServerProviderModel,
+  type ServerProviderUsageWindow,
   ThreadId,
   isOrchestrationV2WorkActive,
   latestProviderTurnForAttempt,
@@ -2563,6 +2564,14 @@ const make = Effect.gen(function* () {
       );
       const inherited = parent?.thread.modelSelection;
       const searchTerms = input.search?.toLowerCase().split(/\s+/).filter(Boolean) ?? [];
+      const weeklyWindow = (window: Pick<ServerProviderUsageWindow, "kind" | "id">) =>
+        window.kind === "weekly" && window.id !== "seven_day_fable";
+      const usageLimitsSummary = collectUsageLimitsSummary(
+        scope.environmentId,
+        providers,
+        yield* usageLimitSources.current,
+        DateTime.toEpochMillis(yield* DateTime.now),
+      );
       return {
         parentThreadId: parent?.thread.id ?? null,
         inheritedProviderInstanceId: inherited?.instanceId ?? null,
@@ -2577,12 +2586,23 @@ const make = Effect.gen(function* () {
           ) ?? [],
         runtimeMode: limits.runtimeMode,
         interactionMode: limits.interactionMode,
-        usageLimitsSummary: collectUsageLimitsSummary(
-          scope.environmentId,
-          providers,
-          yield* usageLimitSources.current,
-          DateTime.toEpochMillis(yield* DateTime.now),
-        ),
+        usageLimitsSummary: {
+          ...usageLimitsSummary,
+          pools: usageLimitsSummary.pools.flatMap((pool) => {
+            const windows = pool.windows.filter(weeklyWindow);
+            if (windows.length === 0) return [];
+            return [
+              {
+                ...pool,
+                accounts: pool.accounts.map((account) => ({
+                  ...account,
+                  windows: account.windows.filter(weeklyWindow),
+                })),
+                windows,
+              },
+            ];
+          }),
+        },
         providers: providers.map((provider) => {
           // Snapshots list instances any project enables; delegate_task checks the caller's project.
           const enabledForCaller =

@@ -17,6 +17,7 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import {
   applyAntigravityAcpModelSelection,
   antigravityClientInfo,
+  antigravityPermissionMode,
   antigravitySessionMeta,
   buildAntigravityPrompt,
   isQualifiedAntigravityRelease,
@@ -720,4 +721,15 @@ it.layer(NodeServices.layer)("buildAntigravityPrompt", (it) => {
       });
     }),
   );
+});
+
+describe("antigravityPermissionMode", () => {
+  it.each([
+    ["approval-required", "default"],
+    ["auto-accept-edits", "auto_edit"],
+    ["auto", "yolo"],
+    ["full-access", "yolo"],
+  ] as const)("maps %s to %s", (runtimeMode, expected) => {
+    expect(antigravityPermissionMode(runtimeMode)).toBe(expected);
+  });
 });
