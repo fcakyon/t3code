@@ -3384,19 +3384,30 @@ describe("AcpAdapterV2", () => {
       yield* replay("user_message_chunk", "u1", "lo");
       yield* replay("agent_message_chunk", "a1", "hi");
       yield* replay("user_message_chunk", "u2", "next");
-      yield* replay("agent_message_chunk", "a1", " there");
+      yield* replay("agent_message_chunk", "a1", " ");
+      yield* replay("agent_message_chunk", "a1", "there");
+      yield* replay("agent_message_chunk", "a3", "\t");
+      yield* replay("agent_message_chunk", "a3", "code");
+      yield* replay("agent_message_chunk", "a4", "\n\n");
       const first = yield* runtime.readThreadSnapshot({ providerThread });
       yield* replay("agent_message_chunk", "a2", "done");
-      yield* replay("user_message_chunk", "u2", " one");
+      yield* replay("user_message_chunk", "u2", "\n");
+      yield* replay("user_message_chunk", "u2", "\tone");
       const second = yield* runtime.readThreadSnapshot({ providerThread });
 
       const texts = (snapshot: typeof first) =>
         snapshot.messages.map((message) => `${message.role}:${message.text}`);
-      assert.deepEqual(texts(first), ["user:hello", "assistant:hi there", "user:next"]);
+      assert.deepEqual(texts(first), [
+        "user:hello",
+        "assistant:hi there",
+        "user:next",
+        "assistant:\tcode",
+      ]);
       assert.deepEqual(texts(second), [
         "user:hello",
         "assistant:hi there",
-        "user:next one",
+        "user:next\n\tone",
+        "assistant:\tcode",
         "assistant:done",
       ]);
     }).pipe(Effect.provide(layerTest), Effect.scoped),
@@ -5196,28 +5207,35 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
-  it.effect.each([false, true])(
-    "ends a running tool call when its agent process exits mid-prompt (followAgentWorkState: %s)",
-    (followAgentWorkState) =>
+  it.effect.each(
+    [false, true].flatMap((followAgentWorkState) => [
+      { ending: "agent process exits mid-prompt", followAgentWorkState },
+      { ending: "prompt returns an RPC error", followAgentWorkState },
+    ]),
+  )(
+    "ends an open tool call when its $ending (followAgentWorkState: $followAgentWorkState)",
+    ({ ending, followAgentWorkState }) =>
       Effect.gen(function* () {
+        const agentExits = ending === "agent process exits mid-prompt";
         const harness = yield* makePromptInactivityHarness({
           followAgentWorkState,
           environment: (runtimeOrdinal) =>
-            runtimeOrdinal === 1 ? { T3_ACP_EMIT_TRACKED_TOOL_CALL_KIND_THEN_HANG: "execute" } : {},
+            runtimeOrdinal === 1
+              ? {
+                  T3_ACP_EMIT_TRACKED_TOOL_CALL_KIND_THEN_HANG: "execute",
+                  ...(agentExits ? {} : { T3_ACP_FAIL_PROMPT: "1" }),
+                }
+              : {},
         });
         yield* harness.startTurn(1);
-        let exited = false;
-        const statuses = yield* harness.runtime.events.pipe(
+        let exited = !agentExits;
+        const events = yield* harness.runtime.events.pipe(
           Stream.takeUntil((event) => event.type === "turn.terminal"),
-          Stream.flatMap((event) =>
-            event.type === "turn_item.updated" &&
-            event.turnItem.nativeItemRef?.nativeId === "tracked-tool-call"
-              ? Stream.make(event.turnItem.status)
-              : Stream.empty,
-          ),
           // The agent dies while its tool call is open.
-          Stream.tap(() =>
-            exited
+          Stream.tap((event) =>
+            exited ||
+            event.type !== "turn_item.updated" ||
+            event.turnItem.nativeItemRef?.nativeId !== "tracked-tool-call"
               ? Effect.void
               : Effect.sync(() => (exited = true)).pipe(
                   Effect.andThen(harness.natives[0]!.notify("_test/exit", {})),
@@ -5226,8 +5244,16 @@ describe("AcpAdapterV2", () => {
           Stream.runCollect,
           Effect.map((collected) => Array.from(collected)),
         );
-        // regression: #37368 the dead agent's tool call stayed open in the failed turn.
-        assert.include(["failed", "interrupted", "cancelled"], statuses.at(-1));
+        const toolStatuses = events.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.nativeItemRef?.nativeId === "tracked-tool-call"
+            ? [event.turnItem.status]
+            : [],
+        );
+        // regression: #37368 the tool call stayed open in the failed turn.
+        assert.equal(toolStatuses.at(-1), "failed");
+        const terminal = events.at(-1);
+        assert.equal(terminal?.type === "turn.terminal" ? terminal.status : undefined, "failed");
       }).pipe(Effect.provide(layerTest)),
   );
 

@@ -1,5 +1,6 @@
 # t3code-fcakyon changelog
 
+- build: Sync upstream through [`47f90ee2e9`](https://github.com/pingdotgg/t3code/commit/47f90ee2e9) and keep fork release and Antigravity patches
 - build: Sync upstream through [`6b7027b1f4`](https://github.com/pingdotgg/t3code/commit/6b7027b1f4) and keep Antigravity prompt steering with Grok attachment steering
 - feat: Share native usage pace with agents and Stream Deck
 - build: Sync upstream through [`26b63a44f9`](https://github.com/pingdotgg/t3code/commit/26b63a44f9)
