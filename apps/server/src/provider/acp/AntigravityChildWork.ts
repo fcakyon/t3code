@@ -103,16 +103,19 @@ export interface AntigravitySessionSubagentState {
   readonly reports: ReadonlyArray<AntigravitySubagentReportState>;
 }
 
+const LaunchEntrySchema = Schema.Struct({
+  Role: Schema.String,
+  Prompt: Schema.String,
+  Model: Schema.optionalKey(Schema.Unknown),
+});
+
 const decodeLaunchInput = Schema.decodeUnknownOption(
-  Schema.Struct({
-    Subagents: Schema.NonEmptyArray(
-      Schema.Struct({
-        Role: Schema.String,
-        Prompt: Schema.String,
-        Model: Schema.optionalKey(Schema.Unknown),
-      }),
-    ),
-  }),
+  Schema.Union([
+    Schema.Struct({
+      Subagents: Schema.NonEmptyArray(LaunchEntrySchema),
+    }),
+    LaunchEntrySchema,
+  ]),
 );
 
 /** `invoke_subagent` arguments, from the permission prompt or the persisted record. */
@@ -120,16 +123,17 @@ export function antigravitySubagentLaunches(
   input: unknown,
 ): ReadonlyArray<AntigravityChildLaunch> | undefined {
   return Option.getOrUndefined(
-    Option.map(decodeLaunchInput(input), (decoded) =>
-      decoded.Subagents.map((entry) => {
+    Option.map(decodeLaunchInput(input), (decoded) => {
+      const entries = "Subagents" in decoded ? decoded.Subagents : [decoded];
+      return entries.map((entry) => {
         const model = typeof entry.Model === "string" ? entry.Model.trim() : "";
         return {
           role: entry.Role,
           prompt: entry.Prompt,
           ...(model ? { model } : {}),
         };
-      }),
-    ),
+      });
+    }),
   );
 }
 

@@ -482,8 +482,10 @@ export function normalizeAntigravityToolCall(
 
 const ANTIGRAVITY_SUBAGENT_TITLES = new Set([
   "Running start_subagent",
+  "Run start_subagent",
   "Run start_subagent?",
   "Running invoke_subagent",
+  "Run invoke_subagent",
   "Run invoke_subagent?",
 ]);
 

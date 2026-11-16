@@ -28,8 +28,10 @@ describe("native Antigravity subagent tools", () => {
     const toolCall = { toolCallId: "trajectory:4", kind: "other", data: {} };
     for (const title of [
       "Running start_subagent",
+      "Run start_subagent",
       "Run start_subagent?",
       "Running invoke_subagent",
+      "Run invoke_subagent",
       "Run invoke_subagent?",
     ]) {
       expect(classifyAntigravitySubagentToolCall({ ...toolCall, title }, {})).toBe("subagent");

@@ -137,6 +137,25 @@ describe("AntigravityAdapterV2 flavor", () => {
     assert.equal(launch?.prompt, "Read README.md");
     assert.isNull(launch?.model);
     assert.isUndefined(launch?.modelSelection);
+
+    const singleInvoke = flavor.extractSubagentUpdate?.({
+      toolCallId: "call_9553458398520993711",
+      title: "Run invoke_subagent",
+      kind: "other",
+      status: "completed",
+      data: {
+        rawInput: {
+          TypeName: "research",
+          Role: "Simplify Altitude Reviewer",
+          Prompt: "Review the diff",
+          Model: "flash",
+        },
+      },
+    });
+    assert.equal(singleInvoke?.status, "running");
+    assert.equal(singleInvoke?.title, "Simplify Altitude Reviewer");
+    assert.equal(singleInvoke?.prompt, "Review the diff");
+    assert.equal(singleInvoke?.model, "Flash");
   });
 
   it("resolves subagent model and reasoning tier from launch specs and parent selection", () => {

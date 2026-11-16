@@ -1,5 +1,6 @@
 # t3code-fcakyon changelog
 
+- fix: Track Antigravity 1.5 native invoke_subagent runs in Lineage
 - fix: Expose deferred MCP tools and T3_ACP_MCP_NODE to Antigravity sessions
 - fix: Keep Antigravity turns running during background tasks and continue on completion
 - feat: Map Auto runtime mode to full access for Antigravity
