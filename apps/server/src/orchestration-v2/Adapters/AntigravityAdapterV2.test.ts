@@ -97,6 +97,10 @@ describe("AntigravityAdapterV2 flavor", () => {
     assert.equal(batch?.childSessionId, "antigravity-task:trajectory:4");
     assert.isNull(batch?.result);
     assert.isTrue(flavor.subagentsIdleOnTurnCompletion);
+    assert.isTrue(flavor.deferMcpTools);
+    assert.isTrue(flavor.deferFinalizeForBackgroundWork);
+    assert.isTrue(flavor.enablePostSettleContinuation);
+    assert.isTrue(flavor.promptOnEmptyContinuationWake);
 
     const completedBatch = flavor.extractSubagentUpdate?.({
       toolCallId: "trajectory:4",
