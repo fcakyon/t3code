@@ -270,11 +270,10 @@ export function makeAntigravityAcpAdapterFlavor(
             Deferred.doneUnsafe(ready, Exit.void),
           );
           yield* changes.pipe(
-            Stream.runForEach(() =>
-              updates.withPermit(
+            Stream.runForEach(
+              () =>
                 projectUpdate?.({ sessionId, update: { sessionUpdate: "session_info_update" } }) ??
-                  Effect.void,
-              ),
+                Effect.void,
             ),
             Effect.ignoreCause({ log: true }),
             Effect.ensuring(Deferred.succeed(ready, undefined)),
@@ -305,18 +304,14 @@ export function makeAntigravityAcpAdapterFlavor(
               Effect.onExit((exit) => {
                 const served = reads.attempted(request.path, Exit.isSuccess(exit));
                 if (served === undefined || projectUpdate === undefined) return Effect.void;
-                return updates
-                  .withPermit(
-                    projectUpdate({
-                      sessionId: served.sessionId,
-                      update: {
-                        sessionUpdate: "tool_call_update",
-                        toolCallId: served.toolCallId,
-                        status: "completed",
-                      },
-                    }),
-                  )
-                  .pipe(Effect.ignore);
+                return projectUpdate({
+                  sessionId: served.sessionId,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: served.toolCallId,
+                    status: "completed",
+                  },
+                }).pipe(Effect.ignore);
               }),
             ),
           ),
@@ -325,21 +320,17 @@ export function makeAntigravityAcpAdapterFlavor(
             Effect.andThen(runtime.prompt(payload, promptOptions)),
           ),
         handleSessionUpdate: (handler) => {
-          projectUpdate = handler;
-          return runtime.handleSessionUpdate((rawNotification) =>
-            updates.withPermit(
-              subagents
-                .rewriteAndDrain(rawNotification)
-                .pipe(
-                  Effect.flatMap((notifications) =>
-                    Effect.forEach(
-                      notifications,
-                      (notification) => handler(reads.repair(notification)),
-                      { discard: true },
-                    ),
-                  ),
+          const project = (notification: Parameters<typeof handler>[0]) =>
+            subagents
+              .rewriteAndDrain(notification)
+              .pipe(
+                Effect.flatMap((notifications) =>
+                  Effect.forEach(notifications, handler, { discard: true }),
                 ),
-            ),
+              );
+          projectUpdate = (notification) => updates.withPermit(project(notification));
+          return runtime.handleSessionUpdate((notification) =>
+            updates.withPermit(Effect.suspend(() => project(reads.repair(notification)))),
           );
         },
         resumeSession: (sessionId, configOptions) =>

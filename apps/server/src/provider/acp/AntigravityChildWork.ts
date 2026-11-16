@@ -41,6 +41,7 @@ const AGENT_REPORT_RECIPIENT_SESSION_ID = 2;
 const AGENT_REPORT_SENDER_CONVERSATION_ID = 3;
 const AGENT_REPORT_TEXT = 4;
 const STEP_INVOKE_SUBAGENT = 143;
+const STEP_GENERIC_TOOL = 140;
 const STEP_TASK_DETAILS = 148;
 const INVOKE_SPECS = 9;
 const INVOKE_SPEC_MODEL_TIER = 8;
@@ -50,6 +51,8 @@ const SYSTEM_MESSAGE_STEP_TYPE = 101;
 const INVOKE_SUBAGENT_STEP_TYPE = 127;
 const RUN_COMMAND_STEP_TYPE = 21;
 const GENERIC_STEP_TYPE = 132;
+// Protobuf field 2 holds the tool name, preceded by its byte length.
+const INVOKE_SUBAGENT_TOOL_FIELD = Buffer.from("\x12\x0finvoke_subagent");
 const RUNNING_STEP_STATUS = 2;
 const encodeCommandTasks = Schema.encodeSync(
   Schema.fromJsonString(Schema.Array(OrchestrationV2PendingBackgroundTask)),
@@ -270,6 +273,7 @@ const decodeInvokeSpec = (spec: Uint8Array): AntigravityChildLaunch => {
     (field, value) => {
       if (field === 2 && role === undefined) role = textDecoder.decode(value);
       else if (field === 3 && prompt === undefined) prompt = textDecoder.decode(value);
+      else if (field === 12 && model === undefined) model = textDecoder.decode(value);
     },
     (field, value) => {
       if (field === INVOKE_SPEC_MODEL_TIER && model === undefined) {
@@ -286,18 +290,27 @@ const decodeInvokeSpec = (spec: Uint8Array): AntigravityChildLaunch => {
 
 const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => {
   const metadataCall = message(message(payload, STEP_METADATA), METADATA_TOOL_CALL);
+  if (text(metadataCall, 2) !== "invoke_subagent") return undefined;
   const toolCallId = text(metadataCall, 1);
-  const invoke = message(payload, STEP_INVOKE_SUBAGENT);
+  const legacy = message(payload, STEP_INVOKE_SUBAGENT);
+  const structured = message(message(message(payload, STEP_GENERIC_TOOL), 2), 6);
+  const invoke =
+    legacy ??
+    (text(structured, 1) === "type.googleapis.com/exa.cortex.core.tools.InvokeSubagent"
+      ? message(structured, 2)
+      : undefined);
   const children =
     invoke === undefined
       ? []
-      : messages(invoke, INVOKE_RESULTS).map((result) => ({
+      : messages(invoke, legacy === undefined ? 2 : INVOKE_RESULTS).map((result) => ({
           conversationId: text(result, 1) ?? "",
           logUri: text(result, 2) ?? "",
         }));
   if (!children.every((child) => NATIVE_ID.test(child.conversationId))) return undefined;
   const specLaunches =
-    invoke === undefined ? [] : messages(invoke, INVOKE_SPECS).map(decodeInvokeSpec);
+    invoke === undefined
+      ? []
+      : messages(invoke, legacy === undefined ? 1 : INVOKE_SPECS).map(decodeInvokeSpec);
   const launches =
     specLaunches.length === 0 || specLaunches.some((launch) => launch.model === undefined)
       ? mergeLaunchModels(specLaunches, decodeLaunchJson(text(metadataCall, 3)))
@@ -459,9 +472,15 @@ function readIndexedInvokeRecords(
 
   for (const row of database
     .prepare(
-      "SELECT idx, step_type, length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_type IN (?, ?) AND step_format = 0 ORDER BY idx",
+      "SELECT idx, step_type, step_format, length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE (step_type = ? AND step_format = 0) OR step_type = ? OR (step_type = ? AND instr(step_payload, ?) > 0) ORDER BY idx",
     )
-    .iterate(MAX_STEP_BYTES, PLANNER_RESPONSE_STEP_TYPE, INVOKE_SUBAGENT_STEP_TYPE)) {
+    .iterate(
+      MAX_STEP_BYTES,
+      PLANNER_RESPONSE_STEP_TYPE,
+      INVOKE_SUBAGENT_STEP_TYPE,
+      GENERIC_STEP_TYPE,
+      INVOKE_SUBAGENT_TOOL_FIELD,
+    )) {
     const stepType = rowNumber(row, "step_type");
     const idx = rowNumber(row, "idx");
     const size = rowNumber(row, "size");
@@ -483,10 +502,15 @@ function readIndexedInvokeRecords(
       continue;
     }
 
-    if (stepType === INVOKE_SUBAGENT_STEP_TYPE) {
+    if (stepType === INVOKE_SUBAGENT_STEP_TYPE || stepType === GENERIC_STEP_TYPE) {
       invokeRows += 1;
       invokeBytes += size;
-      if (invokeRows > MAX_INVOKE_ROWS || size > MAX_STEP_BYTES || invokeBytes > MAX_SCAN_BYTES) {
+      if (
+        invokeRows > MAX_INVOKE_ROWS ||
+        size > MAX_STEP_BYTES ||
+        invokeBytes > MAX_SCAN_BYTES ||
+        rowNumber(row, "step_format") !== 0
+      ) {
         return undefined;
       }
       const decoded = payload === undefined ? undefined : decodeInvokeRecord(payload);
@@ -601,14 +625,14 @@ function findInvokeRecord(
   },
 ): InvokeRecord | undefined {
   if (!canLookupInvokeRecord(input)) return undefined;
+  const entries = readIndexedInvokeRecords(database);
+  if (entries === undefined) return undefined;
   const plannerIdx = plannerIdxOfTask(input.rootSessionId, input.nativeTaskId);
   const launchIsHydrated =
     input.launch.title !== null &&
     input.launch.title !== ANTIGRAVITY_SUBAGENT_BATCH_TITLE &&
     input.launch.prompt.trim() !== "";
   if (plannerIdx !== undefined) {
-    const entries = readIndexedInvokeRecords(database);
-    if (entries === undefined) return undefined;
     const record = provenAutoApprovedRecord(entries, plannerIdx);
     if (
       record !== undefined &&
@@ -621,21 +645,6 @@ function findInvokeRecord(
       return undefined;
     }
   }
-  const totals = database
-    .prepare(
-      "SELECT count(*) AS rows, coalesce(sum(length(step_payload)), 0) AS bytes, coalesce(max(length(step_payload)), 0) AS largest, sum(step_format != 0) AS other FROM steps WHERE step_type = ?",
-    )
-    .get(INVOKE_SUBAGENT_STEP_TYPE);
-  if (
-    rowNumber(totals, "rows") > MAX_INVOKE_ROWS ||
-    rowNumber(totals, "bytes") > MAX_SCAN_BYTES ||
-    rowNumber(totals, "largest") > MAX_STEP_BYTES ||
-    rowNumber(totals, "other") > 0
-  ) {
-    return undefined;
-  }
-  const entries = readIndexedInvokeRecords(database);
-  if (entries === undefined) return undefined;
   const claimed = new Set<string>();
   for (const sibling of input.siblings) {
     const idx = plannerIdxOfTask(input.rootSessionId, sibling.nativeTaskId);
@@ -1049,7 +1058,23 @@ export function makeAntigravityCommandTaskTracker(profileDirectory: string | und
         sessions.set(sessionId, state);
       }
       let terminalToolId: string | undefined;
-      if (update.sessionUpdate === "session_info_update") {
+      let refresh = update.sessionUpdate === "session_info_update";
+      if (update.sessionUpdate !== "session_info_update") {
+        const previous = state.commands.get(update.toolCallId);
+        const input = update.rawInput;
+        const command =
+          Predicate.isObject(input) && typeof input.CommandLine === "string"
+            ? input.CommandLine
+            : previous?.command;
+        if (command !== undefined)
+          state.commands.set(update.toolCallId, { command, taskId: previous?.taskId });
+        refresh =
+          command !== undefined &&
+          (previous === undefined || update.status === "completed" || update.status === "failed");
+        if (update.status === "completed" || update.status === "failed")
+          terminalToolId = update.toolCallId;
+      }
+      if (refresh) {
         const native = yield* readCommandTasks(profileDirectory, sessionId).pipe(
           Effect.orElseSucceed(() => undefined),
         );
@@ -1059,17 +1084,6 @@ export function makeAntigravityCommandTaskTracker(profileDirectory: string | und
           if (entry.taskId !== undefined && !native.some((task) => task.taskId === entry.taskId))
             state.commands.delete(id);
         }
-      } else {
-        const previous = state.commands.get(update.toolCallId);
-        const input = update.rawInput;
-        const command =
-          Predicate.isObject(input) && typeof input.CommandLine === "string"
-            ? input.CommandLine
-            : previous?.command;
-        if (command !== undefined)
-          state.commands.set(update.toolCallId, { command, taskId: previous?.taskId });
-        if (update.status === "completed" || update.status === "failed")
-          terminalToolId = update.toolCallId;
       }
       const tasks: Array<OrchestrationV2PendingBackgroundTask> = [];
       for (const task of state.native ?? []) {

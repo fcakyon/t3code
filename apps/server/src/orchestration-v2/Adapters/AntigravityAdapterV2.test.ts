@@ -1322,6 +1322,134 @@ describe("AntigravityAdapterV2 html_render pages", () => {
 });
 
 describe("AntigravityAdapterV2 subagent reads", () => {
+  it.live("delivers child reports from database changes after the parent stops streaming", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const crypto = yield* SecureRandom.SecureRandom;
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const { profile } = yield* makeProfile({
+        sessionId: "mock-session-1",
+        steps: (logUri) => [
+          [1, 15, plannerStep(["call-reader"])],
+          [
+            2,
+            132,
+            invokeStep({
+              stepType: 132,
+              callId: "call-reader",
+              launches: [LAUNCH],
+              children: [{ id: CHILD, logUri }],
+            }),
+          ],
+        ],
+      });
+      let send:
+        | Parameters<AcpSessionRuntime.AcpSessionRuntime["Service"]["handleSessionUpdate"]>[0]
+        | undefined;
+      const runtime = yield* makeAntigravityAcpAdapterFlavor({
+        instanceId: ProviderInstanceId.make("antigravity-db-report"),
+        random: crypto,
+        fileSystem,
+        path,
+        host: yield* ProviderHost.ProviderHost,
+        profileDirectory: profile,
+        selfInvocation: yield* resolveSelfInvocation(),
+        withProcess: (_stop, task) => task,
+        defaultModel: Effect.undefined,
+        makeRuntime: (input) =>
+          makeAntigravityAcpRuntime({
+            ...input,
+            childProcessSpawner,
+            spawn: {
+              command: process.execPath,
+              args: [mockAgentPath],
+              cwd: input.cwd,
+              env: { T3_ACP_ANTIGRAVITY: "1" },
+            },
+          }).pipe(
+            Effect.provideService(SecureRandom.SecureRandom, crypto),
+            Effect.map((base) => ({
+              ...base,
+              handleSessionUpdate: (handler) =>
+                Effect.sync(() => {
+                  send = handler;
+                }).pipe(Effect.andThen(base.handleSessionUpdate(handler))),
+            })),
+          ),
+      }).makeRuntime({
+        cwd: profile,
+        runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: profile,
+        }),
+        mcpServers: [],
+        clientCapabilities: {},
+        clientInfo: { name: "t3-test", version: "1" },
+        protocolLogging: {},
+        onTermination: () => Effect.void,
+      });
+      const refreshed = yield* Deferred.make<void>();
+      const notifications: Array<EffectAcpSchema.SessionNotification> = [];
+      let reportWritten = false;
+      yield* runtime.handleSessionUpdate((notification) =>
+        Effect.sync(() => {
+          notifications.push(notification);
+          if (reportWritten && notification.update.sessionUpdate === "session_info_update")
+            Deferred.doneUnsafe(refreshed, Exit.void);
+        }),
+      );
+      yield* runtime.start();
+      if (send === undefined) return yield* Effect.die("the adapter must handle updates");
+      yield* send({
+        sessionId: "mock-session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "call-reader",
+          title: "Running invoke_subagent",
+          kind: "other",
+          status: "in_progress",
+          rawInput: { Role: LAUNCH.role, Prompt: LAUNCH.prompt },
+        },
+      });
+      const database = new NodeSqlite.DatabaseSync(
+        path.join(profile, "antigravity-acp", "conversations", "mock-session-1.db"),
+      );
+      reportWritten = true;
+      database.prepare("INSERT INTO steps (idx,step_type,step_payload) VALUES (3,101,?)").run(
+        agentReportStep({
+          recipientSessionId: "mock-session-1",
+          senderConversationId: CHILD,
+          text: "reader finished",
+        }),
+      );
+      database.close();
+      yield* Deferred.await(refreshed);
+      assert.includeDeepMembers(
+        notifications.map((notification) => notification.update),
+        [
+          {
+            sessionUpdate: "agent_message",
+            messageId: `antigravity-subagent-report:${CHILD}:3`,
+            content: [{ type: "text", text: "reader finished" }],
+          },
+        ],
+      );
+      assert.isTrue(
+        notifications.some(
+          ({ update }) =>
+            update.sessionUpdate === "tool_call_update" &&
+            update.toolCallId === "call-reader" &&
+            update.status === "completed",
+        ),
+      );
+    }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
   it.effect("completes a read T3 served when the agent later fails it with a step error", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -1562,12 +1690,13 @@ describe("AntigravityAdapterV2 subagent reads", () => {
         makeRuntime: (runtimeInput) =>
           makeAntigravityAcpRuntime({
             ...runtimeInput,
+            runtimeVersion: "1.5.9",
             childProcessSpawner,
             spawn: {
               command: process.execPath,
               args: [mockAgentPath],
               cwd: runtimeInput.cwd,
-              env: { T3_ACP_ANTIGRAVITY: "1" },
+              env: { T3_ACP_ANTIGRAVITY: "1", T3_ACP_AGENT_VERSION: "1.5.9" },
             },
           }).pipe(
             Effect.provideService(SecureRandom.SecureRandom, crypto),
@@ -1687,8 +1816,9 @@ describe("AntigravityAdapterV2 subagent reads", () => {
             [4, 15, plannerStep(["call-30"])],
             [
               5,
-              127,
+              132,
               invokeStep({
+                stepType: 132,
                 callId: "call-30",
                 launches: [LAUNCH],
                 children: [{ id: CHILD, logUri }],
@@ -1849,8 +1979,9 @@ describe("AntigravityAdapterV2 subagent reads", () => {
             [1, 15, plannerStep(["call-1"])],
             [
               2,
-              127,
+              132,
               invokeStep({
+                stepType: 132,
                 callId: "call-1",
                 launches: [LAUNCH],
                 children: [{ id: CHILD, logUri }],
@@ -1953,8 +2084,9 @@ describe("AntigravityAdapterV2 subagent reads", () => {
             [1, 15, plannerStep(["call-inherit"])],
             [
               2,
-              127,
+              132,
               invokeStep({
+                stepType: 132,
                 callId: "call-inherit",
                 launches: [inheritedLaunch],
                 children: [{ id: CHILD, logUri }],
@@ -1963,8 +2095,9 @@ describe("AntigravityAdapterV2 subagent reads", () => {
             [3, 15, plannerStep(["call-flash"])],
             [
               4,
-              127,
+              132,
               invokeStep({
+                stepType: 132,
                 callId: "call-flash",
                 launches: [flashLaunch],
                 children: [{ id: "b468c0e1d2f34a5b6c7d8e9f0a1b2c3d", logUri }],

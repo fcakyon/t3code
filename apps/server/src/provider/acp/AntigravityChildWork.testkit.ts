@@ -60,41 +60,67 @@ export const commandTaskStep = (input: {
   );
 
 export const invokeStep = (input: {
+  readonly stepType?: 127 | 132;
   readonly callId: string;
   readonly launches: ReadonlyArray<AntigravityChildLaunch>;
   readonly children: ReadonlyArray<{ readonly id: string; readonly logUri: string }>;
   readonly metadataArgsJson?: string;
   readonly omitInvokePayload?: boolean;
-}) =>
-  proto(
-    [...varint(1 * 8), ...varint(127)],
+}) => {
+  const generic = input.stepType === 132;
+  const invoke = proto(
+    ...input.launches.map((launch) => {
+      const tier = launch.model === undefined ? undefined : MODEL_TIER_VALUES[launch.model];
+      return field(
+        generic ? 1 : 9,
+        proto(
+          field(1, "research"),
+          field(2, launch.role),
+          field(3, launch.prompt),
+          ...(generic && launch.model !== undefined
+            ? [field(12, launch.model)]
+            : tier === undefined
+              ? []
+              : [[...varint(8 * 8), ...varint(tier)]]),
+        ),
+      );
+    }),
+    ...input.children.map((child) =>
+      field(generic ? 2 : 10, proto(field(1, child.id), field(2, child.logUri))),
+    ),
+  );
+  return proto(
+    [...varint(1 * 8), ...varint(input.stepType ?? 127)],
     field(5, proto(field(4, toolCall(input.callId, input.metadataArgsJson)))),
     ...(input.omitInvokePayload
       ? []
       : [
-          field(
-            143,
-            proto(
-              ...input.launches.map((launch) => {
-                const tier =
-                  launch.model === undefined ? undefined : MODEL_TIER_VALUES[launch.model];
-                return field(
-                  9,
-                  proto(
-                    field(1, "research"),
-                    field(2, launch.role),
-                    field(3, launch.prompt),
-                    ...(tier === undefined ? [] : [[...varint(8 * 8), ...varint(tier)]]),
+          generic
+            ? field(
+                140,
+                proto(
+                  field(
+                    2,
+                    proto(
+                      field(
+                        1,
+                        "Created the following subagent: {}\nThe subagent will send you a message when it has completed its task or requires guidance. There is no need to poll for its response.",
+                      ),
+                      field(
+                        6,
+                        proto(
+                          field(1, "type.googleapis.com/exa.cortex.core.tools.InvokeSubagent"),
+                          field(2, invoke),
+                        ),
+                      ),
+                    ),
                   ),
-                );
-              }),
-              ...input.children.map((child) =>
-                field(10, proto(field(1, child.id), field(2, child.logUri))),
-              ),
-            ),
-          ),
+                ),
+              )
+            : field(143, invoke),
         ]),
   );
+};
 export const plannerStep = (
   callIds: ReadonlyArray<
     string | { readonly id: string; readonly launches?: ReadonlyArray<AntigravityChildLaunch> }

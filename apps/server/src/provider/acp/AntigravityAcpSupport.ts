@@ -41,6 +41,7 @@ export interface AntigravityAcpRuntimeInput extends Omit<
   | "transformStdout"
 > {
   readonly childProcessSpawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
+  readonly processEnvironment?: NodeJS.ProcessEnv;
   readonly onAuthorizationUrl?: (url: string) => Effect.Effect<void, EffectAcpErrors.AcpError>;
   /** Serve `fs/read_text_file` for runtimes whose native reader is not qualified. */
   readonly clientFileReads?: boolean;

@@ -69,6 +69,7 @@ describe("Antigravity release gates", () => {
     { version: "1.5.0", filter: false, native: false, ownName: false, advertisedAppend: false },
     { version: "1.5.1", filter: false, native: false, ownName: true, advertisedAppend: false },
     { version: "1.5.7", filter: false, native: false, ownName: true, advertisedAppend: true },
+    { version: "1.5.9", filter: false, native: false, ownName: true, advertisedAppend: true },
     { version: "1.3.0", filter: false, native: false, ownName: false, advertisedAppend: false },
     { version: undefined, filter: false, native: false, ownName: false, advertisedAppend: false },
     { version: "unknown", filter: false, native: false, ownName: false, advertisedAppend: false },

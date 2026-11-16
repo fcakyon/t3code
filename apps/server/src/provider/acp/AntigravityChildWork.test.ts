@@ -90,8 +90,7 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
         sessionId: ROOT,
         update: { sessionUpdate: "session_info_update" as const },
       };
-      expect(yield* tracker.read(notification)).toBeUndefined();
-      expect(yield* tracker.read(refresh)).toEqual([
+      expect(yield* tracker.read(notification)).toEqual([
         {
           kind: "command",
           taskId,
@@ -100,6 +99,7 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
           nativeItemId: `${ROOT}:2813`,
         },
       ]);
+      expect(yield* tracker.read(refresh)).toBeUndefined();
       expect(yield* tracker.read(notification)).toBeUndefined();
       expect(
         yield* tracker.read({
@@ -122,7 +122,13 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
         }),
       ).toBeUndefined();
       expect(yield* tracker.read(notification)).toBeUndefined();
-      expect(yield* tracker.read(refresh)).toEqual([]);
+      expect(
+        yield* tracker.read({
+          ...notification,
+          update: { ...notification.update, status: "completed" },
+        }),
+      ).toEqual([]);
+      expect(yield* tracker.read(refresh)).toBeUndefined();
       yield* tracker.read({
         ...notification,
         update: { ...notification.update, toolCallId: "completed-foreground", status: "completed" },
@@ -144,11 +150,12 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
           }),
         );
       nextDatabase.close();
-      yield* tracker.read({
-        ...notification,
-        update: { ...notification.update, toolCallId: `${ROOT}:2814` },
-      });
-      expect(yield* tracker.read(refresh)).toEqual([
+      expect(
+        yield* tracker.read({
+          ...notification,
+          update: { ...notification.update, toolCallId: `${ROOT}:2814` },
+        }),
+      ).toEqual([
         {
           kind: "command",
           taskId: `${ROOT}/task-4294`,
@@ -157,6 +164,7 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
           nativeItemId: `${ROOT}:2814`,
         },
       ]);
+      expect(yield* tracker.read(refresh)).toBeUndefined();
     }),
   );
 
@@ -240,9 +248,9 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
     }),
   );
 
-  it.effect(
-    "matches an auto-approved call id when earlier silent planner steps shift StepUpdate.step_index",
-    () =>
+  it.effect.each([127, 132] as const)(
+    "matches an auto-approved call id with silent planner steps and native step type %s",
+    (stepType) =>
       Effect.gen(function* () {
         const { profile } = yield* makeProfile({
           steps: (logUri) => [
@@ -258,8 +266,9 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
             [29, 15, plannerStep(["call-30"])],
             [
               30,
-              127,
+              stepType,
               invokeStep({
+                stepType,
                 callId: "call-30",
                 launches: [LAUNCH],
                 children: [{ id: CHILD, logUri }],
@@ -274,6 +283,21 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
                 text: "marker 4242 found in README.md",
               }),
             ],
+            ...Array.from(
+              { length: 201 },
+              (_, index) =>
+                [
+                  100 + index,
+                  132,
+                  commandTaskStep({
+                    stepType: 132,
+                    taskId: `${ROOT}/task-${100 + index}`,
+                    command: "echo invoke_subagent",
+                    summary: "Unrelated command",
+                    callId: `command-${index}`,
+                  }),
+                ] as const,
+            ),
           ],
         });
         // 5 silent planner steps precede idx 30 (at 1, 4, 9, 20, 29), so StepUpdate.step_index is 25.
@@ -553,41 +577,62 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
     }),
   );
 
-  it.effect("declines a launch-text match it cannot prove unique within its scan bounds", () =>
-    Effect.gen(function* () {
-      const record = (callId: string, logUri: string) =>
-        invokeStep({ callId, launches: [LAUNCH], children: [{ id: CHILD, logUri }] });
-      const other = { role: "Test Runner", prompt: "Run the tests" };
-      const filler = (idx: number, logUri: string) =>
-        [
-          idx,
-          127,
-          invokeStep({ callId: `f${idx}`, launches: [other], children: [{ id: CHILD, logUri }] }),
-        ] as const;
-      const opaque = "35bea692fa95447fbdae6333fec5515f";
-      const launch = describeAntigravitySubagentLaunches([LAUNCH]);
-      const cases = [
-        // More records than one open may scan.
-        (logUri: string) => [
-          [1, 127, record("x", logUri)] as const,
-          ...Array.from({ length: 200 }, (_, index) => filler(index + 2, logUri)),
-        ],
-        // An oversized record could hold an identical launch.
-        (logUri: string) => [
-          [1, 127, record("x", logUri)] as const,
-          [2, 127, new Uint8Array(1024 * 1024 + 1)] as const,
-        ],
-        // So could one this reader cannot decode.
-        (logUri: string) => [
-          [1, 127, record("x", logUri)] as const,
-          [2, 127, Uint8Array.from([0xff, 0xff])] as const,
-        ],
-      ];
-      for (const steps of cases) {
-        const { profile } = yield* makeProfile({ steps });
+  it.effect.each([127, 132] as const)(
+    "declines an unproven launch-text match for native step %s",
+    (stepType) =>
+      Effect.gen(function* () {
+        const record = (callId: string, logUri: string) =>
+          invokeStep({ stepType, callId, launches: [LAUNCH], children: [{ id: CHILD, logUri }] });
+        const other = { role: "Test Runner", prompt: "Run the tests" };
+        const filler = (idx: number, logUri: string) =>
+          [
+            idx,
+            stepType,
+            invokeStep({
+              stepType,
+              callId: `f${idx}`,
+              launches: [other],
+              children: [{ id: CHILD, logUri }],
+            }),
+          ] as const;
+        const opaque = "35bea692fa95447fbdae6333fec5515f";
+        const launch = describeAntigravitySubagentLaunches([LAUNCH]);
+        const cases = [
+          // More records than one open may scan.
+          (logUri: string) => [
+            [1, stepType, record("x", logUri)] as const,
+            ...Array.from({ length: 200 }, (_, index) => filler(index + 2, logUri)),
+          ],
+          // An oversized record could hold an identical launch.
+          (logUri: string) => [
+            [1, stepType, record("x", logUri)] as const,
+            [
+              2,
+              stepType,
+              Uint8Array.from([...record("oversized", logUri), ...new Uint8Array(1024 * 1024)]),
+            ] as const,
+          ],
+          // So could one this reader cannot decode.
+          (logUri: string) => [
+            [1, stepType, record("x", logUri)] as const,
+            [2, stepType, Uint8Array.from([...record("invalid", logUri), 0xff, 0xff])] as const,
+          ],
+        ];
+        for (const steps of cases) {
+          const { profile } = yield* makeProfile({ steps });
+          expect(yield* read(profile, opaque, launch)).toEqual([]);
+        }
+        const { profile } = yield* makeProfile({
+          steps: (logUri) => [[1, stepType, record("x", logUri)]],
+        });
+        const path = yield* Path.Path;
+        const database = new NodeSqlite.DatabaseSync(
+          path.join(profile, "antigravity-acp", "conversations", `${ROOT}.db`),
+        );
+        database.prepare("UPDATE steps SET step_format = 1").run();
+        database.close();
         expect(yield* read(profile, opaque, launch)).toEqual([]);
-      }
-    }),
+      }),
   );
 
   it.effect("keeps the batch view for a batch over the child limit", () =>
@@ -745,9 +790,9 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
       }),
   );
 
-  it.effect(
-    "decodes and hydrates subagent launch models across rawInput, invoke proto, and planner args",
-    () =>
+  it.effect.each([127, 132] as const)(
+    "hydrates subagent models from raw input, native step %s, and planner args",
+    (stepType) =>
       Effect.gen(function* () {
         expect(
           antigravitySubagentLaunches({
@@ -766,12 +811,12 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
 
         const { profile } = yield* makeProfile({
           steps: (logUri) => [
-            // Invoke specs carry field 8 model_tier directly.
             [1, 15, plannerStep(["call-proto"])],
             [
               2,
-              127,
+              stepType,
               invokeStep({
+                stepType,
                 callId: "call-proto",
                 launches: [
                   { role: "Lite", prompt: "A", model: "flash_lite" },
@@ -783,12 +828,12 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
                 ],
               }),
             ],
-            // Invoke specs omit field 8, so Model merges from the planner step args.
             [3, 15, plannerStep([{ id: "call-planner-model", launches: [flashLaunch] }])],
             [
               4,
-              127,
+              stepType,
               invokeStep({
+                stepType,
                 callId: "call-planner-model",
                 launches: [{ role: flashLaunch.role, prompt: flashLaunch.prompt }],
                 children: [{ id: CHILD, logUri }],

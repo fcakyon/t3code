@@ -608,7 +608,7 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           environmentId: EnvironmentId.make("env-antigravity-mcp-test"),
           threadId,
           providerSessionId,
-          providerInstanceId: h.instanceId,
+          providerInstanceId: h.instance.instanceId,
           endpoint: "http://127.0.0.1:4321/mcp",
           authorizationHeader: "Bearer test-mcp-token",
           browserToolsAvailable: false,
@@ -617,7 +617,7 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
           h.instance.orchestrationAdapter.openSession({
             threadId,
             providerSessionId,
-            modelSelection: { instanceId: h.instanceId, model: "gemini-test-low" },
+            modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
             runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
               runtimeMode: "full-access",
               interactionMode: "default",
