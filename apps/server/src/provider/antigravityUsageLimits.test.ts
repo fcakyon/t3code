@@ -67,6 +67,7 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
     userId?: string;
     userInfoAt?: number;
     missingToken?: boolean;
+    keychainToken?: string;
     authMethod?: "oauth-personal" | "oauth-business" | "gemini-api-key";
     tokenFormat?: "legacy" | "cli";
     accessTokenExpiry?: string;
@@ -134,7 +135,7 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
         );
       }
       expect(JSON.parse(body)).toEqual(
-        options.tokenFormat === "cli" ? {} : { project: "project-id" },
+        options.tokenFormat === "cli" || options.keychainToken ? {} : { project: "project-id" },
       );
       expect(request.headers["user-agent"]).toMatch(/^antigravity\/hub\/2\.24\.0 /);
       return HttpClientResponse.fromWeb(
@@ -156,6 +157,7 @@ const fixture = Effect.fn("AntigravityUsageTest.fixture")(function* (
   const usage = yield* makeAntigravityUsageProbe({
     profileDirectory,
     authMethod: options.authMethod ?? "oauth-personal",
+    readKeychain: () => Effect.succeed(options.keychainToken),
     refreshCliToken: () =>
       Effect.gen(function* () {
         const native = yield* fs
@@ -744,5 +746,37 @@ describe("Antigravity subscription limits", () => {
         expect(requests).toEqual([]);
       }
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect(
+    "reads go-keyring-base64 OAuth tokens from macOS Keychain when token files are absent",
+    () =>
+      Effect.gen(function* () {
+        yield* TestClock.setTime(
+          DateTime.toEpochMillis(DateTime.makeUnsafe("2026-10-09T14:00:00Z")),
+        );
+        const payload = Buffer.from(
+          JSON.stringify({
+            auth_method: "consumer",
+            token: {
+              access_token: "access-token",
+              refresh_token: "refresh-kc",
+              expiry: "2026-10-09T15:00:00Z",
+            },
+          }),
+          "utf8",
+        ).toString("base64");
+        const { probe, requests } = yield* fixture({
+          missingToken: true,
+          keychainToken: `go-keyring-base64:${payload}`,
+        });
+        const limits = yield* probe;
+        expect(limits.unavailable).toBeUndefined();
+        expect(limits.windows.length).toBeGreaterThan(0);
+        expect(requests.some((req) => req.url.endsWith("/oauth2/v2/userinfo"))).toBe(true);
+        expect(requests.some((req) => req.url.endsWith("/oauth2.googleapis.com/token"))).toBe(
+          false,
+        );
+      }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
   );
 });

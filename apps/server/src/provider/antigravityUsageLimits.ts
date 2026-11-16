@@ -8,8 +8,10 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 
+import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStreamText";
 import {
   makeUnavailableUsageLimits,
   makeUsageLimits,
@@ -220,6 +222,7 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   readonly profileDirectory: string;
   readonly authMethod: AntigravitySettings["authMethod"];
   readonly refreshCliToken?: () => Effect.Effect<void, E>;
+  readonly readKeychain?: () => Effect.Effect<string | undefined>;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -227,6 +230,7 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   const crypto = yield* Digest.Digest;
   const platform = yield* HostProcess.Platform;
   const architecture = yield* HostProcess.Architecture;
+  const spawner = yield* Effect.serviceOption(ChildProcessSpawner.ChildProcessSpawner);
   const tokenPath = path.join(input.profileDirectory, "antigravity-acp", "acp_token.json");
   const cliTokenPath = path.join(
     input.profileDirectory,
@@ -245,19 +249,50 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       Effect.flatMap((response) => response.json),
       Effect.timeout("10 seconds"),
     );
+  const readCliToken = Effect.fn("AntigravityUsageProbe.readCliToken")(function* () {
+    const fileToken = yield* fs.readFileString(cliTokenPath).pipe(
+      Effect.flatMap(decodeCliTokenFile),
+      Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
+    );
+    if (fileToken !== undefined) return fileToken;
+    const raw = input.readKeychain
+      ? yield* input.readKeychain()
+      : yield* Effect.gen(function* () {
+          if (platform !== "darwin" || Option.isNone(spawner)) return undefined;
+          const child = yield* spawner.value.spawn(
+            ChildProcess.make("/usr/bin/security", [
+              "find-generic-password",
+              "-s",
+              "gemini",
+              "-a",
+              "antigravity",
+              "-w",
+            ]),
+          );
+          const [stdout, exitCode] = yield* Effect.all([
+            collectUint8StreamText({ stream: child.stdout, maxBytes: 16_384 }),
+            child.exitCode,
+          ]);
+          if (Number(exitCode) !== 0 || stdout.truncated) return undefined;
+          return stdout.text.trim();
+        }).pipe(
+          Effect.scoped,
+          Effect.timeout("5 seconds"),
+          Effect.orElseSucceed(() => undefined),
+        );
+    if (!raw) return undefined;
+    const jsonText = raw.startsWith("go-keyring-base64:")
+      ? Buffer.from(raw.slice("go-keyring-base64:".length), "base64").toString("utf8")
+      : raw;
+    return yield* decodeCliTokenFile(jsonText).pipe(Effect.orElseSucceed(() => undefined));
+  });
   const read = Effect.gen(function* () {
     const startedGeneration = generation;
     const checkedAt = DateTime.formatIso(yield* DateTime.now);
     if (input.authMethod !== "oauth-personal" && input.authMethod !== "oauth-business") {
       return makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" });
     }
-    const cliToken =
-      input.authMethod === "oauth-personal"
-        ? yield* fs.readFileString(cliTokenPath).pipe(
-            Effect.flatMap(decodeCliTokenFile),
-            Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined),
-          )
-        : undefined;
+    const cliToken = input.authMethod === "oauth-personal" ? yield* readCliToken() : undefined;
     if (cliToken === undefined && !(yield* fs.exists(tokenPath))) {
       cached = undefined;
       return makeUnavailableUsageLimits({
@@ -306,9 +341,10 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
                 if (input.refreshCliToken === undefined)
                   return yield* new AntigravityUsageRefreshError();
                 yield* input.refreshCliToken();
-                native = (yield* fs
-                  .readFileString(cliTokenPath)
-                  .pipe(Effect.flatMap(decodeCliTokenFile))).token;
+                const refreshedCliToken = yield* readCliToken();
+                if (refreshedCliToken === undefined)
+                  return yield* new AntigravityUsageRefreshError();
+                native = refreshedCliToken.token;
                 expiresAt = native.expiry ? DateTime.make(native.expiry) : Option.none();
               }
               if (!native.access_token || Option.isNone(expiresAt))
