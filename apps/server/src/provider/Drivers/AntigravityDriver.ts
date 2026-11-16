@@ -294,7 +294,10 @@ export const AntigravityDriver: ProviderDriver<
           installation: executable,
           profile,
           cwd: input.cwd,
-          baseEnv: processEnvironment,
+          baseEnv:
+            input.processEnvironment === undefined
+              ? processEnvironment
+              : { ...processEnvironment, ...input.processEnvironment },
           auth,
           runtimeTempDirectory,
         }),

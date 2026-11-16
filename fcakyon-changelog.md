@@ -1,5 +1,6 @@
 # t3code-fcakyon changelog
 
+- fix: Expose deferred MCP tools and T3_ACP_MCP_NODE to Antigravity sessions
 - fix: Keep Antigravity turns running during background tasks and continue on completion
 - feat: Map Auto runtime mode to full access for Antigravity
 - fix: Limit agent capabilities usage pace to non-Fable weekly windows
