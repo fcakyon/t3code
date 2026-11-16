@@ -110,6 +110,7 @@ function authState(patch: Partial<ProviderAuthState> = {}): ProviderAuthState {
 }
 
 interface SectionOptions {
+  compact?: boolean;
   readOnly?: boolean;
   provider?: ServerProvider;
   enabled?: boolean;
@@ -119,6 +120,7 @@ interface SectionOptions {
 function section(options: SectionOptions = {}) {
   return (
     <ProviderSetupSection
+      compact={options.compact}
       environmentId={environmentId}
       environmentLabel="Remote Google device"
       instanceId={instanceId}
@@ -181,6 +183,38 @@ function resetSetup() {
 }
 
 describe("Antigravity setup", () => {
+  it("updates the selected environment from the version action", async () => {
+    resetSetup();
+    setup.auth = authState({ phase: "idle", flowId: null, authorizationUrl: null });
+    setup.installation = {
+      ...setup.installation!,
+      version: "1.5.9",
+      installedVersion: "1.4.5",
+    };
+    await using screen = await renderSetup({ compact: true });
+    await screen.click("Update Antigravity to v1.5.9");
+    expect(setup.startInstall).toHaveBeenCalledWith({ environmentId, input: { instanceId } });
+
+    setup.installation = { ...setup.installation!, phase: "downloading", operationId: "update" };
+    await publish();
+    await expect
+      .element(screen.getByRole("button", { name: "Updating Antigravity" }))
+      .toBeDisabled();
+
+    setup.installation = { ...setup.installation!, phase: "succeeded", installedVersion: "1.5.9" };
+    await publish();
+    await expect.element(screen.getByRole("button")).not.toBeInTheDocument();
+    setup.installation = { ...setup.installation!, version: "1.5.8" };
+    await publish();
+    await expect.element(screen.getByRole("button")).not.toBeInTheDocument();
+    setup.installation = { ...setup.installation!, installedVersion: "1.4.5" };
+    await publish();
+    for (const options of [{ readOnly: true }, { enabled: false }, { binaryPath: "/custom/agy" }]) {
+      await screen.rerender(section({ compact: true, ...options }));
+      await expect.element(screen.getByRole("button")).not.toBeInTheDocument();
+    }
+  });
+
   it("can start installation before the first install snapshot arrives", async () => {
     resetSetup();
     setup.auth = authState({ phase: "idle", flowId: null, authorizationUrl: null });

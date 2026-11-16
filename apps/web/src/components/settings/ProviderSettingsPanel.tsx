@@ -98,7 +98,7 @@ import { ProviderInstanceCard } from "./ProviderInstanceCard";
 import { useSecretSources } from "./SecretSourceInput";
 import { TextGeneratorsSettings } from "./TextGeneratorsSettings";
 import { UsageProviderSettings } from "./UsageProviderSettings";
-import { ProviderSetupSection, readAntigravityAuthMethod } from "./ProviderSetupSection";
+import { ProviderSetupSection } from "./ProviderSetupSection";
 import { ProviderAuthenticationSection } from "./ProviderAuthenticationSection";
 import { CodexSetupSection, CodexManagedRuntimeFields } from "./CodexSetupSection";
 import { readCodexSetupMode } from "./CodexSetupSection.logic";
@@ -1299,6 +1299,19 @@ function ProviderInstanceRow({
     Boolean(liveProvider.compatibilityAdvisory?.message) &&
     Boolean(recommendedVersion) &&
     liveProvider.versionAdvisory?.canInstallVersion === true;
+  const antigravitySetup =
+    driver === "antigravity"
+      ? {
+          environmentId,
+          environmentLabel,
+          instanceId,
+          provider: liveProvider,
+          binaryPath: configuredBinaryPath(instance.config),
+          enabled: resolveProviderInstanceEnabled(instance),
+          readOnly,
+          onEnable: () => actions.enableInstance(instanceId, { ...instance, enabled: true }),
+        }
+      : undefined;
 
   return (
     <ProviderInstanceCard
@@ -1328,18 +1341,8 @@ function ProviderInstanceRow({
       }
       canWriteSettings={canWriteSettings}
       setup={
-        mode === "editor" && driver === "antigravity" ? (
-          <ProviderSetupSection
-            environmentId={environmentId}
-            environmentLabel={environmentLabel}
-            instanceId={instanceId}
-            provider={liveProvider}
-            binaryPath={configuredBinaryPath(instance.config)}
-            authMethod={readAntigravityAuthMethod(instance.config)}
-            enabled={resolveProviderInstanceEnabled(instance)}
-            readOnly={readOnly}
-            onEnable={() => actions.enableInstance(instanceId, { ...instance, enabled: true })}
-          />
+        mode === "editor" && antigravitySetup ? (
+          <ProviderSetupSection {...antigravitySetup} />
         ) : mode === "editor" && codexSetupMode === "managed" ? (
           <CodexSetupSection
             environmentId={environmentId}
@@ -1386,6 +1389,9 @@ function ProviderInstanceRow({
         ) : null
       }
       onUpdate={(next) => actions.updateInstance(instanceId, instance, next)}
+      versionAction={
+        antigravitySetup ? <ProviderSetupSection {...antigravitySetup} compact /> : undefined
+      }
       onDelete={
         mode === "editor" && !isDefault
           ? () => actions.deleteInstance(instanceId, instance)

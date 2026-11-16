@@ -685,6 +685,7 @@ interface ProviderInstanceCardProps {
   readonly onUpdate: (nextInstance: ProviderInstanceConfig) => Promise<boolean>;
   readonly onDelete?: (() => void) | undefined;
   readonly headerAction?: ReactNode | undefined;
+  readonly versionAction?: ReactNode | undefined;
   readonly setup?: ReactNode;
   readonly runtime?: ReactNode;
   readonly hiddenModels: ReadonlyArray<string>;
@@ -759,6 +760,7 @@ export function ProviderInstanceCard({
   onUpdate,
   onDelete,
   headerAction,
+  versionAction,
   setup,
   runtime,
   hiddenModels,
@@ -1156,6 +1158,7 @@ export function ProviderInstanceCard({
                 </code>
               ) : null}
               {versionAdvisoryNode}
+              {versionAction}
             </span>
             <span className="mt-0.5 flex items-start gap-1.5 text-xs leading-normal text-muted-foreground/80">
               {statusDotNode && !updateProgress ? (
@@ -1218,6 +1221,7 @@ export function ProviderInstanceCard({
       ) : null}
       {versionCodeNode}
       {versionAdvisoryNode}
+      {versionAction}
       <span
         inert={readOnly}
         aria-disabled={readOnly || undefined}

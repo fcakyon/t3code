@@ -5,47 +5,45 @@ import {
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
 import {
-  ANTIGRAVITY_AUTH_METHODS,
-  type AntigravityAuthMethod,
   type EnvironmentId,
   type ProviderInstanceId,
   type ServerProvider,
 } from "@t3tools/contracts";
 import { useRef, useState } from "react";
-import { Trash2Icon } from "lucide-react";
+import { ArrowUpCircleIcon, Trash2Icon } from "lucide-react";
+import { compareSemverVersions } from "@t3tools/shared/semver";
 
 import { ensureLocalApi } from "../../localApi";
 import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
+import { Spinner } from "../ui/spinner";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { SettingsRow } from "./settingsLayout";
 import { ProviderAuthenticationSection } from "./ProviderAuthenticationSection";
 
 interface ProviderSetupSectionProps {
+  readonly compact?: boolean | undefined;
   readonly environmentId: EnvironmentId;
   readonly environmentLabel: string;
   readonly instanceId: ProviderInstanceId;
   readonly provider: ServerProvider | undefined;
   readonly binaryPath?: string | undefined;
-  readonly authMethod?: AntigravityAuthMethod | undefined;
   readonly enabled: boolean;
   readonly readOnly: boolean;
   readonly onEnable: () => void;
 }
 
-export function readAntigravityAuthMethod(config: unknown): AntigravityAuthMethod {
-  const value =
-    config !== null && typeof config === "object" && "authMethod" in config
-      ? config.authMethod
-      : undefined;
-  return (
-    ANTIGRAVITY_AUTH_METHODS.find((method) => method.value === value)?.value ?? "oauth-personal"
-  );
-}
-
 export function ProviderSetupSection(props: ProviderSetupSectionProps) {
+  if (props.compact) {
+    return props.enabled &&
+      !props.readOnly &&
+      !props.binaryPath?.trim() &&
+      props.provider?.setup?.canInstall ? (
+      <ProviderSetupActions {...props} provider={props.provider} />
+    ) : null;
+  }
   return (
     <section
       aria-label="Antigravity setup"
@@ -83,7 +81,6 @@ export function ProviderSetupSection(props: ProviderSetupSectionProps) {
           instanceId={props.instanceId}
           provider={props.provider}
           binaryPath={props.binaryPath}
-          authMethod={props.authMethod ?? "oauth-personal"}
           enabled={props.enabled}
         />
       )}
@@ -98,12 +95,12 @@ function ProviderSetupActions({
   provider,
   enabled,
   binaryPath,
+  compact,
 }: Pick<
   ProviderSetupSectionProps,
-  "environmentId" | "environmentLabel" | "instanceId" | "enabled" | "binaryPath"
+  "environmentId" | "environmentLabel" | "instanceId" | "enabled" | "binaryPath" | "compact"
 > & {
   readonly provider: ServerProvider;
-  readonly authMethod: AntigravityAuthMethod;
 }) {
   const target = { environmentId, input: { instanceId } };
   const authQuery = useEnvironmentQuery(serverEnvironment.providerAuthState(target));
@@ -126,29 +123,14 @@ function ProviderSetupActions({
     installation?.phase === "downloading" ||
     installation?.phase === "extracting" ||
     installation?.phase === "verifying";
-  const usesCustomBinary = Boolean(binaryPath?.trim());
-  const installed =
-    provider.installed || (!usesCustomBinary && installation?.installedVersion != null);
+  const updateVersion =
+    installation?.installedVersion &&
+    installation.version &&
+    compareSemverVersions(installation.installedVersion, installation.version) < 0
+      ? installation.version
+      : null;
   const queryError = authQuery.error ?? installQuery.error;
   const actionsDisabled = pendingLabel !== null || queryError !== null;
-  const installationStatusMessage =
-    installation === null
-      ? "Checking the Antigravity runtime."
-      : installation?.phase === "downloading"
-        ? `Downloading ${(installation.downloadedBytes / 1_000_000).toFixed(1)} MB${installation.totalBytes === null ? "" : ` of ${(installation.totalBytes / 1_000_000).toFixed(1)} MB`}.`
-        : installation?.phase === "extracting"
-          ? "Extracting Antigravity."
-          : installation?.phase === "verifying"
-            ? "Checking the downloaded runtime."
-            : installed
-              ? "Installed."
-              : usesCustomBinary
-                ? enabled
-                  ? "The configured Antigravity runtime is unavailable."
-                  : "The configured Antigravity runtime has not been checked."
-                : installation?.totalBytes
-                  ? `${Math.ceil(installation.totalBytes / 1_000_000)} MB download.`
-                  : "Not installed.";
 
   async function runCommand<A, E>(
     label: string,
@@ -184,6 +166,54 @@ function ProviderSetupActions({
       await runCommand("Removing runtime", () => removeInstall(target));
     }
   }
+
+  if (compact) {
+    if (updateVersion === null) return null;
+    const label = installActive
+      ? "Updating Antigravity"
+      : `Update Antigravity to v${updateVersion}`;
+    return (
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              size="icon-micro"
+              variant="ghost-muted"
+              className="pointer-events-auto relative shrink-0"
+              aria-label={label}
+              disabled={actionsDisabled || authActive || installActive}
+              onClick={() => void runCommand("Starting installation", () => startInstall(target))}
+            >
+              {installActive ? <Spinner tone="muted" size="sm" /> : <ArrowUpCircleIcon />}
+            </Button>
+          }
+        />
+        <TooltipPopup>{error ?? label}</TooltipPopup>
+      </Tooltip>
+    );
+  }
+
+  const usesCustomBinary = Boolean(binaryPath?.trim());
+  const installed =
+    provider.installed || (!usesCustomBinary && installation?.installedVersion != null);
+  const installationStatusMessage =
+    installation === null
+      ? "Checking the Antigravity runtime."
+      : installation?.phase === "downloading"
+        ? `Downloading ${(installation.downloadedBytes / 1_000_000).toFixed(1)} MB${installation.totalBytes === null ? "" : ` of ${(installation.totalBytes / 1_000_000).toFixed(1)} MB`}.`
+        : installation?.phase === "extracting"
+          ? "Extracting Antigravity."
+          : installation?.phase === "verifying"
+            ? "Checking the downloaded runtime."
+            : installed
+              ? "Installed."
+              : usesCustomBinary
+                ? enabled
+                  ? "The configured Antigravity runtime is unavailable."
+                  : "The configured Antigravity runtime has not been checked."
+                : installation?.totalBytes
+                  ? `${Math.ceil(installation.totalBytes / 1_000_000)} MB download.`
+                  : "Not installed.";
 
   return (
     <div className="divide-y divide-border/50">
@@ -265,8 +295,7 @@ function ProviderSetupActions({
                     }
                   >
                     {installation?.installedVersion
-                      ? installation.version &&
-                        installation.version !== installation.installedVersion
+                      ? updateVersion
                         ? "Update Antigravity"
                         : "Reinstall Antigravity"
                       : installation?.phase === "failed" || installation?.phase === "cancelled"
