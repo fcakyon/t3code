@@ -435,7 +435,6 @@ export function makeAntigravityAcpAdapterFlavor(
     },
     normalizeToolCall: normalizeAntigravityToolCall,
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
-    deferFinalizeForBackgroundWork: true,
     enablePostSettleContinuation: true,
     promptOnEmptyContinuationWake: true,
     deferMcpTools: true,

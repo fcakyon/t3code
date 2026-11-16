@@ -1,5 +1,6 @@
 # t3code-fcakyon changelog
 
+- fix: Complete Antigravity foreground turns on prompt settlement while keeping background command tracking and safe post-settlement steer handling
 - fix: Complete Antigravity 1.5 subagents from native reports and discover background commands before turn settlement
 - fix: Track Antigravity 1.5 native invoke_subagent runs in Lineage
 - fix: Expose deferred MCP tools and T3_ACP_MCP_NODE to Antigravity sessions

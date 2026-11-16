@@ -98,7 +98,7 @@ describe("AntigravityAdapterV2 flavor", () => {
     assert.isNull(batch?.result);
     assert.isTrue(flavor.subagentsIdleOnTurnCompletion);
     assert.isTrue(flavor.deferMcpTools);
-    assert.isTrue(flavor.deferFinalizeForBackgroundWork);
+    assert.isUndefined(flavor.deferFinalizeForBackgroundWork);
     assert.isTrue(flavor.enablePostSettleContinuation);
     assert.isTrue(flavor.promptOnEmptyContinuationWake);
 
@@ -2421,7 +2421,7 @@ describe("AntigravityAdapterV2 session system prompt", () => {
 
 describe("AntigravityAdapterV2 background command continuation", () => {
   it.live(
-    "defers turn finalization while a background command runs and prompts continuation when it finishes",
+    "completes the foreground turn while a background command runs and prompts continuation when it finishes",
     () =>
       Effect.gen(function* () {
         const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -2453,6 +2453,7 @@ describe("AntigravityAdapterV2 background command continuation", () => {
         const crypto = yield* SecureRandom.SecureRandom;
         const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
           [];
+        const continuationOffered = yield* Deferred.make<void>();
         const promptCalls: Array<string> = [];
         const firstPromptSettled = yield* Deferred.make<void>();
         const instanceId = ProviderInstanceId.make("antigravity-bg-test");
@@ -2464,7 +2465,7 @@ describe("AntigravityAdapterV2 background command continuation", () => {
             offer: (request) =>
               Effect.sync(() => {
                 continuationRequests.push(request);
-              }),
+              }).pipe(Effect.andThen(Deferred.succeed(continuationOffered, undefined))),
           },
           makeRuntime: (input) =>
             makeAntigravityAcpRuntime({
@@ -2525,19 +2526,6 @@ describe("AntigravityAdapterV2 background command continuation", () => {
         });
         yield* session.startTurn(turn);
         yield* Deferred.await(firstPromptSettled);
-        const settledEarly = yield* Queue.takeAll(events);
-        assert.isFalse(
-          [...settledEarly].some((event) => event.type === "turn.terminal"),
-          "turn must stay running while a background command task is active",
-        );
-        assert.lengthOf(continuationRequests, 0);
-
-        const database = new NodeSqlite.DatabaseSync(
-          path.join(profile, "antigravity-acp", "conversations", `${sessionId}.db`),
-        );
-        yield* Effect.addFinalizer(() => Effect.sync(() => database.close()));
-        database.prepare("UPDATE steps SET status = 3").run();
-
         const terminal = yield* Stream.fromQueue(events).pipe(
           Stream.filter((event) => event.type === "turn.terminal"),
           Stream.runHead,
@@ -2546,6 +2534,16 @@ describe("AntigravityAdapterV2 background command continuation", () => {
         if (terminal._tag === "Some" && terminal.value.type === "turn.terminal") {
           assert.equal(terminal.value.status, "completed");
         }
+        assert.isTrue(yield* session.hasPendingBackgroundWork!);
+        assert.lengthOf(continuationRequests, 0);
+
+        const database = new NodeSqlite.DatabaseSync(
+          path.join(profile, "antigravity-acp", "conversations", `${sessionId}.db`),
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(() => database.close()));
+        database.prepare("UPDATE steps SET status = 3").run();
+
+        yield* Deferred.await(continuationOffered);
         assert.lengthOf(continuationRequests, 1);
 
         const promptCountBefore = promptCalls.length;
@@ -2568,6 +2566,7 @@ describe("AntigravityAdapterV2 background command continuation", () => {
         );
         assert.isTrue(secondTerminal._tag === "Some");
         assert.isAbove(promptCalls.length, promptCountBefore);
+        assert.isFalse(yield* session.hasPendingBackgroundWork!);
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });

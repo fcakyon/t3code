@@ -2586,20 +2586,18 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           });
           if (hadPending && tasks.length === 0) {
             const context = yield* Ref.get(activeTurn);
-            if (
+            const readyToFinalize =
               context !== null &&
               context.nativeThreadId === notification.sessionId &&
               context.promptSettled &&
               !context.finalized &&
               !context.interrupted &&
-              !hasDeferredBackgroundWork(context)
-            ) {
-              if (flavor.deferFinalizeForBackgroundWork === true) {
-                yield* finalizeTurn(context, context.promptSettledStatus ?? "completed");
-              }
-              if (postSettleContinuationEnabled) {
-                yield* offerContinuationRun(notification.sessionId);
-              }
+              !hasDeferredBackgroundWork(context);
+            if (readyToFinalize && flavor.deferFinalizeForBackgroundWork === true) {
+              yield* finalizeTurn(context, context.promptSettledStatus ?? "completed");
+            }
+            if ((readyToFinalize || context === null) && postSettleContinuationEnabled) {
+              yield* offerContinuationRun(notification.sessionId);
             }
           }
           return updated;
@@ -9640,22 +9638,29 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               const setup = yield* Ref.get(activeSessionSetup);
               const promptSteering =
                 setup !== null && flavor.promptSteering?.(setup.initializeResult) === true;
+              const rejectSteer = (detail: string) =>
+                promptSteering
+                  ? new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+                      driver,
+                      providerThreadId: turnInput.providerThread.id,
+                      providerTurnId: turnInput.providerTurnId,
+                    })
+                  : new ProviderAdapter.ProviderAdapterProtocolError({ driver, detail });
               const context = yield* Ref.get(activeTurn);
               if (
                 context === null ||
                 context.finalized ||
                 context.providerTurnId !== turnInput.providerTurnId
               ) {
-                if (promptSteering)
-                  return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
-                    driver,
-                    providerThreadId: turnInput.providerThread.id,
-                    providerTurnId: turnInput.providerTurnId,
-                  });
-                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
-                  driver,
-                  detail: `Provider turn ${turnInput.providerTurnId} is not active and cannot be steered.`,
-                });
+                return yield* rejectSteer(
+                  `Provider turn ${turnInput.providerTurnId} is not active and cannot be steered.`,
+                );
+              }
+              if (context.promptSettled) {
+                yield* finalizeTurn(context, context.promptSettledStatus ?? "completed");
+                return yield* rejectSteer(
+                  `Provider turn ${turnInput.providerTurnId} already settled and cannot be steered.`,
+                );
               }
               if (promptSteering) {
                 yield* Effect.raceFirst(
