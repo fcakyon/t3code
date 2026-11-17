@@ -397,8 +397,11 @@ export function makeAntigravityAcpAdapterFlavor(
         Effect.provideService(FileSystem.FileSystem, options.fileSystem),
         Effect.provideService(Path.Path, options.path),
       ),
-    // Loading history replays tool calls; resume avoids replay.
-    subagentsIdleOnTurnCompletion: true,
+    // Loading history replays tool calls; resume avoids replay. 1.5+ subagents run asynchronously after end_turn.
+    subagentsIdleOnTurnCompletion: (initializeResult) => {
+      const version = initializeResult.agentInfo?.version;
+      return version === undefined || compareSemverVersions(version, "1.5.0") < 0;
+    },
     ...(options.onSessionEvent === undefined ? {} : { onSessionEvent: options.onSessionEvent }),
     applyModelSelection: Effect.fn("AntigravityAdapterV2.applyModelSelection")(function* ({
       runtime,
@@ -435,6 +438,7 @@ export function makeAntigravityAcpAdapterFlavor(
     },
     normalizeToolCall: normalizeAntigravityToolCall,
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
+    deferFinalizeForBackgroundWork: true,
     enablePostSettleContinuation: true,
     promptOnEmptyContinuationWake: true,
     deferMcpTools: true,

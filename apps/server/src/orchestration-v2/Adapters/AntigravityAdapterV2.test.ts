@@ -96,9 +96,23 @@ describe("AntigravityAdapterV2 flavor", () => {
     assert.equal(batch?.prompt, "Started two agents.");
     assert.equal(batch?.childSessionId, "antigravity-task:trajectory:4");
     assert.isNull(batch?.result);
-    assert.isTrue(flavor.subagentsIdleOnTurnCompletion);
+    assert.equal(typeof flavor.subagentsIdleOnTurnCompletion, "function");
+    if (typeof flavor.subagentsIdleOnTurnCompletion === "function") {
+      assert.isTrue(
+        flavor.subagentsIdleOnTurnCompletion({
+          protocolVersion: 1,
+          agentInfo: { name: "antigravity-acp", version: "1.4.5" },
+        }),
+      );
+      assert.isFalse(
+        flavor.subagentsIdleOnTurnCompletion({
+          protocolVersion: 1,
+          agentInfo: { name: "antigravity-acp", version: "1.5.9" },
+        }),
+      );
+    }
     assert.isTrue(flavor.deferMcpTools);
-    assert.isUndefined(flavor.deferFinalizeForBackgroundWork);
+    assert.isTrue(flavor.deferFinalizeForBackgroundWork);
     assert.isTrue(flavor.enablePostSettleContinuation);
     assert.isTrue(flavor.promptOnEmptyContinuationWake);
 
@@ -2567,6 +2581,203 @@ describe("AntigravityAdapterV2 background command continuation", () => {
         assert.isTrue(secondTerminal._tag === "Some");
         assert.isAbove(promptCalls.length, promptCountBefore);
         assert.isFalse(yield* session.hasPendingBackgroundWork!);
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.live(
+    "keeps 1.5.9 subagents running after prompt settlement and prompts continuation when they finish",
+    () =>
+      Effect.gen(function* () {
+        const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const path = yield* Path.Path;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-agy-sub-bg-" });
+        const sessionId = "mock-session-1";
+        const { profile } = yield* makeProfile({
+          sessionId,
+          steps: (logUri) => [
+            [1, 15, plannerStep(["call-reader"])],
+            [
+              2,
+              132,
+              invokeStep({
+                stepType: 132,
+                callId: "call-reader",
+                launches: [LAUNCH],
+                children: [{ id: CHILD, logUri }],
+              }),
+            ],
+          ],
+        });
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        const crypto = yield* SecureRandom.SecureRandom;
+        const continuationRequests: Array<ProviderContinuationRequests.ProviderContinuationRequest> =
+          [];
+        const continuationOffered = yield* Deferred.make<void>();
+        const firstPromptSettled = yield* Deferred.make<void>();
+        const promptCalls: Array<string> = [];
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+        const instanceId = ProviderInstanceId.make("antigravity-sub-bg-test");
+        const adapter = yield* makeAntigravityAdapterV2({
+          instanceId,
+          profileDirectory: profile,
+          selfInvocation: yield* resolveSelfInvocation(),
+          continuationRequests: {
+            offer: (request) =>
+              Effect.sync(() => {
+                continuationRequests.push(request);
+              }).pipe(Effect.andThen(Deferred.succeed(continuationOffered, undefined))),
+          },
+          makeRuntime: (input) =>
+            makeAntigravityAcpRuntime({
+              ...input,
+              runtimeVersion: "1.5.9",
+              childProcessSpawner,
+              spawn: {
+                command: process.execPath,
+                args: [mockAgentPath],
+                cwd: input.cwd,
+                env: { T3_ACP_ANTIGRAVITY: "1", T3_ACP_AGENT_VERSION: "1.5.9" },
+              },
+            }).pipe(
+              Effect.provideService(SecureRandom.SecureRandom, crypto),
+              Effect.map((runtime): RuntimeService => ({
+                ...runtime,
+                handleSessionUpdate: (handler) =>
+                  Effect.sync(() => {
+                    sessionUpdate = handler;
+                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+                prompt: (payload, promptOptions) =>
+                  Effect.gen(function* () {
+                    promptCalls.push("session/prompt");
+                    if (promptCalls.length === 1) {
+                      if (sessionUpdate === undefined) {
+                        return yield* Effect.die("the adapter must handle updates");
+                      }
+                      yield* sessionUpdate(
+                        normalizeAntigravitySessionUpdate({
+                          sessionId,
+                          update: {
+                            sessionUpdate: "tool_call",
+                            toolCallId: "call-reader",
+                            title: "Running invoke_subagent",
+                            kind: "other",
+                            status: "in_progress",
+                            rawInput: { Role: LAUNCH.role, Prompt: LAUNCH.prompt },
+                          },
+                        }),
+                      );
+                    }
+                    const response = yield* runtime.prompt(payload, promptOptions);
+                    if (promptCalls.length === 1) {
+                      yield* Deferred.succeed(firstPromptSettled, undefined);
+                    }
+                    return response;
+                  }),
+              })),
+            ),
+          withProcess: (_stop, task) => task,
+          defaultModel: Effect.undefined,
+        });
+        const threadId = ThreadId.make("thread-antigravity-sub-bg");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: directory,
+        });
+        const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+        const session = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-antigravity-sub-bg"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* session.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        yield* session.events.pipe(
+          Stream.runForEach((event) => Queue.offer(events, event)),
+          Effect.forkChild,
+        );
+        const turn = makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          runtimePolicy,
+          modelSelection,
+          now: yield* DateTime.now,
+        });
+        yield* session.startTurn(turn);
+        yield* Deferred.await(firstPromptSettled);
+
+        const earlyEvents: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        while (
+          !earlyEvents.some(
+            (event) => event.type === "subagent.updated" && event.subagent.status === "running",
+          )
+        ) {
+          earlyEvents.push(yield* Queue.take(events));
+        }
+        earlyEvents.push(...Array.from(yield* Queue.takeAll(events)));
+        assert.isFalse(
+          earlyEvents.some(
+            (event) => event.type === "subagent.updated" && event.subagent.status === "idle",
+          ),
+          "1.5.9 subagents must stay running in Lineage after session/prompt settles",
+        );
+        assert.isFalse(
+          earlyEvents.some((event) => event.type === "turn.terminal"),
+          "foreground turn must wait for running 1.5.9 subagents before finalizing",
+        );
+
+        const database = new NodeSqlite.DatabaseSync(
+          path.join(profile, "antigravity-acp", "conversations", `${sessionId}.db`),
+        );
+        database.prepare("INSERT INTO steps (idx,step_type,step_payload) VALUES (3,101,?)").run(
+          agentReportStep({
+            recipientSessionId: sessionId,
+            senderConversationId: CHILD,
+            text: "reader finished",
+          }),
+        );
+        database.close();
+
+        const completionEvents: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
+        while (!completionEvents.some((event) => event.type === "turn.terminal")) {
+          completionEvents.push(yield* Queue.take(events));
+        }
+        assert.isTrue(
+          completionEvents.some(
+            (event) => event.type === "subagent.updated" && event.subagent.status === "completed",
+          ),
+        );
+        yield* Deferred.await(continuationOffered);
+        assert.lengthOf(continuationRequests, 1);
+
+        const promptCountBefore = promptCalls.length;
+        yield* session.startTurn({
+          ...turn,
+          runId: RunId.make("run:antigravity-sub-bg:2"),
+          runOrdinal: 2,
+          providerTurnOrdinal: 2,
+          message: {
+            ...turn.message,
+            messageId: MessageId.make("sub-bg-continuation-msg"),
+            createdBy: "agent",
+            creationSource: "provider",
+            text: "Background task completed.",
+          },
+        });
+        while ((yield* Queue.take(events)).type !== "turn.terminal") {
+          // drain until second turn completes
+        }
+        assert.isAbove(promptCalls.length, promptCountBefore);
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });

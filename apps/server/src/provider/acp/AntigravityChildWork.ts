@@ -1485,10 +1485,12 @@ export function makeAntigravitySubagentTracker(profileDirectory: string | undefi
           (batch) => batch.rootSessionId === rootSessionId && !batch.completed,
         );
         if (activeBatches.length > 0) {
-          const isToolUpdate =
-            update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update";
+          const isImmediateSync =
+            update.sessionUpdate === "tool_call" ||
+            update.sessionUpdate === "tool_call_update" ||
+            update.sessionUpdate === "session_info_update";
           const now = yield* Clock.currentTimeMillis;
-          if (isToolUpdate || lastChunkSyncAt === undefined || now - lastChunkSyncAt >= 200) {
+          if (isImmediateSync || lastChunkSyncAt === undefined || now - lastChunkSyncAt >= 200) {
             lastChunkSyncAt = now;
             yield* syncSubagentsFromDb(rootSessionId, {
               includeBatches: activeBatches.some(batchNeedsDbSync),

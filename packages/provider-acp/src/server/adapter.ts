@@ -496,7 +496,9 @@ export interface AcpAdapterV2Flavor {
   readonly onSessionEvent?: (
     event: AcpSessionRuntime.AcpSessionRuntimeEvent,
   ) => Effect.Effect<void>;
-  readonly subagentsIdleOnTurnCompletion?: boolean;
+  readonly subagentsIdleOnTurnCompletion?:
+    | boolean
+    | ((initializeResult: EffectAcpSchema.InitializeResponse) => boolean);
   readonly supportsCompaction?: boolean;
   /** Sends `/compact` as a prompt, only to sessions whose advertised commands include `compact`. */
   readonly compactViaAdvertisedCommand?: boolean;
@@ -4319,7 +4321,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           /Monitor\s+["']?[0-9a-f-]{8,}/i.test(text) && /ended/i.test(text);
 
         const hasDeferredBackgroundWork = (context: ActiveAcpTurn): boolean => {
-          if (sessionsWithPendingBackgroundTasks.has(context.nativeThreadId)) return true;
           if (context.awaitingBackgroundHydration.size > 0) return true;
           if (context.pendingInjectedReport.size > 0) return true;
           for (const [taskId, toolCallId] of context.toolCallIdsByBackgroundTaskId) {
@@ -8323,7 +8324,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             yield* Fiber.interrupt(watchdog).pipe(Effect.forkDetach, Effect.asVoid);
           }
           const directStopQuarantine = yield* Ref.get(stoppedRunQuarantine);
-          if (flavor.subagentsIdleOnTurnCompletion === true) {
+          const setup = yield* Ref.get(activeSessionSetup);
+          const subagentsIdleOnTurnCompletion =
+            typeof flavor.subagentsIdleOnTurnCompletion === "function"
+              ? setup !== null && flavor.subagentsIdleOnTurnCompletion(setup.initializeResult)
+              : flavor.subagentsIdleOnTurnCompletion === true;
+          if (subagentsIdleOnTurnCompletion) {
             for (const subagent of context.subagents.values()) {
               if (!acpSubagentStatusBlocksTurnSettlement(subagent.task.status)) continue;
               yield* emitSubagent(context, {
@@ -9115,7 +9121,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               }
               context.promptSettled = true;
               context.promptSettledStatus = "completed";
-              if (drainedWakeCount === 0 && flavor.promptOnEmptyContinuationWake === true) {
+              if (
+                flavor.promptOnEmptyContinuationWake === true &&
+                (drainedWakeCount === 0 ||
+                  (context.assistant.current === null &&
+                    context.assistant.closedNamedSegments.size === 0))
+              ) {
                 promptParts = yield* resolvePromptParts(turnInput, requestedSessionId);
                 context.promptSettled = false;
                 context.promptSettledStatus = null;
@@ -9133,7 +9144,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   return;
                 }
                 if (!context.finalized) {
-                  if (hasDeferredBackgroundWork(context)) {
+                  if (flavor.deferFinalizeForBackgroundWork !== true) {
+                    yield* finalizeTurn(context, "completed");
+                  } else if (hasDeferredBackgroundWork(context)) {
                     yield* rearmDeferredFinalize(context);
                   } else {
                     yield* scheduleDeferredFinalize(context);
