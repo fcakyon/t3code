@@ -1,19 +1,20 @@
 # t3code-fcakyon changelog
 
-- fix: Restore Antigravity 1.5.9 `edit_file` diff previews, qualified release capabilities, and git worktree `.git` access
-- fix: Keep Antigravity 1.5 subagents running in Lineage after prompt settlement and wake continuation on completion
-- fix: Complete Antigravity foreground turns on prompt settlement while keeping background command tracking and safe post-settlement steer handling
-- fix: Complete Antigravity 1.5 subagents from native reports and discover background commands before turn settlement
-- fix: Track Antigravity 1.5 native invoke_subagent runs in Lineage
-- fix: Expose deferred MCP tools and T3_ACP_MCP_NODE to Antigravity sessions
-- fix: Keep Antigravity turns running during background tasks and continue on completion
-- feat: Map Auto runtime mode to full access for Antigravity
-- fix: Limit agent capabilities usage pace to non-Fable weekly windows
-- fix: Show managed Antigravity updates beside the provider version
-- build: Sync upstream through [`47f90ee2e9`](https://github.com/pingdotgg/t3code/commit/47f90ee2e9) and keep fork release and Antigravity patches
-- build: Sync upstream through [`6b7027b1f4`](https://github.com/pingdotgg/t3code/commit/6b7027b1f4) and keep Antigravity prompt steering with Grok attachment steering
-- feat: Share native usage pace with agents and Stream Deck
-- build: Sync upstream through [`26b63a44f9`](https://github.com/pingdotgg/t3code/commit/26b63a44f9)
+- fix: Restore Antigravity 1.5.9 `edit_file` diff previews, qualified release capabilities, and git worktree `.git` access ([`e20aeaa67d`](https://github.com/fcakyon/t3code/commit/e20aeaa67d))
+- fix: Keep Antigravity 1.5 subagents running in Lineage after prompt settlement and wake continuation on completion ([`7b1e31f8e3`](https://github.com/fcakyon/t3code/commit/7b1e31f8e3))
+- fix: Complete Antigravity foreground turns on prompt settlement while keeping background command tracking and safe post-settlement steer handling ([`e2b1eceab7`](https://github.com/fcakyon/t3code/commit/e2b1eceab7))
+- fix: Complete Antigravity 1.5 subagents from native reports and discover background commands before turn settlement ([`f58a00e58b`](https://github.com/fcakyon/t3code/commit/f58a00e58b))
+- fix: Read macOS Keychain OAuth tokens for Antigravity usage limits ([`744147d9f6`](https://github.com/fcakyon/t3code/commit/744147d9f6))
+- fix: Track Antigravity 1.5 native invoke_subagent runs in Lineage ([`e1b49400fe`](https://github.com/fcakyon/t3code/commit/e1b49400fe))
+- fix: Expose deferred MCP tools and T3_ACP_MCP_NODE to Antigravity sessions ([`b266b35ced`](https://github.com/fcakyon/t3code/commit/b266b35ced), [`7d070d92ff`](https://github.com/fcakyon/t3code/commit/7d070d92ff))
+- fix: Keep Antigravity turns running during background tasks and continue on completion ([`84b933553c`](https://github.com/fcakyon/t3code/commit/84b933553c))
+- feat: Map Auto runtime mode to full access for Antigravity ([`84b933553c`](https://github.com/fcakyon/t3code/commit/84b933553c))
+- fix: Limit agent capabilities usage pace to non-Fable weekly windows ([`84b933553c`](https://github.com/fcakyon/t3code/commit/84b933553c))
+- fix: Show managed Antigravity updates beside the provider version ([`53de663bb1`](https://github.com/fcakyon/t3code/commit/53de663bb1))
+- build: Sync upstream through [`47f90ee2e9`](https://github.com/pingdotgg/t3code/commit/47f90ee2e9) and keep fork release and Antigravity patches ([`297463e283`](https://github.com/fcakyon/t3code/commit/297463e283))
+- build: Sync upstream through [`6b7027b1f4`](https://github.com/pingdotgg/t3code/commit/6b7027b1f4) and keep Antigravity prompt steering with Grok attachment steering ([`f6e52ff1aa`](https://github.com/fcakyon/t3code/commit/f6e52ff1aa))
+- feat: Share native usage pace with agents and Stream Deck ([`f96aad41f0`](https://github.com/fcakyon/t3code/commit/f96aad41f0))
+- build: Sync upstream through [`26b63a44f9`](https://github.com/pingdotgg/t3code/commit/26b63a44f9) ([`63ed319c9b`](https://github.com/fcakyon/t3code/commit/63ed319c9b))
 - fix: Upgrade managed Antigravity before new sessions ([`848690d39e`](https://github.com/fcakyon/t3code/commit/848690d39e))
 - fix: Rename the fork changelog heading ([`0f26bb3f04`](https://github.com/fcakyon/t3code/commit/0f26bb3f04))
 - fix: Use a flat fork changelog ([`8afbdfa141`](https://github.com/fcakyon/t3code/commit/8afbdfa141))
