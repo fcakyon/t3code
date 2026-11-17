@@ -32,6 +32,36 @@ describe("toolActivity", () => {
     expect(
       mergeToolActivityData({ rawInput: { path: "src/a.ts" } }, { rawInput: { startLine: 4 } }),
     ).toEqual({ rawInput: { startLine: 4 } });
+    expect(
+      mergeToolActivityData(
+        {
+          content: [
+            { type: "diff", path: "src/a.ts", patch: { text: "@@ -1,1 +1,1 @@\n-a\n+b\n" } },
+          ],
+        },
+        {
+          content: [{ type: "diff", path: "src/a.ts", oldText: "a\n", newText: "b\n" }],
+        },
+      ),
+    ).toEqual({
+      content: [
+        {
+          type: "diff",
+          path: "src/a.ts",
+          oldText: "a\n",
+          newText: "b\n",
+          patch: { text: "@@ -1,1 +1,1 @@\n-a\n+b\n" },
+        },
+      ],
+    });
+    expect(
+      mergeToolActivityData(
+        { content: [{ type: "diff", path: "src/a.ts", patch: { format: "omitted" } }] },
+        { content: [{ type: "diff", path: "src/a.ts", oldText: "", newText: "created\n" }] },
+      ),
+    ).toEqual({
+      content: [{ type: "diff", path: "src/a.ts", oldText: "", newText: "created\n" }],
+    });
   });
 
   it("recognizes computer-use REPL calls before result metadata exists", () => {

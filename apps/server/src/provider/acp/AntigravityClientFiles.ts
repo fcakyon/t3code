@@ -6,6 +6,41 @@ import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/compat";
 
 const CLIENT_FILE_MAX_BYTES = 8 * 1024 * 1024;
+const GIT_FILE_MAX_BYTES = 4096;
+
+/**
+ * In a git worktree, `<cwd>/.git` is a file containing `gitdir: <path>` that points to
+ * `<repo>/.git/worktrees/<name>` outside `<cwd>`. Include that directory in workspace roots
+ * so reading `.git/HEAD` or worktree refs does not fail workspace containment checks.
+ */
+export const resolveGitWorktreeDirectory = Effect.fn(
+  "AntigravityClientFiles.resolveGitWorktreeDirectory",
+)(function* (input: {
+  readonly fileSystem: FileSystem.FileSystem;
+  readonly path: Path.Path;
+  readonly cwd: string | null | undefined;
+}): Effect.fn.Return<string | undefined> {
+  const cwd = input.cwd?.trim();
+  if (!cwd) return undefined;
+  const dotGit = input.path.join(cwd, ".git");
+  const info = yield* input.fileSystem.stat(dotGit).pipe(Effect.option);
+  if (
+    Option.isNone(info) ||
+    info.value.type !== "File" ||
+    Number(info.value.size) > GIT_FILE_MAX_BYTES
+  ) {
+    return undefined;
+  }
+  const content = yield* input.fileSystem.readFileString(dotGit, "utf8").pipe(Effect.option);
+  if (Option.isNone(content)) return undefined;
+  const match = /^gitdir:\s*(.+?)\s*$/m.exec(content.value);
+  const gitdir = match?.[1]?.trim();
+  if (!gitdir) return undefined;
+  const resolved = input.path.resolve(cwd, gitdir);
+  const dirInfo = yield* input.fileSystem.stat(resolved).pipe(Effect.option);
+  if (Option.isNone(dirInfo) || dirInfo.value.type !== "Directory") return undefined;
+  return resolved;
+});
 
 function isInsideRoot(path: Path.Path, root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);

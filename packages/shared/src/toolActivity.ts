@@ -194,6 +194,28 @@ function extractPrimaryPath(data: Record<string, unknown> | undefined): string |
   return collectToolFilePaths(data)[0];
 }
 
+function mergeToolContent(previous: unknown, next: unknown): unknown {
+  if (!Array.isArray(previous) || !Array.isArray(next)) {
+    return next;
+  }
+  return next.map((entry) => {
+    const nextEntry = asRecord(entry);
+    if (!nextEntry || nextEntry.type !== "diff" || nextEntry.patch !== undefined) {
+      return entry;
+    }
+    const previousDiff = previous
+      .map(asRecord)
+      .find(
+        (candidate) =>
+          candidate?.type === "diff" &&
+          candidate.path === nextEntry.path &&
+          candidate.patch !== undefined &&
+          asRecord(candidate.patch)?.format !== "omitted",
+      );
+    return previousDiff ? { ...nextEntry, patch: previousDiff.patch } : entry;
+  });
+}
+
 /**
  * A null field clears it (ACP v2) and a nonempty rawInput replaces the previous one.
  * An empty rawInput keeps the previous one; later ACP updates often resend an empty object.
@@ -212,6 +234,9 @@ export function mergeToolActivityData(
     if (value === null) {
       delete merged[key];
     }
+  }
+  if (previousRecord && nextRecord.content !== undefined && nextRecord.content !== null) {
+    merged.content = mergeToolContent(previousRecord.content, nextRecord.content);
   }
   if (!previousRecord || nextRecord.rawInput === null) {
     return merged;

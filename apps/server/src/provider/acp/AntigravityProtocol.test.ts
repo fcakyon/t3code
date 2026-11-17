@@ -360,6 +360,88 @@ describe("Antigravity tool results", () => {
         `--- ${path}\n+++ ${path}\n@@ -10,1 +10,1 @@\n-const target = 10;\n+const target = 100;\n`,
       );
     }
+    // 1.5+ edit_file announces a pending call with no content and completes with full-file oldText/newText.
+    const pending159 = parseToolUpdate(
+      normalizeAntigravitySessionUpdate({
+        sessionId: "session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "edit-159",
+          title: "Running edit_file",
+          kind: "edit",
+          status: "pending",
+          locations: [{ path }],
+          rawInput: {
+            Path: path,
+            Target: replace.TargetContent,
+            Replacement: replace.ReplacementContent,
+          },
+        },
+      }),
+    ).toolCall;
+    const largePadding = `${"const filler = 0;\n".repeat(600)}`;
+    const completed159 = parseToolUpdate(
+      normalizeAntigravitySessionUpdate({
+        sessionId: "session-1",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "edit-159",
+          kind: "edit",
+          status: "completed",
+          title: "Running edit_file",
+          locations: [{ path }],
+          rawInput: {
+            Path: path,
+            Target: replace.TargetContent,
+            Replacement: replace.ReplacementContent,
+          },
+          rawOutput: `Edited ${path}`,
+          content: [
+            {
+              type: "diff",
+              path,
+              oldText: `${largePadding}${preEdit}`,
+              newText: `${largePadding}${postEdit}`,
+            },
+          ],
+        },
+      }),
+    ).toolCall;
+    let edit159 = normalizeAntigravityToolCall(pending159, () => preEdit);
+    edit159 = normalizeAntigravityToolCall(
+      mergeToolCallState(edit159, completed159),
+      () => postEdit,
+    );
+    expect(edit159.status).toBe("completed");
+    expect(acpToolCallDiffPatch(edit159.data.content)).toBe(
+      `--- ${path}\n+++ ${path}\n@@ -10,1 +10,1 @@\n-const target = 10;\n+const target = 100;\n`,
+    );
+    // Replaying a completed 1.5+ edit_file with non-truncated oldText locates the hunk from oldText.
+    const replayed159 = normalizeAntigravityToolCall(
+      parseToolUpdate(
+        normalizeAntigravitySessionUpdate({
+          sessionId: "session-1",
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "edit-159-replay",
+            title: "Running edit_file",
+            kind: "edit",
+            status: "completed",
+            locations: [{ path }],
+            rawInput: {
+              Path: path,
+              Target: replace.TargetContent,
+              Replacement: replace.ReplacementContent,
+            },
+            content: [{ type: "diff", path, oldText: preEdit, newText: postEdit }],
+          },
+        }),
+      ).toolCall,
+      () => postEdit,
+    );
+    expect(acpToolCallDiffPatch(replayed159.data.content)).toBe(
+      `--- ${path}\n+++ ${path}\n@@ -10,1 +10,1 @@\n-const target = 10;\n+const target = 100;\n`,
+    );
     // Full-access edits arrive path-only; no hunk is offered instead of the tool's status text.
     let pathOnly = normalizeAntigravityToolCall(
       parseToolUpdate({

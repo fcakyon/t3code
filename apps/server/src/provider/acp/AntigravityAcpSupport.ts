@@ -79,12 +79,15 @@ function antigravityWritesRunWorkflowSkill(version: string | null | undefined): 
   );
 }
 
+const QUALIFIED_ANTIGRAVITY_RELEASES = new Set(["1.4.5", "1.5.9"]);
+
 /**
- * Releases T3 qualified for native range reads and linked video. On 1.4.5 the client-read path
- * sends a whole file to serve one line, and the native reader keeps diff edits.
+ * Releases T3 qualified for native range reads and linked video. On 1.4.5 and 1.5.9 the
+ * client-read path sends a whole file to serve one line, and the native reader keeps diff edits.
  */
 export function isQualifiedAntigravityRelease(version: string | null | undefined): boolean {
-  return version?.trim() === "1.4.5";
+  const trimmed = version?.trim();
+  return trimmed !== undefined && QUALIFIED_ANTIGRAVITY_RELEASES.has(trimmed);
 }
 
 // `agy acp` 1.5.1 offers every model to every ACP client; older runtimes allowlist editors.

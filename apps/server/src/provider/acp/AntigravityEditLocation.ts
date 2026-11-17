@@ -39,11 +39,15 @@ const decodeEditInput = Schema.decodeUnknownOption(
   ]),
 );
 const decodeLocations = Schema.decodeUnknownOption(Schema.Array(Schema.Struct({ line: Line })));
-// The runtime accepts edit arguments in either casing.
+// The runtime accepts edit arguments in either casing; 1.5+ edit_file uses Target and Replacement.
 const PASCAL_KEYS: Readonly<Record<string, string>> = {
   replacement_chunks: "ReplacementChunks",
   target_content: "TargetContent",
+  Target: "TargetContent",
+  target: "TargetContent",
   replacement_content: "ReplacementContent",
+  Replacement: "ReplacementContent",
+  replacement: "ReplacementContent",
   start_line: "StartLine",
   end_line: "EndLine",
 };
@@ -56,7 +60,12 @@ const pascalKeys = (value: unknown): unknown => {
     const pascal = PASCAL_KEYS[key];
     // Like the runtime, a present PascalCase value wins over its snake_case alias.
     if (pascal === undefined) result[key] ??= pascalKeys(entry);
-    else if (fields[pascal] == null) result[pascal] = pascalKeys(entry);
+    else if (fields[pascal] == null) {
+      const upperAlias = `${key[0]?.toUpperCase() ?? ""}${key.slice(1)}`;
+      if (upperAlias === key || fields[upperAlias] == null) {
+        result[pascal] = pascalKeys(entry);
+      }
+    }
   }
   return result;
 };

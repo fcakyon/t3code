@@ -42,7 +42,10 @@ import {
   makeAntigravitySubagentTracker,
   makeAntigravityCommandTaskTracker,
 } from "../../provider/acp/AntigravityChildWork.ts";
-import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
+import {
+  readAntigravityClientTextFile,
+  resolveGitWorktreeDirectory,
+} from "../../provider/acp/AntigravityClientFiles.ts";
 import {
   cancelStaleAntigravityRunningSteps,
   watchAntigravityPromptOutcome,
@@ -237,11 +240,28 @@ export function makeAntigravityAcpAdapterFlavor(
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
   const commandTasks = makeAntigravityCommandTaskTracker(profileDirectory);
-  const antigravityClientFileRoots = (cwd: string | null) =>
-    cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
+  const antigravityClientFileRoots = Effect.fn("AntigravityAdapterV2.antigravityClientFileRoots")(
+    function* (cwd: string | null) {
+      const worktreeGitDir = yield* resolveGitWorktreeDirectory({
+        fileSystem: options.fileSystem,
+        path: options.path,
+        cwd,
+      });
+      return [
+        ...(cwd === null ? [] : [cwd]),
+        options.host.paths.attachmentsDir,
+        ...(worktreeGitDir === undefined ? [] : [worktreeGitDir]),
+      ];
+    },
+  );
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
       const scope = yield* Scope.fork(yield* Effect.scope);
+      const worktreeGitDir = yield* resolveGitWorktreeDirectory({
+        fileSystem: options.fileSystem,
+        path: options.path,
+        cwd: input.cwd,
+      });
       const runtime = yield* options
         .withProcess(
           Scope.close(scope, Exit.void),
@@ -249,7 +269,10 @@ export function makeAntigravityAcpAdapterFlavor(
             ...input,
             clientFileReads: true,
             sessionSystemPromptAppend: PULL_REQUEST_LINKING_INSTRUCTIONS,
-            additionalDirectories: [options.host.paths.attachmentsDir],
+            additionalDirectories: [
+              options.host.paths.attachmentsDir,
+              ...(worktreeGitDir === undefined ? [] : [worktreeGitDir]),
+            ],
           }),
         )
         .pipe(Effect.provideService(Scope.Scope, scope));
@@ -420,12 +443,16 @@ export function makeAntigravityAcpAdapterFlavor(
     runtimeModeForSessionMode: antigravityRuntimeModeForSessionMode,
     clientFileSystem: {
       readTextFile: (request, cwd) =>
-        readAntigravityClientTextFile({
-          fileSystem: options.fileSystem,
-          path: options.path,
-          allowedRoots: antigravityClientFileRoots(cwd),
-          request,
-        }),
+        antigravityClientFileRoots(cwd).pipe(
+          Effect.flatMap((allowedRoots) =>
+            readAntigravityClientTextFile({
+              fileSystem: options.fileSystem,
+              path: options.path,
+              allowedRoots,
+              request,
+            }),
+          ),
+        ),
     },
     approvalOptions: antigravityApprovalOptions,
     extractPermissionQuestion: (request) => {

@@ -795,6 +795,14 @@ describe("AntigravityAdapterV2 client file system", () => {
       });
       const outsideFile = path.join(outside, "secret.txt");
       yield* fileSystem.writeFileString(outsideFile, "secret");
+      const worktreeGitDir = path.join(outside, "repo-git", "worktrees", "wt-1");
+      yield* fileSystem.makeDirectory(worktreeGitDir, { recursive: true });
+      const worktreeHead = path.join(worktreeGitDir, "HEAD");
+      yield* fileSystem.writeFileString(worktreeHead, "ref: refs/heads/nightly\n");
+      yield* fileSystem.writeFileString(
+        path.join(workspace, ".git"),
+        `gitdir: ${worktreeGitDir}\n`,
+      );
       const attachment = path.join(host.paths.attachmentsDir, "pasted.txt");
       yield* fileSystem.writeFileString(attachment, "pasted");
 
@@ -812,22 +820,31 @@ describe("AntigravityAdapterV2 client file system", () => {
         runtimePolicy,
       });
       yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
-      const initialize = (yield* fileSystem.readFileString(requestLog))
+      const requests = (yield* fileSystem.readFileString(requestLog))
         .trim()
         .split("\n")
         .map(
           (line) =>
             JSON.parse(line) as {
               method?: string;
-              params?: { clientCapabilities?: { fs?: unknown }; clientInfo?: { name?: string } };
+              params?: {
+                additionalDirectories?: ReadonlyArray<string>;
+                clientCapabilities?: { fs?: unknown };
+                clientInfo?: { name?: string };
+              };
             },
-        )
-        .find((request) => request.method === "initialize");
+        );
+      const initialize = requests.find((request) => request.method === "initialize");
+      const sessionNew = requests.find((request) => request.method === "session/new");
       assert.deepEqual(initialize?.params?.clientCapabilities?.fs, {
         readTextFile: true,
         writeTextFile: false,
       });
       assert.equal(initialize?.params?.clientInfo?.name, "zed");
+      assert.deepEqual(sessionNew?.params?.additionalDirectories, [
+        host.paths.attachmentsDir,
+        worktreeGitDir,
+      ]);
       assert.isUndefined(writeTextFile);
       if (readTextFile === undefined) {
         return yield* Effect.die("Antigravity sessions must serve client file reads");
@@ -842,6 +859,11 @@ describe("AntigravityAdapterV2 client file system", () => {
         context("fs/read_text_file"),
       );
       assert.equal(pasted.content, "pasted");
+      const gitHead = yield* readTextFile(
+        { sessionId: "mock-session-1", path: worktreeHead },
+        context("fs/read_text_file"),
+      );
+      assert.equal(gitHead.content, "ref: refs/heads/nightly\n");
       yield* fileSystem.writeFileString(insidePath, "\uFEFFfirst\né中🙂\nlast");
       const sliced = yield* readTextFile(
         { sessionId: "mock-session-1", path: insidePath, line: 2, limit: 1 },
