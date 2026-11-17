@@ -4,6 +4,7 @@ import {
   type OrchestratorMcpDelegateTaskInput,
   type OrchestratorMcpInteractionMode,
   type OrchestratorMcpRuntimeMode,
+  type ProviderDriverKind,
   type ProviderInteractionMode,
   type RuntimeMode,
 } from "@t3tools/contracts";
@@ -37,12 +38,18 @@ export function resolveRuntimeMode(
   parentMode: RuntimeMode,
   requested: OrchestratorMcpRuntimeMode | undefined,
   target?: {
+    readonly driver?: ProviderDriverKind;
     readonly modelSelection: ModelSelection;
     readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
   },
 ): Effect.Effect<RuntimeMode, OrchestratorMcpFailure> {
   const inherited = requested === undefined || requested === "inherit";
-  const resolved = inherited ? parentMode : requested;
+  const requestedMode = inherited ? parentMode : requested;
+  // Nightly's Antigravity adapter runs Auto and Full access in the same native mode.
+  const resolved =
+    parentMode === "auto" && requestedMode === "full-access" && target?.driver === "antigravity"
+      ? "auto"
+      : requestedMode;
   if (runtimeModeRank(resolved) > runtimeModeRank(parentMode)) {
     return Effect.fail(
       new OrchestratorMcpFailure({

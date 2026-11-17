@@ -164,6 +164,7 @@ const THREAD_PULL_REQUEST_PREVIEW_LIMIT = 5;
 const THREAD_READ_RESULT_MAX_BYTES = 30_000;
 
 interface ResolvedTarget {
+  readonly driver: ServerProvider["driver"];
   readonly modelSelection: ModelSelection;
   readonly supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined;
 }
@@ -1667,6 +1668,7 @@ const make = Effect.gen(function* () {
       options = [...selections.values()];
     }
     return {
+      driver: provider.driver,
       modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
       supportedRuntimeModes: provider.supportedRuntimeModes,
     };

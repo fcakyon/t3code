@@ -4505,6 +4505,28 @@ describe("OrchestratorMcpService provider resolution", () => {
       supportedRuntimeModes: ["approval-required", "full-access"] as const,
     };
 
+    it.effect("accepts Antigravity full access from an Auto parent", () =>
+      Effect.gen(function* () {
+        const target = {
+          driver: ProviderDriverKind.make("antigravity"),
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("custom-agy"),
+            model: "gemini-4-hydrogen",
+          },
+          supportedRuntimeModes: ["approval-required", "auto", "full-access"] as const,
+        };
+        assert.equal(yield* resolveRuntimeMode("auto", "full-access", target), "auto");
+        const error = yield* resolveRuntimeMode("auto-accept-edits", "full-access", target).pipe(
+          Effect.flip,
+        );
+        assert.equal(error.code, "runtime_mode_escalation_denied");
+        const otherDriver = yield* resolveRuntimeMode("auto", "full-access", muse).pipe(
+          Effect.flip,
+        );
+        assert.equal(otherDriver.code, "runtime_mode_escalation_denied");
+      }),
+    );
+
     it.effect("refuses an explicit mode the target provider does not offer", () =>
       Effect.gen(function* () {
         const error = yield* resolveRuntimeMode("full-access", "auto-accept-edits", muse).pipe(

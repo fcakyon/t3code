@@ -1,5 +1,6 @@
 # t3code-fcakyon changelog
 
+- fix: Allow Auto threads to launch local Antigravity subagents with Full Access
 - fix: Restore Antigravity 1.5.9 `edit_file` diff previews, qualified release capabilities, and git worktree `.git` access ([`e20aeaa67d`](https://github.com/fcakyon/t3code/commit/e20aeaa67d))
 - fix: Keep Antigravity 1.5 subagents running in Lineage after prompt settlement and wake continuation on completion ([`7b1e31f8e3`](https://github.com/fcakyon/t3code/commit/7b1e31f8e3))
 - fix: Complete Antigravity foreground turns on prompt settlement while keeping background command tracking and safe post-settlement steer handling ([`e2b1eceab7`](https://github.com/fcakyon/t3code/commit/e2b1eceab7))
