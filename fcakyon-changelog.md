@@ -1,5 +1,7 @@
 # t3code-fcakyon changelog
 
+- build: Sync upstream through [`055b44919e`](https://github.com/pingdotgg/t3code/commit/055b44919e) and retain Antigravity setup, background tasks, and usage summaries with upstream translations
+- fix: Use the test runner’s Node executable in SSH reconnect fixtures
 - fix: Allow Auto threads to launch local Antigravity subagents with Full Access
 - fix: Restore Antigravity 1.5.9 `edit_file` diff previews, qualified release capabilities, and git worktree `.git` access ([`e20aeaa67d`](https://github.com/fcakyon/t3code/commit/e20aeaa67d))
 - fix: Keep Antigravity 1.5 subagents running in Lineage after prompt settlement and wake continuation on completion ([`7b1e31f8e3`](https://github.com/fcakyon/t3code/commit/7b1e31f8e3))

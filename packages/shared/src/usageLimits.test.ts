@@ -17,9 +17,7 @@ import {
   withUsageLimitsCommands,
   collectLimitAccounts,
   collectExternalUsageLinks,
-  collectLimitNotices,
   collectLimitPools,
-  collectUsageLimitsSummary,
   elapsedShare,
   exhaustedUsageWindow,
   paceOf,
@@ -27,6 +25,8 @@ import {
   usesChatGptSharing,
   resolveNewThreadModelSelection,
 } from "./usageLimits.ts";
+import { collectLimitNotices } from "./usageLimitsCopy.ts";
+import { collectUsageLimitsSummary } from "./usageLimitsSummary.ts";
 
 const now = Date.parse("2026-09-03T12:00:00.000Z");
 
@@ -1189,7 +1189,14 @@ describe("usage summary", () => {
     expect(summary.notices).toEqual([]);
     const hubSummary = collectUsageLimitsSummary(
       environmentId,
-      [{ ...native, usageLimits: undefined }],
+      [
+        { ...native, usageLimits: undefined },
+        provider({
+          instanceId: ProviderInstanceId.make("unreported"),
+          displayName: "Unreported",
+          usageLimits: { checkedAt, windows: [] },
+        }),
+      ],
       [
         {
           id: UsageLimitSourceId.make("hub-summary"),
@@ -1209,6 +1216,7 @@ describe("usage summary", () => {
       now,
     );
     expect(hubSummary.pools[0]?.accounts[0]?.providerInstanceIds).toEqual([native.instanceId]);
+    expect(hubSummary.notices).toEqual(["Unreported: No limits reported."]);
   });
 });
 
