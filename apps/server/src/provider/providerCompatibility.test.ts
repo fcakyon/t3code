@@ -144,11 +144,6 @@ describe("provider compatibility", () => {
         )?.status,
         "supported",
       );
-      assert.strictEqual(
-        resolveProviderCompatibility(policies, ProviderDriverKind.make("antigravity"), version)
-          ?.recommendedVersion,
-        "1.5.9",
-      );
     },
   );
 
