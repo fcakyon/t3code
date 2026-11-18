@@ -26,8 +26,6 @@ export const validateAntigravityCallbackUrl = Effect.fn("validateAntigravityCall
     });
     const expected = new URL(pending.redirectUri);
     if (
-      callback.protocol !== "http:" ||
-      callback.hostname !== "127.0.0.1" ||
       callback.origin !== expected.origin ||
       callback.pathname !== expected.pathname ||
       callback.username !== "" ||

@@ -94,6 +94,15 @@ export interface AcpSpawnInput {
   readonly shell?: false;
 }
 
+export function sessionActivationMethod(
+  capabilities: EffectAcpSchema.InitializeResponse["agentCapabilities"],
+  preferred: AcpSessionRuntimeOptions["resumeMethod"],
+) {
+  const canResume = capabilities?.sessionCapabilities?.resume != null;
+  if (capabilities?.loadSession === true && (preferred !== "resume" || !canResume)) return "load";
+  return canResume ? "resume" : undefined;
+}
+
 export interface AcpSessionRuntimeOptions {
   readonly spawn: AcpSpawnInput;
   readonly cwd: string;
@@ -2254,10 +2263,11 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
       const additionalDirectories = sessionSetupFields(initializeResult);
       if (options.resumeSessionId) {
         sessionId = options.resumeSessionId;
-        if (
-          initializeResult.agentCapabilities?.loadSession === true &&
-          options.resumeMethod !== "resume"
-        ) {
+        const method = sessionActivationMethod(
+          initializeResult.agentCapabilities,
+          options.resumeMethod,
+        );
+        if (method === "load") {
           const loadPayload = {
             sessionId,
             cwd: options.cwd,
@@ -2265,7 +2275,7 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
             mcpServers: sessionMcpServers(initializeResult),
           } satisfies EffectAcpSchema.LoadSessionRequest;
           sessionSetupResult = yield* runLoadSessionWithReplayIdle(loadPayload, initializeResult);
-        } else if (initializeResult.agentCapabilities?.sessionCapabilities?.resume != null) {
+        } else if (method === "resume") {
           const resumePayload = {
             sessionId,
             cwd: options.cwd,

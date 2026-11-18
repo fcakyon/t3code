@@ -5,6 +5,7 @@ import type { AntigravityAuthMethod, ProviderInstanceId } from "@t3tools/contrac
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveNodeExecutable, nodeRuntimeUnavailableMessage } from "@t3tools/shared/nodeRuntime";
 import * as Digest from "effect/crypto/Digest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Hex from "effect/encoding/Hex";
 import * as FileSystem from "effect/FileSystem";
@@ -172,6 +173,11 @@ export interface AntigravityAuthorizationUrl {
   readonly redirectUri: string;
   readonly state: string;
 }
+
+export type AntigravityAuthorizationHandler = (
+  url: string,
+  submit?: (callback: URL) => Effect.Effect<void>,
+) => Effect.Effect<void, AcpErrors.AcpError>;
 
 function authSupportError(detail: string) {
   return new AcpErrors.AcpTransportError({ detail, cause: undefined });
@@ -556,9 +562,47 @@ export function buildAntigravityAcpSpawnInput(input: {
   };
 }
 
+export const runAntigravityCliLogin = Effect.fn("runAntigravityCliLogin")(
+  function* (
+    spawn: AcpSessionRuntime.AcpSpawnInput,
+    onAuthorizationUrl: AntigravityAuthorizationHandler,
+  ) {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const reply = yield* Deferred.make<string>();
+    const child = yield* spawner.spawn(
+      ChildProcess.make(spawn.command, [...spawn.args, "--login"], {
+        cwd: spawn.cwd,
+        env: spawn.env,
+        extendEnv: false,
+        stdin: Stream.fromEffect(Deferred.await(reply)).pipe(Stream.encodeText),
+        stderr: "ignore",
+      }),
+    );
+    yield* child.stdout.pipe(
+      Stream.decodeText(),
+      Stream.splitLines,
+      Stream.map((line) => line.trim()),
+      Stream.filter((line) => line.startsWith("https://")),
+      Stream.runForEach((url) =>
+        onAuthorizationUrl(url, (callback) =>
+          Deferred.succeed(reply, `${callback.href}\n`).pipe(Effect.asVoid),
+        ),
+      ),
+    );
+    if ((yield* child.exitCode) !== 0) {
+      return yield* authSupportError("Antigravity could not finish Google sign-in.");
+    }
+  },
+  Effect.scoped,
+  Effect.mapError((cause) =>
+    cause._tag === "PlatformError" ? authSupportError("Could not run Antigravity sign-in.") : cause,
+  ),
+);
+
 export const parseAntigravityAuthorizationUrl = Effect.fn("parseAntigravityAuthorizationUrl")(
   function* (
     authorizationUrl: string,
+    cliLogin = false,
   ): Effect.fn.Return<AntigravityAuthorizationUrl, AcpErrors.AcpError> {
     const invalidUrl = () =>
       authSupportError("Antigravity returned an invalid Google sign-in URL.");
@@ -570,7 +614,7 @@ export const parseAntigravityAuthorizationUrl = Effect.fn("parseAntigravityAutho
     const redirectUri = url.searchParams.get("redirect_uri");
     if (
       url.origin !== "https://accounts.google.com" ||
-      url.pathname !== "/o/oauth2/v2/auth" ||
+      url.pathname !== (cliLogin ? "/o/oauth2/auth" : "/o/oauth2/v2/auth") ||
       url.username !== "" ||
       url.password !== "" ||
       url.hash !== "" ||
@@ -583,12 +627,14 @@ export const parseAntigravityAuthorizationUrl = Effect.fn("parseAntigravityAutho
       state.length > 512 ||
       /\s/.test(state) ||
       redirectUri === null ||
-      !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/$/.test(redirectUri)
+      (cliLogin
+        ? redirectUri !== "https://antigravity.google/oauth-callback"
+        : !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/$/.test(redirectUri))
     ) {
       return yield* invalidUrl();
     }
     const redirect = yield* decodeUrl(redirectUri).pipe(Effect.mapError(invalidUrl));
-    if (Number(redirect.port) < 1_024) return yield* invalidUrl();
+    if (!cliLogin && Number(redirect.port) < 1_024) return yield* invalidUrl();
     return { authorizationUrl, redirectUri, state };
   },
 );

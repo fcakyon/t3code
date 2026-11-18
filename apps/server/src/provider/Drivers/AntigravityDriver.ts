@@ -41,6 +41,7 @@ import {
   isAntigravitySignInRequiredError,
   prepareAntigravityProfile,
   resolveAntigravityInstanceDirectories,
+  runAntigravityCliLogin,
   type AntigravityAuthConfig,
 } from "../antigravityAuthSupport.ts";
 import {
@@ -294,6 +295,23 @@ export const AntigravityDriver: ProviderDriver<
         threadEnvironment === undefined
           ? processEnvironment
           : { ...processEnvironment, ...threadEnvironment };
+      const spawn = buildAntigravityAcpSpawnInput({
+        installation: executable,
+        profile,
+        cwd: runtimeInput.cwd,
+        baseEnv: spawnEnvironment,
+        auth,
+        runtimeTempDirectory,
+      });
+      if (
+        input.onAuthorizationUrl &&
+        executable.harnessPath === null &&
+        auth.authMethod === "oauth-personal"
+      ) {
+        yield* runAntigravityCliLogin(spawn, input.onAuthorizationUrl).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        );
+      }
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
         additionalDirectories: [
@@ -303,14 +321,7 @@ export const AntigravityDriver: ProviderDriver<
         runtimeVersion: executable.version,
         authMethod: auth.authMethod,
         childProcessSpawner: spawner,
-        spawn: buildAntigravityAcpSpawnInput({
-          installation: executable,
-          profile,
-          cwd: runtimeInput.cwd,
-          baseEnv: spawnEnvironment,
-          auth,
-          runtimeTempDirectory,
-        }),
+        spawn,
       }).pipe(Effect.provideService(SecureRandom.SecureRandom, random));
       return {
         ...runtime,

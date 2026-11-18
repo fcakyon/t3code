@@ -4691,9 +4691,9 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
-  it.live(
-    "loads the persisted ACP session during startup without creating a throwaway session",
-    () =>
+  it.live.each([false, true])(
+    "uses the same session activation at startup and reattachment, prefer resume: %s",
+    (preferResume) =>
       Effect.gen(function* () {
         const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
         const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -4706,6 +4706,7 @@ describe("AcpAdapterV2", () => {
           flavor: {
             driver: ACP_TEST_DRIVER,
             capabilities: AcpProviderCapabilitiesV2,
+            ...(preferResume && { resumeMethod: "resume" }),
             makeRuntime: makeMockRuntime({
               childProcessSpawner,
               mockAgentPath,
@@ -4742,7 +4743,7 @@ describe("AcpAdapterV2", () => {
         const loaded = yield* runtime.readThreadSnapshot({ providerThread });
         assert.deepEqual(
           loaded.messages.map((message) => `${message.role}:${message.text}`),
-          ["user:replay"],
+          [preferResume ? "user:native-resume-started" : "user:replay"],
         );
 
         yield* runtime.resumeThread({ providerThread, modelSelection, runtimePolicy });
@@ -4770,6 +4771,27 @@ describe("AcpAdapterV2", () => {
             driver: ACP_TEST_DRIVER,
             nativeTurnId: "persisted-session:turn:1",
           }),
+        );
+        yield* runtime.resumeThread({
+          providerThread: {
+            ...providerThread,
+            nativeThreadRef: {
+              driver: ACP_TEST_DRIVER,
+              nativeId: "other-session",
+              strength: "strong",
+            },
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+        const reactivation = (yield* Queue.takeAll(protocolEvents)).find(
+          (event) =>
+            event.direction === "outgoing" && rawProtocolMethod(event) === "session/resume",
+        );
+        assert.isDefined(reactivation);
+        assert.deepEqual(
+          rawProtocolRequestParam(reactivation, "replayFrom"),
+          preferResume ? undefined : { type: "start" },
         );
       }).pipe(Effect.provide(layerTest)),
   );

@@ -426,7 +426,8 @@ export function makeAntigravityAcpAdapterFlavor(
         Effect.provideService(FileSystem.FileSystem, options.fileSystem),
         Effect.provideService(Path.Path, options.path),
       ),
-    // Loading history replays tool calls; resume avoids replay. 1.5+ subagents run asynchronously after end_turn.
+    // Loading history replays old tool calls into the current turn.
+    resumeMethod: "resume",
     subagentsIdleOnTurnCompletion: (initializeResult) => {
       const version = initializeResult.agentInfo?.version;
       return version === undefined || compareSemverVersions(version, "1.5.0") < 0;

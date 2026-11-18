@@ -1,5 +1,7 @@
 # t3code-fcakyon changelog
 
+- fix: Restore Antigravity personal sign-in over SSH, resume sessions without replaying old tools, and qualify native file and video handling on 1.5.11
+- fix: Follow upstream Antigravity version advice ([`0bbd856746`](https://github.com/fcakyon/t3code/commit/0bbd856746))
 - build: Sync upstream through [`8cf97b5f06`](https://github.com/pingdotgg/t3code/commit/8cf97b5f06) and keep Antigravity plugin skills alongside upstream thread environment handling
 - build: Sync upstream through [`055b44919e`](https://github.com/pingdotgg/t3code/commit/055b44919e) and retain Antigravity setup, background tasks, and usage summaries with upstream translations
 - fix: Use the test runner’s Node executable in SSH reconnect fixtures

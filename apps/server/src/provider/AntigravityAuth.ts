@@ -22,6 +22,7 @@ import * as AcpErrors from "effect-acp/errors";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import {
   parseAntigravityAuthorizationUrl,
+  type AntigravityAuthorizationHandler,
   type AntigravityAuthorizationUrl,
 } from "./antigravityAuthSupport.ts";
 import {
@@ -58,7 +59,11 @@ interface AuthFlow {
   readonly ownerSessionId: string;
   readonly expiresAtMillis: number;
   state: ProviderAuthState;
-  pending: AntigravityAuthorizationUrl | undefined;
+  pending:
+    | (AntigravityAuthorizationUrl & {
+        submit: (callback: URL) => Effect.Effect<void, ProviderSetupError>;
+      })
+    | undefined;
   initialized: boolean;
   callbackSent: boolean;
   fiber: Fiber.Fiber<void> | undefined;
@@ -88,7 +93,7 @@ export interface AntigravityAuthOptions<
 > {
   readonly instanceId: ProviderInstanceId;
   readonly makeRuntime: (input: {
-    readonly onAuthorizationUrl?: (url: string) => Effect.Effect<void, AcpErrors.AcpError>;
+    readonly onAuthorizationUrl?: AntigravityAuthorizationHandler;
   }) => Effect.Effect<Runtime, AcpErrors.AcpError | ProviderSetupError, Scope.Scope>;
   readonly onAuthenticated: (
     result: AcpSessionRuntime.AcpSessionRuntimeStartResult,
@@ -249,31 +254,37 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
       }),
     );
 
-  const receiveAuthorizationUrl = (flow: AuthFlow, url: string) =>
-    parseAntigravityAuthorizationUrl(url).pipe(
-      Effect.flatMap((authorization) =>
-        lock.withPermits(1)(
-          Effect.gen(function* () {
-            if (activeFlow !== flow || operation !== "auth") return;
-            if (flow.pending) {
-              if (flow.pending.authorizationUrl === authorization.authorizationUrl) return;
-              return yield* new AcpErrors.AcpTransportError({
-                detail: "Antigravity started more than one Google sign-in request.",
-                cause: undefined,
+  const forwardCallback =
+    options.forwardCallback ??
+    ((callback: URL) => forwardAntigravityCallback(options.instanceId, callback));
+  const receiveAuthorizationUrl =
+    (flow: AuthFlow): AntigravityAuthorizationHandler =>
+    (url, submit) =>
+      parseAntigravityAuthorizationUrl(url, submit !== undefined).pipe(
+        Effect.flatMap((authorization) =>
+          lock.withPermits(1)(
+            Effect.gen(function* () {
+              if (activeFlow !== flow || operation !== "auth") return;
+              if (flow.pending) {
+                if (flow.pending.authorizationUrl === authorization.authorizationUrl) return;
+                return yield* new AcpErrors.AcpTransportError({
+                  detail: "Antigravity started more than one Google sign-in request.",
+                  cause: undefined,
+                });
+              }
+              flow.pending = { ...authorization, submit: submit ?? forwardCallback };
+              yield* publishFlow(flow, {
+                ...flow.state,
+                phase: "waiting",
+                authorizationUrl: authorization.authorizationUrl,
+                message: submit
+                  ? "Sign in with Google, then paste the full return URL here."
+                  : "Open the Google sign-in link. If you are remote, paste the redirect URL here.",
               });
-            }
-            flow.pending = authorization;
-            yield* publishFlow(flow, {
-              ...flow.state,
-              phase: "waiting",
-              authorizationUrl: authorization.authorizationUrl,
-              message:
-                "Open the Google sign-in link. If you are remote, paste the redirect URL here.",
-            });
-          }),
+            }),
+          ),
         ),
-      ),
-    );
+      );
 
   const publishStartingHint = (flow: AuthFlow, delayMs: number, message: string) =>
     Effect.sleep(delayMs).pipe(
@@ -291,10 +302,10 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
   const runSignIn = Effect.fn("AntigravityAuth.runSignIn")(
     function* (flow: AuthFlow, stopSessions: Effect.Effect<void, ProviderSetupError>) {
       yield* stopSessions.pipe(Effect.ensuring(stopOwnedProcesses));
-      const runtime = yield* options.makeRuntime({
-        onAuthorizationUrl: (url) => receiveAuthorizationUrl(flow, url),
-      });
       const startupHint = yield* publishStartingHint(flow, STARTUP_HINT_MS, NOT_STARTED_MESSAGE);
+      const runtime = yield* options.makeRuntime({
+        onAuthorizationUrl: receiveAuthorizationUrl(flow),
+      });
       // `start` reuses this memoized handshake.
       yield* runtime.initialize();
       flow.initialized = true;
@@ -455,10 +466,7 @@ export const makeAntigravityAuth = Effect.fn("makeAntigravityAuth")(function* <
             authorizationUrl: null,
             message: "Waiting for Google to finish sign-in.",
           });
-          const forwarding = yield* (
-            options.forwardCallback?.(callback) ??
-            forwardAntigravityCallback(options.instanceId, callback)
-          ).pipe(
+          const forwarding = yield* flow.pending.submit(callback).pipe(
             // stopFlow interrupts this fiber, so it runs from a sibling fiber.
             Effect.tapError(() =>
               stopFlow(flow, "failed", FORWARDING_FAILED_MESSAGE).pipe(

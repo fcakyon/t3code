@@ -211,6 +211,7 @@ export interface AcpAdapterV2RuntimeInput {
   readonly httpMcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
   readonly processEnvironment?: NodeJS.ProcessEnv;
   readonly resumeSessionId?: string;
+  readonly resumeMethod?: NonNullable<AcpSessionRuntime.AcpSessionRuntimeOptions["resumeMethod"]>;
   readonly interruptPromptOnCancel?: boolean;
   readonly sessionMeta?: NonNullable<AcpSessionRuntime.AcpSessionRuntimeOptions["sessionMeta"]>;
   readonly clientCapabilities: EffectAcpSchema.InitializeRequest["clientCapabilities"];
@@ -342,6 +343,7 @@ export function acpPerTurnPromptUsage(
 }
 
 export interface AcpAdapterV2Flavor {
+  readonly resumeMethod?: NonNullable<AcpSessionRuntime.AcpSessionRuntimeOptions["resumeMethod"]>;
   readonly buildAttachmentPrompt?: (input: {
     readonly text: string;
     readonly attachments: ReadonlyArray<ChatAttachment>;
@@ -2706,6 +2708,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               ? {}
               : { processEnvironment: mcpContext.processEnvironment }),
             ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
+            ...(flavor.resumeMethod && { resumeMethod: flavor.resumeMethod }),
             interruptPromptOnCancel: flavor.interruptPromptOnCancel ?? false,
             clientCapabilities: {
               fs: {
@@ -7870,9 +7873,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           flavor.forkFromTurn?.supported(started.initializeResult) === true,
           flavor.promptSteering?.(started.initializeResult),
         );
-        const canLoadSession = started.initializeResult.agentCapabilities?.loadSession === true;
-        const canResumeSession =
-          started.initializeResult.agentCapabilities?.sessionCapabilities?.resume != null;
+        const activationMethod = AcpSessionRuntime.sessionActivationMethod(
+          started.initializeResult.agentCapabilities,
+          flavor.resumeMethod,
+        );
         const supportsImagePrompts = acpSupportsImagePrompts({
           flavorSupportsImagePrompts: flavor.supportsImagePrompts,
           negotiatedImage:
@@ -7894,9 +7898,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           prepareTerminalEnvironment(mcpContext, sessionId);
           yield* Ref.set(loadingSessionId, sessionId);
           const activated = yield* Effect.gen(function* () {
-            return canLoadSession
+            return activationMethod === "load"
               ? yield* runtime.loadSession(sessionId, activationOptions)
-              : canResumeSession
+              : activationMethod === "resume"
                 ? yield* runtime.resumeSession(sessionId, activationOptions)
                 : yield* new ProviderAdapter.ProviderAdapterProtocolError({
                     driver,
@@ -9474,7 +9478,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           driver,
           providerSessionId: input.providerSessionId,
           providerSession,
-          canResumeAfterRestart: canLoadSession || canResumeSession,
+          canResumeAfterRestart: activationMethod !== undefined,
           events: Stream.fromEffectRepeat(Queue.take(events)),
           ...(flavor.getModelContextWindow === undefined
             ? {}

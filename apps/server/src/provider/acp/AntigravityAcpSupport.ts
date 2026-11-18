@@ -22,6 +22,7 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import {
   makeAntigravityStderrHandler,
   makeAntigravityStdoutTransform,
+  type AntigravityAuthorizationHandler,
 } from "../antigravityAuthSupport.ts";
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import packageJson from "../../../package.json" with { type: "json" };
@@ -35,14 +36,13 @@ export interface AntigravityAcpRuntimeInput extends Omit<
   | "clientCapabilities"
   | "clientInfo"
   | "onStderr"
-  | "resumeMethod"
   | "sessionMeta"
   | "transformSessionUpdate"
   | "transformStdout"
 > {
   readonly childProcessSpawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
   readonly processEnvironment?: NodeJS.ProcessEnv;
-  readonly onAuthorizationUrl?: (url: string) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+  readonly onAuthorizationUrl?: AntigravityAuthorizationHandler;
   /** Serve `fs/read_text_file` for runtimes whose native reader is not qualified. */
   readonly clientFileReads?: boolean;
   readonly clientCapabilities?: AcpSessionRuntime.AcpSessionRuntimeOptions["clientCapabilities"];
@@ -79,11 +79,10 @@ function antigravityWritesRunWorkflowSkill(version: string | null | undefined): 
   );
 }
 
-const QUALIFIED_ANTIGRAVITY_RELEASES = new Set(["1.4.5", "1.5.9"]);
+const QUALIFIED_ANTIGRAVITY_RELEASES = new Set(["1.4.5", "1.5.9", "1.5.11"]);
 
 /**
- * Releases T3 qualified for native range reads and linked video. On 1.4.5 and 1.5.9 the
- * client-read path sends a whole file to serve one line, and the native reader keeps diff edits.
+ * These releases support native range reads, edit diffs and linked video.
  */
 export function isQualifiedAntigravityRelease(version: string | null | undefined): boolean {
   const trimmed = version?.trim();
@@ -144,7 +143,6 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
       ...input,
       authMethodId: input.authMethod ?? "oauth-personal",
       authenticateEagerly: true,
-      resumeMethod: "resume",
       cancelBehavior: "wait-for-prompt",
       clientInfo: antigravityClientInfo(input.runtimeVersion),
       sessionMeta: (initializeResult) =>
@@ -316,7 +314,7 @@ const AUDIO_MIME_TYPES = new Set([
   "audio/webm",
 ]);
 const ANTIGRAVITY_MAX_AUDIO_ATTACHMENT_BYTES = 20 * 1024 * 1024;
-// The agent inlines linked video bytes into one model request, so keep it under the inline limit.
+// Keep linked video within the agent's media limit.
 const ANTIGRAVITY_MAX_VIDEO_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
 /**

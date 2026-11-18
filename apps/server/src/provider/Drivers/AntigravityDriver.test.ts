@@ -13,9 +13,11 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { HttpClient } from "effect/http";
 
@@ -315,6 +317,55 @@ const layerTest = ProviderHostLive.layer.pipe(
 );
 
 it.layer(layerTest)("AntigravityDriver", (it) => {
+  it.effect.skipIf(windowsHost)("retries native CLI sign-in over SSH after a rejected code", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({
+        environment: [{ name: "SSH_CONNECTION", value: "192.0.2.1 12345 192.0.2.2 22" }],
+      });
+      h.controls.selected = { ...h.first, harnessPath: null };
+      const redirect = "https://antigravity.google/oauth-callback";
+      const url = `https://accounts.google.com/o/oauth2/auth?response_type=code&state=owned&redirect_uri=${encodeURIComponent(redirect)}`;
+      const callback = `${redirect}?code=test&state=owned`;
+      const script = yield* h.fs.readFileString(h.first.executablePath);
+      yield* h.fs.writeFileString(
+        h.first.executablePath,
+        script.replace(
+          "#!/bin/sh",
+          [
+            "#!/bin/sh",
+            'if [ "$6" = "--login" ]; then',
+            `  printf '  %s\\n' ${shellQuote(url)}`,
+            `  IFS= read -r reply && [ "$reply" = ${shellQuote(callback)} ] || exit 1`,
+            '  touch "$GEMINI_HOME/test-signed-in"',
+            "  exit 0",
+            "fi",
+            '[ -f "$GEMINI_HOME/test-signed-in" ] || exit 1',
+          ].join("\n"),
+        ),
+      );
+      const auth = h.instance.auth!;
+      const next = auth.subscribe("owner").pipe(
+        Stream.filter((s) => ["failed", "waiting", "succeeded"].includes(s.phase)),
+        Stream.runHead,
+        Effect.map(Option.getOrThrow),
+      );
+      for (const [code, phase] of [
+        ["expired", "failed"],
+        ["test", "succeeded"],
+      ] as const) {
+        const state = yield* auth.start("owner");
+        expect((yield* next).authorizationUrl).toBe(url);
+        const complete = (callbackUrl: string) =>
+          auth.complete("owner", { flowId: state.flowId!, callbackUrl });
+        expect(yield* Effect.isFailure(complete(callback.replace("owned", "other")))).toBe(true);
+        yield* complete(callback.replace("code=test", `code=${code}`));
+        expect((yield* next).phase).toBe(phase);
+      }
+      expect((yield* h.instance.snapshot.getSnapshot).auth.status).toBe("authenticated");
+      yield* h.assertClosed;
+    }),
+  );
+
   it.effect.skipIf(windowsHost)(
     "refreshes the selected executable and limits form capabilities to chat",
     () =>

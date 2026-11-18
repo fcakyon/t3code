@@ -18,7 +18,10 @@ Antigravity setup.
 
 ### Sign in from a remote device
 
-Google returns to a `127.0.0.1` address. It can finish directly when your browser is
+For personal Google sign-in with the native CLI, Google returns to an Antigravity
+page. Copy its full URL back into T3 Code, including when both apps are on the same machine.
+
+Older runtimes use a `127.0.0.1` return address. It can finish directly when your browser is
 on the environment's machine. From another device, the final page will usually
 fail to load because the sign-in listener is on the environment.
 
@@ -110,8 +113,9 @@ Skills for every project go in `~/.gemini/config/skills` or
 so a skill there only appears when the project itself is your home directory.
 
 Antigravity receives images and audio directly, and reads PDFs and text files as
-documents. With the managed runtime on macOS and Linux, an MP4 video up to 20 MiB
-is sent as video to Gemini models. Other attachments, and videos for other models, are passed as a
+documents. With a qualified runtime on macOS or Linux, T3 sends Gemini a file link
+for MP4 videos up to 20 MiB. The native agent can open the link to inspect the video.
+Other attachments, and videos for other models, are passed as a
 saved file path for the agent to inspect with its tools.
 
 ### Subagents
