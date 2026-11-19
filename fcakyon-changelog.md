@@ -1,5 +1,6 @@
 # t3code-fcakyon changelog
 
+- build: Sync upstream through [`6ea01d4cbe`](https://github.com/pingdotgg/t3code/commit/6ea01d4cbe) and retain the Fx session after Stop while tracking Antigravity background tasks
 - fix: Restore Antigravity personal sign-in over SSH, resume sessions without replaying old tools, and qualify native file and video handling on 1.5.11
 - fix: Follow upstream Antigravity version advice ([`0bbd856746`](https://github.com/fcakyon/t3code/commit/0bbd856746))
 - build: Sync upstream through [`8cf97b5f06`](https://github.com/pingdotgg/t3code/commit/8cf97b5f06) and keep Antigravity plugin skills alongside upstream thread environment handling

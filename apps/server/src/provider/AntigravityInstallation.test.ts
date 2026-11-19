@@ -608,7 +608,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
       expect(yield* fs.readFileString(selected.executablePath)).toBe(serverContents);
       expect(yield* fs.readFileString(selected.harnessPath!)).toBe(harnessContents);
       expect(yield* fs.readDirectory(path.join(installation.managedDirectory, "versions"))).toEqual(
-        expect.arrayContaining([previousReleaseId, (yield* releaseAsset()).sha256]),
+        [(yield* releaseAsset()).sha256],
       );
       expect(requests).toEqual([(yield* releaseAsset()).url]);
     }),
@@ -1230,7 +1230,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
     Effect.gen(function* () {
       const manifestEntered = yield* Deferred.make<void>();
       const releaseManifest = yield* Deferred.make<void>();
-      const { installation, fs, requests, stagingReleased } = yield* makeHarness({
+      const { installation, fs, baseDir, requests, stagingReleased } = yield* makeHarness({
         native: true,
         platform: "win32",
         archive: Buffer.from(serverContents),
@@ -1265,6 +1265,9 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
       expect(yield* fs.readFileString(oldExecutable.executablePath)).toBe(serverContents);
       expect(yield* installation.remove().pipe(Effect.flip)).toMatchObject({ operation: "remove" });
       yield* Scope.close(processScope, Exit.void);
+      yield* makeHarness({ native: true, platform: "win32", baseDir });
+      expect(yield* fs.exists(oldExecutable.managedVersionDirectory!)).toBe(false);
+      expect(yield* fs.readFileString(current.executablePath)).toBe(serverContents);
       yield* installation.remove();
       expect(yield* fs.exists(installation.managedDirectory)).toBe(false);
     }),
