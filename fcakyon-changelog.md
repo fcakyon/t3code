@@ -1,5 +1,6 @@
 # t3code-fcakyon changelog
 
+- build: Sync upstream through [`e8c4824b70`](https://github.com/pingdotgg/t3code/commit/e8c4824b70) and retain Antigravity plugin skills and session resume alongside upstream detached replies
 - refactor: Drop superseded Antigravity MCP env, manifest, and legacy 1.4.5 auto-upgrade leftovers
 - build: Sync upstream through [`6ea01d4cbe`](https://github.com/pingdotgg/t3code/commit/6ea01d4cbe) and retain the Fx session after Stop while tracking Antigravity background tasks
 - fix: Restore Antigravity personal sign-in over SSH, resume sessions without replaying old tools, and qualify native file and video handling on 1.5.11

@@ -41,6 +41,7 @@ import {
   describeAntigravitySubagentLaunches,
   makeAntigravitySubagentTracker,
   makeAntigravityCommandTaskTracker,
+  readAntigravityChildrenAtWork,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import {
   readAntigravityClientTextFile,
@@ -52,6 +53,7 @@ import {
 } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
+  antigravityCommandOutlivesPrompt,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
   extractAntigravityUserInputQuestion,
@@ -246,6 +248,8 @@ export function makeAntigravityAcpAdapterFlavor(
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
   const commandTasks = makeAntigravityCommandTaskTracker(profileDirectory);
+  const repliesWithoutPrompt = (version: string | undefined) =>
+    version !== undefined && compareSemverVersions(version, "1.5.11") >= 0;
   const antigravityClientFileRoots = Effect.fn("AntigravityAdapterV2.antigravityClientFileRoots")(
     function* (cwd: string | null) {
       const worktreeGitDir = yield* resolveGitWorktreeDirectory({
@@ -432,6 +436,14 @@ export function makeAntigravityAcpAdapterFlavor(
       const version = initializeResult.agentInfo?.version;
       return version === undefined || compareSemverVersions(version, "1.5.0") < 0;
     },
+    // A finished background command or timer wakes the agent with no prompt open: it streams a
+    // reply and asks for permissions, and no prompt response ever ends that reply.
+    wakeOnDetachedRequest: true,
+    replyEndsWithUsageUpdate: ({ agentInfo }) => repliesWithoutPrompt(agentInfo?.version),
+    toolOutlivesPrompt: antigravityCommandOutlivesPrompt,
+    // session/cancel ends the agent's running commands, so only Stop sends it once the prompt
+    // has ended. A message sent while a command runs leaves the command alone.
+    preserveRuntimeOnSettledInterrupt: true,
     ...(options.onSessionEvent === undefined ? {} : { onSessionEvent: options.onSessionEvent }),
     applyModelSelection: Effect.fn("AntigravityAdapterV2.applyModelSelection")(function* ({
       runtime,
@@ -474,7 +486,7 @@ export function makeAntigravityAcpAdapterFlavor(
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
     deferFinalizeForBackgroundWork: true,
     enablePostSettleContinuation: true,
-    promptOnEmptyContinuationWake: true,
+    promptOnEmptyContinuationWake: ({ agentInfo }) => !repliesWithoutPrompt(agentInfo?.version),
     deferMcpTools: true,
     supportsImagePrompts: true,
     // ACP 1.3.0 treats /compact as ordinary model input.
@@ -490,6 +502,14 @@ export function makeAntigravityAcpAdapterFlavor(
       : {
           watchPromptOutcome: (sessionId: string) =>
             watchAntigravityPromptOutcome(profileDirectory, sessionId),
+          subagentsOutlivingPrompt: ({ sessionId, nativeTaskIds, agentVersion }) =>
+            repliesWithoutPrompt(agentVersion)
+              ? readAntigravityChildrenAtWork({
+                  profileDirectory,
+                  rootSessionId: sessionId,
+                  toolCallIds: nativeTaskIds,
+                })
+              : Effect.undefined,
         }),
   };
 }

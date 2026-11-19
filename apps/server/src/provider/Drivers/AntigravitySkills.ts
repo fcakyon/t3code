@@ -226,6 +226,7 @@ const scanSkillDirectories = Effect.fn("scanAntigravitySkillDirectories")(functi
   for (const root of roots) {
     yield* scanDirectory(root.directory, root.scope, true);
   }
+
   return [...skillsByName.values()].sort((left, right) => left.name.localeCompare(right.name));
 });
 
@@ -245,11 +246,11 @@ const decodePluginPreferences = Schema.decodeEffect(PluginPreferences);
 const encodeString = Schema.encodeSync(Schema.fromJsonString(Schema.String));
 
 const discoverAntigravityPlugins = Effect.fn("discoverAntigravityPlugins")(function* (
-  userHome: string,
+  config: string,
+  native: boolean,
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const config = path.join(userHome, ".gemini", "config");
   const directory = path.join(config, "plugins");
   const entries = yield* readIfPresent(fileSystem.readDirectory(directory), directory);
   if (entries === undefined) return [];
@@ -290,15 +291,19 @@ const discoverAntigravityPlugins = Effect.fn("discoverAntigravityPlugins")(funct
     if (enabled === false) continue;
     const manifestPath = path.join(pluginDirectory, "plugin.json");
     const contents = yield* readAntigravityFile(manifestPath, budget, "json");
-    if (contents === undefined) continue;
-    const manifest = yield* decodePluginManifest(contents).pipe(
-      Effect.catchTags({
-        SchemaError: () =>
-          Effect.logWarning("Skipped an Antigravity plugin with an invalid manifest.", {
-            errorTag: "invalid-config",
-          }).pipe(Effect.as(undefined)),
-      }),
-    );
+    const manifest =
+      contents === undefined
+        ? native
+          ? {}
+          : undefined
+        : yield* decodePluginManifest(contents).pipe(
+            Effect.catchTags({
+              SchemaError: () =>
+                Effect.logWarning("Skipped an Antigravity plugin with an invalid manifest.", {
+                  errorTag: "invalid-config",
+                }).pipe(Effect.as(undefined)),
+            }),
+          );
     if (manifest === undefined) continue;
     if (manifest.disabled && enabled !== true) continue;
     const skills = yield* scanSkillDirectories(
@@ -308,18 +313,20 @@ const discoverAntigravityPlugins = Effect.fn("discoverAntigravityPlugins")(funct
     if (skills.length === 0) continue;
     plugins.push({
       directory: pluginDirectory,
-      skills: skills.map((skill) => ({
-        ...skill,
-        name: `plugin:${[entry, skill.name]
-          .map((part) =>
-            part.replace(
-              /[^a-z0-9-]/gu,
-              (character) => `_${Buffer.from(character).toString("hex")}_`,
-            ),
-          )
-          .join(":")}`,
-        displayName: `${entry}:${skill.name}`,
-      })),
+      skills: native
+        ? skills
+        : skills.map((skill) => ({
+            ...skill,
+            name: `plugin:${[entry, skill.name]
+              .map((part) =>
+                part.replace(
+                  /[^a-z0-9-]/gu,
+                  (character) => `_${Buffer.from(character).toString("hex")}_`,
+                ),
+              )
+              .join(":")}`,
+            displayName: `${entry}:${skill.name}`,
+          })),
     });
   }
   return plugins;
@@ -329,6 +336,7 @@ const discoverAntigravityPlugins = Effect.fn("discoverAntigravityPlugins")(funct
 export const discoverAntigravitySkills = Effect.fn("discoverAntigravitySkills")(function* (input: {
   readonly cwd: string;
   readonly userHome: string;
+  readonly profileDirectory: string;
 }): Effect.fn.Return<
   ReadonlyArray<ServerProviderSkill>,
   AntigravitySkillsProbeError,
@@ -349,8 +357,17 @@ export const discoverAntigravitySkills = Effect.fn("discoverAntigravitySkills")(
     ],
     { remainingBytes: MAX_SCAN_BYTES, remainingEntries: MAX_SCAN_ENTRIES },
   );
-  const plugins = yield* discoverAntigravityPlugins(input.userHome);
-  return [...skills, ...plugins.flatMap((plugin) => plugin.skills)].sort((left, right) =>
+  const userConfig = path.join(input.userHome, ".gemini", "config");
+  const plugins = yield* discoverAntigravityPlugins(userConfig, false);
+  const byName = new Map(skills.map((skill) => [skill.name, skill]));
+  const nativePlugins = yield* discoverAntigravityPlugins(
+    path.join(input.profileDirectory, "config"),
+    true,
+  );
+  for (const { skills } of nativePlugins) {
+    for (const skill of skills) if (!byName.has(skill.name)) byName.set(skill.name, skill);
+  }
+  return [...byName.values(), ...plugins.flatMap((plugin) => plugin.skills)].sort((left, right) =>
     left.name.localeCompare(right.name),
   );
 });
@@ -360,7 +377,10 @@ export const prepareAntigravityPluginSkills = Effect.fn("prepareAntigravityPlugi
   function* (input: { readonly userHome: string; readonly runtimeTempDirectory: string }) {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const plugins = yield* discoverAntigravityPlugins(input.userHome);
+    const plugins = yield* discoverAntigravityPlugins(
+      path.join(input.userHome, ".gemini", "config"),
+      false,
+    );
     if (plugins.length === 0) return [];
     const directory = path.join(input.runtimeTempDirectory, "plugin-skills");
     yield* Effect.forEach(
