@@ -199,7 +199,7 @@ function walkProtoFields(
 }
 
 /** Length-delimited fields only; varints and fixed values are skipped. */
-const protoFields = (bytes: Uint8Array): ReadonlyArray<readonly [number, Uint8Array]> => {
+export const protoFields = (bytes: Uint8Array): ReadonlyArray<readonly [number, Uint8Array]> => {
   const fields: Array<readonly [number, Uint8Array]> = [];
   walkProtoFields(bytes, (field, value) => {
     fields.push([field, value]);
