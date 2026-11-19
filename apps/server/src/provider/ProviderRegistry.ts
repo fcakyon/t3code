@@ -320,30 +320,6 @@ const carrySavedAntigravityAccount = (
   return { auth: previousProvider.auth, status };
 };
 
-const mergeProviderWorkspaceSnapshots = (
-  previousSnapshots: ServerProvider["workspaceSnapshots"],
-  nextProvider: ServerProvider,
-): ServerProvider["workspaceSnapshots"] => {
-  if (nextProvider.workspaceSnapshots === undefined) {
-    return previousSnapshots;
-  }
-  if (
-    !nextProvider.enabled ||
-    (!nextProvider.installed && nextProvider.status === "error") ||
-    nextProvider.auth.status === "unauthenticated"
-  ) {
-    return nextProvider.workspaceSnapshots;
-  }
-  if (!previousSnapshots?.length) {
-    return nextProvider.workspaceSnapshots;
-  }
-  const nextCwds = new Set(nextProvider.workspaceSnapshots.map((snapshot) => snapshot.cwd));
-  return [
-    ...previousSnapshots.filter((snapshot) => !nextCwds.has(snapshot.cwd)),
-    ...nextProvider.workspaceSnapshots,
-  ].slice(-MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER);
-};
-
 export const mergeProviderSnapshot = (
   previousProvider: ServerProvider | undefined,
   nextProvider: ServerProvider,
@@ -361,15 +337,25 @@ export const mergeProviderSnapshot = (
         ...snapshot,
         modelsPending: true,
       }));
-  const workspaceSnapshots = mergeProviderWorkspaceSnapshots(
-    previousWorkspaceSnapshots,
-    nextProvider,
-  );
+  const nextWorkspaceSnapshots = nextProvider.workspaceSnapshots;
+  // A provider reports only folders its own sessions saw, so registry scans of other folders stay.
+  const workspaceSnapshots =
+    nextWorkspaceSnapshots === undefined ||
+    !nextProvider.enabled ||
+    nextProvider.auth.status === "unauthenticated" ||
+    (!nextProvider.installed && nextProvider.status === "error")
+      ? (nextWorkspaceSnapshots ?? previousWorkspaceSnapshots)
+      : [
+          ...(previousWorkspaceSnapshots ?? []).filter(
+            ({ cwd }) => !nextWorkspaceSnapshots.some((snapshot) => snapshot.cwd === cwd),
+          ),
+          ...nextWorkspaceSnapshots,
+        ].slice(-MAX_WORKSPACE_SNAPSHOTS_PER_PROVIDER);
   return {
     ...(savedAccount?.status === "ready" ? nextWithoutMessage : nextProvider),
     ...savedAccount,
     models,
-    ...(workspaceSnapshots !== undefined ? { workspaceSnapshots } : {}),
+    ...(workspaceSnapshots === undefined ? {} : { workspaceSnapshots }),
     ...(nextProvider.workspaceRescannedAt === undefined &&
     previousProvider.workspaceRescannedAt !== undefined
       ? { workspaceRescannedAt: previousProvider.workspaceRescannedAt }
