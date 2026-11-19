@@ -421,22 +421,20 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
     ),
   );
 
-  const lease = (binaryPath?: string, processEnvironment?: NodeJS.ProcessEnv) =>
+  const acquire = (binaryPath?: string, processEnvironment?: NodeJS.ProcessEnv) =>
     Effect.acquireRelease(
       gate.withPermit(
         Effect.gen(function* () {
           const executable = yield* resolve(binaryPath, processEnvironment);
-          const directory =
-            executable.source === "managed" && executable.harnessPath !== null
-              ? null
-              : executable.managedVersionDirectory;
+          const directory = executable.managedVersionDirectory;
           if (directory) leases.set(directory, (leases.get(directory) ?? 0) + 1);
-          return { executable, directory };
+          return executable;
         }),
       ),
-      ({ directory }) =>
+      (executable) =>
         gate.withPermit(
           Effect.sync(() => {
+            const directory = executable.managedVersionDirectory;
             if (!directory) return;
             const remaining = (leases.get(directory) ?? 1) - 1;
             if (remaining > 0) leases.set(directory, remaining);
@@ -444,26 +442,6 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
           }),
         ),
     );
-
-  const acquire = Effect.fn("AntigravityInstallation.acquire")(function* (
-    binaryPath?: string,
-    processEnvironment?: NodeJS.ProcessEnv,
-  ) {
-    const { executable } = yield* lease(binaryPath, processEnvironment);
-    if (executable.source !== "managed" || executable.harnessPath === null) return executable;
-    const started = yield* start;
-    const completed = yield* SubscriptionRef.changes(state).pipe(
-      Stream.filter((value) => value.operationId === started.operationId && !isRunning(value)),
-      Stream.runHead,
-      Effect.map(Option.getOrThrow),
-    );
-    if (completed.phase !== "succeeded")
-      return yield* installationError(
-        "acquire",
-        completed.message ?? "Could not upgrade the managed Antigravity runtime.",
-      );
-    return (yield* lease(binaryPath, processEnvironment)).executable;
-  });
 
   const withValidationTimeout = Effect.timeoutOrElse({
     duration: VALIDATION_TIMEOUT,

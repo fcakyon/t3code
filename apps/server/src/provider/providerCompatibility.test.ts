@@ -132,7 +132,7 @@ describe("provider compatibility", () => {
     }
   });
 
-  it.each(["1.4.5", "1.5.7", "1.5.9"])(
+  it.each(["1.4.5", "1.5.7"])(
     "supports the legacy and native Antigravity runtime %s in the bundled manifest",
     (version) => {
       const policies = decodeCompatibilityPolicies(bundledManifest.compatibility);
