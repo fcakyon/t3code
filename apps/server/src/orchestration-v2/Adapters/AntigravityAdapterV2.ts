@@ -27,6 +27,7 @@ import type { AntigravityAuth } from "../../provider/AntigravityAuth.ts";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import {
   antigravityAppendsSystemPrompt,
+  antigravityPermissionDisposition,
   antigravityPermissionMode,
   antigravityRuntimeModeForSessionMode,
   antigravitySteersWithPrompt,
@@ -92,13 +93,6 @@ const AntigravityProviderCapabilitiesV2 = {
   subagents: {
     ...AcpProviderCapabilitiesV2.subagents,
     supportsSubagents: true,
-  },
-  turns: {
-    ...AcpProviderCapabilitiesV2.turns,
-    supportsActiveSteering: false,
-    supportsSteeringByInterruptRestart: false,
-    activeSteeringInterruptsTools: false,
-    activeSteeringAcceptsAttachments: true,
   },
 } satisfies OrchestrationV2ProviderCapabilities;
 
@@ -341,9 +335,7 @@ export function makeAntigravityAcpAdapterFlavor(
             ),
           ),
         prompt: (payload, promptOptions) =>
-          (promptOptions?.steering ? Effect.void : Effect.sync(reads.reset)).pipe(
-            Effect.andThen(runtime.prompt(payload, promptOptions)),
-          ),
+          Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
         handleSessionUpdate: (handler) => {
           const project = (notification: Parameters<typeof handler>[0]) =>
             subagents
@@ -459,6 +451,7 @@ export function makeAntigravityAcpAdapterFlavor(
           ),
         ),
     },
+    permissionDisposition: antigravityPermissionDisposition,
     approvalOptions: antigravityApprovalOptions,
     extractPermissionQuestion: (request) => {
       const question = extractAntigravityUserInputQuestion(request);

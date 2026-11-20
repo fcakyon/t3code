@@ -9006,7 +9006,7 @@
     "in your browser."
   ],
   "a11d2816a2b3106c": "Loading sign-in terminal…",
-  "66084e81fcc0a365": "Paste the full URL from the final sign-in page.",
+  "b2f7638eb3def111": "If the final localhost page does not load, paste its full URL here.",
   "c749e91a6fec5cf9": "Clear {field}",
   "95e568730bdde867": "Variables",
   "134c2eb478dce8d9": "API keys, base URLs, and other per-instance CLI settings.",

@@ -9004,7 +9004,7 @@
     "i din webbläsare."
   ],
   "a11d2816a2b3106c": "Läser in inloggningsterminalen…",
-  "66084e81fcc0a365": "Klistra in hela webbadressen från den sista inloggningssidan.",
+  "b2f7638eb3def111": "Om den sista localhost-sidan inte laddas klistrar du in dess fullständiga URL här.",
   "c749e91a6fec5cf9": "Rensa {field}",
   "95e568730bdde867": "Variabler",
   "134c2eb478dce8d9": "API-nycklar, bas-URL:er och andra CLI-inställningar per instans.",

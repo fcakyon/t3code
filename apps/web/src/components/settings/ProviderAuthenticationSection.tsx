@@ -485,7 +485,7 @@ export function ProviderAuthenticationSection({
               }}
             >
               <label className="grid gap-1">
-                <T>Paste the full URL from the final sign-in page.</T>
+                <T>If the final localhost page does not load, paste its full URL here.</T>
                 <Input
                   size="sm"
                   id={`provider-callback-${instanceId}`}

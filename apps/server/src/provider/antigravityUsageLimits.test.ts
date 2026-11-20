@@ -18,7 +18,15 @@ import {
   readWindowsCliCredential,
 } from "./antigravityUsageLimits.ts";
 
-import { AntigravityCliTokenFile } from "./antigravityAuthSupport.ts";
+const AntigravityCliTokenFile = Schema.Struct({
+  auth_method: Schema.Literal("consumer"),
+  token: Schema.Struct({
+    refresh_token: Schema.NonEmptyString,
+    token_type: Schema.optional(Schema.String),
+    access_token: Schema.optional(Schema.String),
+    expiry: Schema.optional(Schema.String),
+  }),
+});
 
 const summary = {
   groups: [

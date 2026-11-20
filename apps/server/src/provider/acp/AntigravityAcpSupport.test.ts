@@ -17,8 +17,9 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import {
   applyAntigravityAcpModelSelection,
   antigravityClientInfo,
-  antigravityPermissionMode,
+  antigravityPermissionDisposition,
   antigravitySessionMeta,
+  antigravitySessionMode,
   buildAntigravityPrompt,
 } from "./AntigravityAcpSupport.ts";
 
@@ -85,6 +86,52 @@ describe("Antigravity release gates", () => {
           : undefined,
       );
       expect(antigravityClientInfo(version).name).toBe(ownName ? "t3-code" : "zed");
+    },
+  );
+});
+
+describe("Antigravity Auto", () => {
+  it.each([
+    { offered: ["default", "accept-edits", "auto", "plan"], expected: "auto" },
+    { offered: ["default", "accept-edits", "plan"], expected: "default" },
+  ])("runs as $expected when the session offers $offered", ({ offered, expected }) => {
+    const modeState = {
+      currentModeId: "default",
+      availableModes: offered.map((id) => ({ id, name: id })),
+    };
+    expect(antigravitySessionMode("auto", modeState)).toBe(expected);
+  });
+
+  it.each(["execute", "read"] as const)("asks about the %s requests agy's Auto sends", (kind) => {
+    const request = {
+      sessionId: "session-1",
+      toolCall: { toolCallId: "call-1", title: "Tool call", kind },
+      options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+    } satisfies EffectAcpSchema.RequestPermissionRequest;
+    expect(antigravityPermissionDisposition({ runtimeMode: "auto", cwd: null }, request)).toBe(
+      "ask",
+    );
+  });
+
+  it.each([{ type: "readOnly" }, { type: "workspaceWrite", writableRoots: [] }])(
+    "keeps the $type sandbox's denials in Auto",
+    (sandboxPolicy) => {
+      const request = {
+        sessionId: "session-1",
+        toolCall: {
+          toolCallId: "call-1",
+          title: "Edit",
+          kind: "edit",
+          locations: [{ path: "/outside-workspace/file.txt" }],
+        },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      } satisfies EffectAcpSchema.RequestPermissionRequest;
+      expect(
+        antigravityPermissionDisposition(
+          { runtimeMode: "auto", cwd: "/workspace", sandboxPolicy },
+          request,
+        ),
+      ).toBe("deny");
     },
   );
 });
@@ -716,15 +763,4 @@ it.layer(NodeServices.layer)("buildAntigravityPrompt", (it) => {
       });
     }),
   );
-});
-
-describe("antigravityPermissionMode", () => {
-  it.each([
-    ["approval-required", "default"],
-    ["auto-accept-edits", "auto_edit"],
-    ["auto", "yolo"],
-    ["full-access", "yolo"],
-  ] as const)("maps %s to %s", (runtimeMode, expected) => {
-    expect(antigravityPermissionMode(runtimeMode)).toBe(expected);
-  });
 });

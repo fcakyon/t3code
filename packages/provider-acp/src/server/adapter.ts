@@ -9914,10 +9914,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 context.interrupted ||
                 context.providerTurnId !== turnInput.providerTurnId
               ) {
-                return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                   driver,
-                  providerThreadId: turnInput.providerThread.id,
-                  providerTurnId: turnInput.providerTurnId,
+                  detail: `Provider turn ${turnInput.providerTurnId} is not active and cannot be steered.`,
                 });
               }
               // A wake turn has no prompt of its own to steer; its reply ends the run soon.
@@ -9970,7 +9969,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         () =>
                           runtime.prompt(
                             { prompt: [{ type: "text", text }, ...attachmentBlocks] },
-                            { dispatched, released: releasedForSteer, steering: true },
+                            { dispatched, released: releasedForSteer },
                           ),
                         superseded,
                       ),
@@ -9986,10 +9985,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 }),
               );
               if (!Option.contains(steered, true)) {
-                return yield* new ProviderAdapter.ProviderAdapterSteerDeclinedError({
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                   driver,
-                  providerThreadId: turnInput.providerThread.id,
-                  providerTurnId: turnInput.providerTurnId,
+                  detail: `Provider turn ${turnInput.providerTurnId} ended before it could be steered.`,
                 });
               }
               return dispatched;
@@ -10295,6 +10293,17 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             function* (turnInput) {
               if (steersWithPrompt) return yield* steerWithPrompt(turnInput);
               const steering = flavor.steering;
+              // A text-only steer leaves attachments to the orchestrator's restart.
+              if (
+                steering === undefined ||
+                (turnInput.message.attachments.length > 0 &&
+                  flavor.capabilities.turns.activeSteeringAcceptsAttachments === false)
+              ) {
+                return yield* new ProviderAdapter.ProviderAdapterSteerRunUnsupportedError({
+                  driver,
+                  providerThreadId: turnInput.providerThread.id,
+                });
+              }
               const context = yield* Ref.get(activeTurn);
               if (
                 context === null ||
@@ -10304,16 +10313,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                   driver,
                   detail: `Provider turn ${turnInput.providerTurnId} is not active and cannot be steered.`,
-                });
-              }
-              if (
-                steering === undefined ||
-                (turnInput.message.attachments.length > 0 &&
-                  flavor.capabilities.turns.activeSteeringAcceptsAttachments === false)
-              ) {
-                return yield* new ProviderAdapter.ProviderAdapterSteerRunUnsupportedError({
-                  driver,
-                  providerThreadId: turnInput.providerThread.id,
                 });
               }
               // An agent that drops an early cancel drops an early steer too.

@@ -717,7 +717,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       assert.isFalse(yield* session.hasPendingBackgroundWork!);
       assert.isFalse(before.some((event) => event.type === "turn.terminal"));
       assert.equal(session.providerSession.capabilities.turns.supportsActiveSteering, steers > 0);
-      assert.isFalse(session.providerSession.capabilities.turns.supportsSteeringByInterruptRestart);
+      assert.isTrue(session.providerSession.capabilities.turns.supportsSteeringByInterruptRestart);
       if (!stop && steers > 0) {
         const late = yield* session
           .steerTurn({
@@ -728,7 +728,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
             message: turn.message,
           })
           .pipe(Effect.flip);
-        assert.equal(late._tag, "ProviderAdapterSteerDeclinedError");
+        assert.equal(late._tag, "ProviderAdapterSteerRunError");
       }
       const requests = (yield* fileSystem.readFileString(requestLog))
         .trim()
