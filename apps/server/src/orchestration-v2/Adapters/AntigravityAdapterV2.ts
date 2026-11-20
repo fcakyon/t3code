@@ -268,11 +268,6 @@ export function makeAntigravityAcpAdapterFlavor(
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
     function* (input: AcpAdapterV2RuntimeInput) {
       const scope = yield* Scope.fork(yield* Effect.scope);
-      const worktreeGitDir = yield* resolveGitWorktreeDirectory({
-        fileSystem: options.fileSystem,
-        path: options.path,
-        cwd: input.cwd,
-      });
       const runtime = yield* options
         .withProcess(
           Scope.close(scope, Exit.void),
@@ -280,10 +275,6 @@ export function makeAntigravityAcpAdapterFlavor(
             ...input,
             clientFileReads: true,
             sessionSystemPromptAppend: PULL_REQUEST_LINKING_INSTRUCTIONS,
-            additionalDirectories: [
-              options.host.paths.attachmentsDir,
-              ...(worktreeGitDir === undefined ? [] : [worktreeGitDir]),
-            ],
           }),
         )
         .pipe(Effect.provideService(Scope.Scope, scope));
@@ -486,9 +477,9 @@ export function makeAntigravityAcpAdapterFlavor(
     supportsImagePrompts: true,
     compactViaAdvertisedCommand: true,
     requiresSignIn: isAntigravitySignInRequiredError,
+    checksVersionAtHandshake: true,
     // Antigravity can leave a prompt open without updates; long tools and approvals pause this.
     promptInactivityTimeout: "15 minutes",
-    // 1.4.5 returns the root trajectory's Gemini usageMetadata delta; 1.4.1 returns none.
     reportsPerTurnPromptUsage: true,
     geminiPromptUsage: true,
     ...(profileDirectory === undefined

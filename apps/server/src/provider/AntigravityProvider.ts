@@ -172,6 +172,13 @@ interface AntigravityProviderOptions {
   readonly auth?: { readonly type: string; readonly label: string };
 }
 
+const ANTIGRAVITY_RUNTIME_MODES = [
+  "approval-required",
+  "auto-accept-edits",
+  "auto",
+  "full-access",
+] as const;
+
 export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(function* (
   settings: AntigravitySettings,
   options: AntigravityProviderOptions,
@@ -190,8 +197,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       presentation: {
         displayName: "Antigravity",
         showInteractionModeToggle: false,
-        // Map Auto to full access in this fork so Auto threads and delegates run without prompts.
-        supportedRuntimeModes: ["approval-required", "auto-accept-edits", "auto", "full-access"],
+        supportedRuntimeModes: ANTIGRAVITY_RUNTIME_MODES,
       },
       enabled: settings.enabled,
       checkedAt,
@@ -406,6 +412,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           },
           checkedAt: updatedAt,
           models: buildAntigravityModelsFromSession(started.sessionSetupResult, thinkingLevels),
+          supportedRuntimeModes: ANTIGRAVITY_RUNTIME_MODES,
           supportsTextGeneration,
           ...(cwd
             ? {
@@ -494,6 +501,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             slashCommands: [],
             skills: [],
             workspaceSnapshots: [],
+            supportedRuntimeModes: ANTIGRAVITY_RUNTIME_MODES,
             supportsTextGeneration: false,
             usageLimits: undefined,
           },

@@ -22,7 +22,6 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import {
   makeAntigravityStderrHandler,
   makeAntigravityStdoutTransform,
-  type AntigravityAuthorizationHandler,
 } from "../antigravityAuthSupport.ts";
 import * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import packageJson from "../../../package.json" with { type: "json" };
@@ -41,11 +40,11 @@ export interface AntigravityAcpRuntimeInput extends Omit<
   | "transformStdout"
 > {
   readonly childProcessSpawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
-  readonly onAuthorizationUrl?: AntigravityAuthorizationHandler;
-  /** Serve `fs/read_text_file` for runtimes whose native reader is not qualified. */
+  readonly onAuthorizationUrl?: (url: string) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+  /** Serve `fs/read_text_file` from T3 instead of the agent's native reader. */
   readonly clientFileReads?: boolean;
   readonly clientCapabilities?: AcpSessionRuntime.AcpSessionRuntimeOptions["clientCapabilities"];
-  /** The installed version, known before `initialize`; it picks the file reader and client name. */
+  /** The installed version, known before `initialize`; it picks the client name. */
   readonly runtimeVersion?: string | null;
   /** Conversational sessions only; helpers and probes leave the system prompt untouched. */
   readonly sessionSystemPromptAppend?: string;
@@ -65,25 +64,12 @@ function compareVersions(left: ReadonlyArray<number>, right: ReadonlyArray<numbe
   return 0;
 }
 
-/**
- * 1.4.2 through 1.4.5 create or overwrite skills/system/run-workflow/SKILL.md in the workspace
- * unless `run_workflow` is disabled. Older builds offer the tool and leave the file alone.
- */
-function antigravityWritesRunWorkflowSkill(version: string | null | undefined): boolean {
-  const parsed = parseAntigravityVersion(version);
-  return (
-    parsed !== undefined &&
-    compareVersions(parsed, [1, 4, 2]) >= 0 &&
-    compareVersions(parsed, [1, 4, 5]) <= 0
-  );
-}
-
-const QUALIFIED_ANTIGRAVITY_RELEASES = new Set(["1.4.5", "1.5.9", "1.5.11"]);
+const QUALIFIED_ANTIGRAVITY_RELEASES = new Set(["1.5.9", "1.5.11"]);
 
 /**
- * These releases support native range reads, edit diffs and linked video.
+ * These releases support linked video.
  */
-export function isQualifiedAntigravityRelease(version: string | null | undefined): boolean {
+function isQualifiedAntigravityRelease(version: string | null | undefined): boolean {
   const trimmed = version?.trim();
   return trimmed !== undefined && QUALIFIED_ANTIGRAVITY_RELEASES.has(trimmed);
 }
@@ -100,14 +86,9 @@ export const antigravitySteersWithPrompt = (
   return parsed !== undefined && compareVersions(parsed, PROMPT_STEERING_RELEASE) >= 0;
 };
 
-/**
- * 1.4.5 appends `systemPrompt.append` to its system instructions on new, load and resume, and
- * keeps none of it between processes, so every activation sends it again.
- */
 export const antigravityAppendsSystemPrompt = (
   initializeResult: EffectAcpSchema.InitializeResponse,
 ) => {
-  if (isQualifiedAntigravityRelease(initializeResult.agentInfo?.version)) return true;
   const extension = initializeResult.agentCapabilities?._meta?.antigravity;
   return (
     Predicate.isObject(extension) &&
@@ -120,15 +101,9 @@ export function antigravitySessionMeta(
   initializeResult: EffectAcpSchema.InitializeResponse,
   systemPromptAppend?: string,
 ): EffectAcpSchema.NewSessionRequest["_meta"] | undefined {
-  const antigravity = {
-    ...(antigravityWritesRunWorkflowSkill(initializeResult.agentInfo?.version)
-      ? { disabledTools: ["run_workflow"] }
-      : {}),
-    ...(systemPromptAppend !== undefined && antigravityAppendsSystemPrompt(initializeResult)
-      ? { systemPrompt: { append: systemPromptAppend } }
-      : {}),
-  };
-  return Object.keys(antigravity).length === 0 ? undefined : { antigravity };
+  return systemPromptAppend !== undefined && antigravityAppendsSystemPrompt(initializeResult)
+    ? { antigravity: { systemPrompt: { append: systemPromptAppend } } }
+    : undefined;
 }
 
 /** Older releases offer non-Gemini models only to allowlisted clients such as Zed. */
@@ -159,8 +134,7 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
         ...input.clientCapabilities,
         // Advertising writes swaps the agent's diff edits for whole-file client_edit_file.
         fs: {
-          readTextFile:
-            input.clientFileReads === true && !isQualifiedAntigravityRelease(input.runtimeVersion),
+          readTextFile: input.clientFileReads === true,
           writeTextFile: false,
         },
         terminal: false,
@@ -525,11 +499,17 @@ export const buildAntigravityPrompt = Effect.fn("buildAntigravityPrompt")(functi
     } else if (audio) {
       blocks.push({ type: "audio", data: Buffer.from(bytes).toString("base64"), mimeType });
     } else {
+      const encoding =
+        bytes[0] === 0xff && bytes[1] === 0xfe
+          ? "UTF-16LE"
+          : bytes[0] === 0xfe && bytes[1] === 0xff
+            ? "UTF-16BE"
+            : "UTF-8";
       const decoded = yield* Effect.try({
-        try: () => new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+        try: () => new TextDecoder(encoding, { fatal: true }).decode(bytes),
         catch: () =>
           EffectAcpErrors.AcpRequestError.invalidParams(
-            `Attachment '${attachment.name}' is not a UTF-8 text file.`,
+            `Attachment '${attachment.name}' is not a ${encoding} text file.`,
           ),
       });
       if (decoded.includes("\0")) {
