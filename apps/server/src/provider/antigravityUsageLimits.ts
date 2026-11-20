@@ -41,7 +41,7 @@ const TokenFile = Schema.Struct({
   project_id: Schema.optional(Schema.String),
 });
 // The 1.5.x CLI never writes acp_token.json: it keeps its sign-in in the OS keyring, or in
-// antigravity-oauth-token without one. It stores no OAuth client, so T3 cannot refresh it.
+// antigravity-oauth-token without one or when T3 bypasses the keyring. It stores no OAuth client, so T3 cannot refresh it.
 const CliToken = Schema.Struct({
   token: Schema.Struct({
     access_token: Schema.NonEmptyString,
@@ -353,7 +353,9 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
   const readCliToken = Effect.fn("AntigravityUsageProbe.readCliToken")(function* () {
     const stored = (yield* fs.exists(cliTokenPath))
       ? yield* fs.readFileString(cliTokenPath)
-      : yield* readKeyringSecret;
+      : input.authMethod === "oauth-business"
+        ? yield* readKeyringSecret
+        : undefined;
     return stored === undefined ? undefined : yield* decodeCliToken(stored);
   });
   const read = Effect.gen(function* () {

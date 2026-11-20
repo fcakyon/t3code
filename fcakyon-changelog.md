@@ -16,3 +16,4 @@ Active fork-only features, fixes, and release infrastructure on `nightly` (relat
 - fix: Cancel orphaned `RUNNING` Antigravity session log steps before reopening ([`05953666b3`](https://github.com/fcakyon/t3code/commit/05953666b3))
 - feat: Share native provider usage pace with agents and Stream Deck (limited to non-Fable weekly windows) and open selected usage metrics from desktop deep links ([`f96aad41f0`](https://github.com/fcakyon/t3code/commit/f96aad41f0), [`84b933553c`](https://github.com/fcakyon/t3code/commit/84b933553c), [`abeb40096f`](https://github.com/fcakyon/t3code/commit/abeb40096f))
 - build: Adopt upstream Antigravity code sign-in, keyring support and UTF-16 attachments. Keep fork Auto, plugin skills, quota refresh and Gemini video support.
+- build: Merge upstream Antigravity rule loading and Google account isolation with fork sign-in migration, quota refresh and background tracking.
