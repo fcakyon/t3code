@@ -60,10 +60,14 @@ const decodeSkillsConfig = Schema.decodeUnknownOption(
   ),
 );
 const decodePluginPreferences = Schema.decodeUnknownOption(
+  // agy decodes like Go's encoding/json, so a null entry leaves that plugin's default.
   Schema.fromJsonString(
     Schema.Struct({
       plugins: Schema.optional(
-        Schema.Record(Schema.String, Schema.Struct({ enabled: Schema.optional(Schema.Boolean) })),
+        Schema.Record(
+          Schema.String,
+          Schema.Struct({ enabled: Schema.optional(Schema.NullOr(Schema.Boolean)) }),
+        ),
       ),
     }),
   ),
@@ -126,17 +130,22 @@ export const readAntigravityBoundedFile = Effect.fn("readAntigravityBoundedFile"
   return yield* readIfPresent(fileSystem.readFileString(filePath), filePath);
 });
 
-/** The explicit `plugins.<name>.enabled` values in a GEMINI_HOME's config.json. */
+/**
+ * The explicit `plugins.<name>.enabled` values in a GEMINI_HOME's config.json, or undefined when
+ * the file does not decode, so callers load no plugins rather than ones the user turned off.
+ */
 const readAntigravityPluginPreferences = Effect.fn("readAntigravityPluginPreferences")(function* (
   configPath: string,
 ) {
   const config = yield* readAntigravityBoundedFile(configPath);
   const preferences = config === undefined ? undefined : decodePluginPreferences(config);
+  if (preferences?._tag === "None") {
+    yield* Effect.logWarning("Antigravity plugin preferences are invalid.", { path: configPath });
+    return undefined;
+  }
   return new Map(
-    Object.entries(
-      (preferences?._tag === "Some" ? preferences.value.plugins : undefined) ?? {},
-    ).flatMap(([name, plugin]) =>
-      plugin.enabled === undefined ? [] : [[name, plugin.enabled] as const],
+    Object.entries(preferences?.value.plugins ?? {}).flatMap(([name, plugin]) =>
+      plugin.enabled == null ? [] : [[name, plugin.enabled] as const],
     ),
   );
 });
@@ -148,22 +157,35 @@ const ANTIGRAVITY_PLUGIN_MANIFESTS = [
   ".gemini-plugin/plugin.json",
 ] as const;
 
-const readAntigravityPluginManifest = Effect.fn("readAntigravityPluginManifest")(function* (
-  pluginDirectory: string,
-) {
-  const path = yield* Path.Path;
-  for (const manifest of ANTIGRAVITY_PLUGIN_MANIFESTS) {
-    const text = yield* readAntigravityBoundedFile(path.join(pluginDirectory, manifest));
-    if (text === undefined) continue;
-    const decoded = decodePluginManifest(text);
-    return decoded._tag === "Some" ? { disabled: decoded.value.disabled === true } : undefined;
-  }
-  return undefined;
-});
+const readAntigravityPluginManifest = Effect.fn("readAntigravityPluginManifest")(
+  function* (pluginDirectory: string) {
+    const path = yield* Path.Path;
+    for (const manifest of ANTIGRAVITY_PLUGIN_MANIFESTS) {
+      const text = yield* readAntigravityBoundedFile(path.join(pluginDirectory, manifest));
+      if (text === undefined) continue;
+      const decoded = decodePluginManifest(text);
+      return decoded._tag === "Some" ? { disabled: decoded.value.disabled === true } : undefined;
+    }
+    return undefined;
+  },
+  // An oversized manifest cannot be valid JSON for agy either, so only that plugin is skipped.
+  Effect.catchIf(
+    (error) => error.reason === "scan-budget-exhausted",
+    () => Effect.undefined,
+  ),
+);
 
-/** A plugin shipping `"disabled": true` loads only when config.json enables it by folder name. */
-const isAntigravityPluginEnabled = (disabledByDefault: boolean, enabled: boolean | undefined) =>
-  disabledByDefault ? enabled === true : enabled !== false;
+/**
+ * A plugin shipping `"disabled": true` loads only when config.json enables it by folder name, and
+ * none load while config.json does not decode.
+ */
+const isAntigravityPluginEnabled = (
+  disabledByDefault: boolean,
+  preferences: ReadonlyMap<string, boolean> | undefined,
+  name: string,
+) =>
+  preferences !== undefined &&
+  (disabledByDefault ? preferences.get(name) === true : preferences.get(name) !== false);
 
 /** Enabled plugins in the user's ~/.gemini, by name, that a profile links and agy then loads. */
 export const readAntigravityUserPlugins = Effect.fn("readAntigravityUserPlugins")(function* (
@@ -190,7 +212,7 @@ export const readAntigravityUserPlugins = Effect.fn("readAntigravityUserPlugins"
     path.join(userHome, ".gemini", "config", "config.json"),
   );
   for (const [name, plugin] of plugins) {
-    if (!isAntigravityPluginEnabled(plugin.disabledByDefault, preferences.get(name))) {
+    if (!isAntigravityPluginEnabled(plugin.disabledByDefault, preferences, name)) {
       plugins.delete(name);
     }
   }
@@ -237,7 +259,7 @@ export const readAntigravityPlugins = Effect.fn("readAntigravityPlugins")(functi
   );
   return [...plugins]
     .filter(([name, plugin]) =>
-      isAntigravityPluginEnabled(plugin.disabledByDefault, preferences.get(name)),
+      isAntigravityPluginEnabled(plugin.disabledByDefault, preferences, name),
     )
     .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
     .map(([, plugin]) => plugin.directory);

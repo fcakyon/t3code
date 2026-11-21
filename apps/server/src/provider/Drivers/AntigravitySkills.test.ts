@@ -232,6 +232,48 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
       }),
   );
 
+  it.effect(
+    "skips an oversized plugin manifest and loads no plugins from invalid preferences",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const input = yield* makeWorkspace();
+        const config = path.join(input.userHome, ".gemini", "config");
+        for (const plugin of ["big", "ok", "off"]) {
+          yield* writeSkill(
+            path.join(config, "plugins", plugin, "skills", plugin),
+            `---\nname: ${plugin}\n---\n`,
+          );
+        }
+        yield* fileSystem.writeFileString(
+          path.join(config, "plugins", "big", "plugin.json"),
+          "x".repeat(1_000_001),
+        );
+        for (const plugin of ["ok", "off"]) {
+          yield* fileSystem.writeFileString(
+            path.join(config, "plugins", plugin, "plugin.json"),
+            "{}",
+          );
+        }
+        const names = () =>
+          discoverAntigravitySkills(input).pipe(
+            Effect.map((skills) => skills.map((skill) => skill.name)),
+          );
+        // A null entry leaves its plugin's default and keeps the explicit false beside it.
+        yield* fileSystem.writeFileString(
+          path.join(config, "config.json"),
+          JSON.stringify({ plugins: { ok: { enabled: null }, off: { enabled: false } } }),
+        );
+        assert.deepEqual(yield* names(), ["ok"]);
+        yield* fileSystem.writeFileString(
+          path.join(config, "config.json"),
+          '{"plugins":{"off":{"enabled":"no"}}}',
+        );
+        assert.deepEqual(yield* names(), []);
+      }),
+  );
+
   it.effect("uses native root order for duplicate names", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

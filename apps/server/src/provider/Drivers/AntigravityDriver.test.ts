@@ -263,6 +263,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
   });
   return {
     instance,
+    userHome: path.join(root, "home"),
     refresh,
     makeExecutable,
     fs,
@@ -319,6 +320,10 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
     () =>
       Effect.gen(function* () {
         const h = yield* makeHarness();
+        // One plugin with a manifest agy cannot load must not hide text generation.
+        const plugin = h.path.join(h.userHome, ".gemini", "config", "plugins", "broken");
+        yield* h.fs.makeDirectory(plugin, { recursive: true });
+        yield* h.fs.writeFileString(h.path.join(plugin, "plugin.json"), "x".repeat(1_000_001));
         yield* h.refresh();
         const snapshot = yield* h.instance.snapshot.getSnapshot;
         expect(snapshot.status).toBe("ready");
