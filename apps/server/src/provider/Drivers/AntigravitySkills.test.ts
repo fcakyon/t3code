@@ -1,11 +1,10 @@
-import { matchInlineSkills } from "@t3tools/shared/inlineSkills";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
-import { discoverAntigravitySkills, prepareAntigravityPluginSkills } from "./AntigravitySkills.ts";
+import { discoverAntigravitySkills } from "./AntigravitySkills.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
 const writeSkill = Effect.fn("writeSkill")(function* (directory: string, contents: string) {
@@ -95,130 +94,6 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
     }),
   );
 
-  it.effect(
-    "reads enabled plugin skills without merging same-name skills from different plugins",
-    () =>
-      Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const input = yield* makeWorkspace();
-        const config = path.join(input.userHome, ".gemini", "config");
-        const expected = [];
-        for (const name of ["alpha", "beta", "broken", "off", "disabled", "unregistered"]) {
-          const plugin = path.join(config, "plugins", name);
-          const skillPath = yield* writeSkill(
-            path.join(plugin, "skills", "review"),
-            "---\nname: review\ndescription: Review changes.\n---\n",
-          );
-          if (name !== "unregistered") {
-            yield* fileSystem.writeFileString(
-              path.join(plugin, "plugin.json"),
-              name === "off" || name === "broken"
-                ? "{ invalid"
-                : JSON.stringify({
-                    name: `Display ${name} --- plugin ---`,
-                    disabled: name === "beta" || name === "disabled",
-                  }),
-            );
-          }
-          if (name === "alpha" || name === "beta") {
-            expected.push({
-              name: `plugin:${name}:review`,
-              displayName: `${name}:review`,
-              description: "Review changes.",
-              path: skillPath,
-              scope: "user",
-              enabled: true,
-            });
-          }
-        }
-        yield* fileSystem.writeFileString(
-          path.join(config, "config.json"),
-          JSON.stringify({ plugins: { beta: { enabled: true }, off: { enabled: false } } }),
-        );
-        for (const [directory, scope] of [
-          [path.join(input.cwd, ".agents", "skills"), "project"],
-          [path.join(input.userHome, ".gemini", "config", "skills"), "user"],
-        ] as const) {
-          const name = `standalone-${scope}`;
-          const skillPath = yield* writeSkill(
-            path.join(directory, name),
-            `---\nname: ${name}\n---\n`,
-          );
-          expected.push({ name, path: skillPath, scope, enabled: true });
-        }
-        assert.deepEqual(yield* discoverAntigravitySkills(input), expected);
-        const directories = yield* prepareAntigravityPluginSkills({
-          userHome: input.userHome,
-          runtimeTempDirectory: yield* fileSystem.makeTempDirectoryScoped(),
-        });
-        const nativeSkills = yield* discoverAntigravitySkills({
-          cwd: directories[0]!,
-          userHome: path.join(input.userHome, "empty"),
-          profileDirectory: input.profileDirectory,
-        });
-        assert.deepEqual(
-          nativeSkills.map((skill) => skill.name),
-          ["plugin:alpha:review", "plugin:beta:review"],
-        );
-        for (const [index, skill] of nativeSkills.entries()) {
-          assert.include(
-            yield* fileSystem.readFileString(skill.path),
-            JSON.stringify(expected[index]!.path),
-          );
-          assert.equal(
-            directories[index + 1],
-            path.dirname(path.dirname(path.dirname(expected[index]!.path))),
-          );
-          assert.include(yield* fileSystem.readFileString(expected[index]!.path), "name: review\n");
-        }
-        for (const contents of ["{ invalid", '{"plugins":{"alpha":{"enabled":"yes"}}}']) {
-          yield* fileSystem.writeFileString(path.join(config, "config.json"), contents);
-          assert.deepEqual(yield* discoverAntigravitySkills(input), expected.slice(2));
-        }
-      }),
-  );
-
-  it.effect("keeps punctuation and prefix variants distinct and invocable", () =>
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const input = yield* makeWorkspace();
-      const directories = ["foo.bar", "foo_bar", "_alpha", "plugin_alpha", "alpha"];
-      for (const name of directories) {
-        const plugin = path.join(input.userHome, ".gemini", "config", "plugins", name);
-        yield* writeSkill(path.join(plugin, "skills", "review"), "---\nname: review\n---\n");
-        yield* fileSystem.writeFileString(path.join(plugin, "plugin.json"), "{}");
-      }
-      const skills = yield* discoverAntigravitySkills(input);
-      assert.lengthOf(skills, directories.length);
-      assert.equal(
-        new Set(skills.map((skill) => skill.name.toLowerCase())).size,
-        directories.length,
-      );
-      for (const skill of skills) {
-        const matches = [...matchInlineSkills("$" + skill.name, skills)];
-        assert.lengthOf(matches, 1);
-        assert.equal(matches[0]?.skill.path, skill.path);
-      }
-    }),
-  );
-
-  it.effect("preserves plugin directory case across separate homes", () =>
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const identifiers = [];
-      for (const name of ["alpha", "Alpha"]) {
-        const input = yield* makeWorkspace();
-        const plugin = path.join(input.userHome, ".gemini", "config", "plugins", name);
-        yield* writeSkill(path.join(plugin, "skills", "review"), "---\nname: review\n---\n");
-        yield* fileSystem.writeFileString(path.join(plugin, "plugin.json"), "{}");
-        identifiers.push(...(yield* discoverAntigravitySkills(input)).map((skill) => skill.name));
-      }
-      assert.deepEqual(identifiers, ["plugin:alpha:review", "plugin:_41_lpha:review"]);
-    }),
-  );
   it.effect("reads skills from enabled plugins in the instance's Antigravity profile", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -232,18 +107,129 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
           `---\nname: ${plugin}-skill\ndescription: From ${plugin}.\n---\n`,
         );
       }
+      for (const plugin of ["default-off", "opted-in"]) {
+        yield* writeSkill(
+          path.join(plugins, plugin, "skills", `${plugin}-skill`),
+          `---\nname: ${plugin}-skill\n---\n`,
+        );
+        yield* fileSystem.writeFileString(
+          path.join(plugins, plugin, "plugin.json"),
+          '{"disabled":true}',
+        );
+      }
       yield* fileSystem.writeFileString(
         path.join(profileDirectory, "config", "config.json"),
-        JSON.stringify({ plugins: { off: { enabled: false } } }),
+        JSON.stringify({ plugins: { off: { enabled: false }, "opted-in": { enabled: true } } }),
       );
       yield* fileSystem.writeFileString(path.join(plugins, ".DS_Store"), "x");
       const input = { ...workspace, profileDirectory };
 
       assert.deepEqual(
         (yield* discoverAntigravitySkills(input)).map((skill) => skill.name),
-        ["demo-skill"],
+        ["demo-skill", "opted-in-skill"],
       );
     }),
+  );
+
+  it.effect("skips an oversized profile config.json when no plugins are installed", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const input = yield* makeWorkspace();
+      const userSkill = yield* writeSkill(
+        path.join(input.userHome, ".gemini", "config", "skills", "user"),
+        "---\nname: user\n---\n",
+      );
+      const projectSkill = yield* writeSkill(
+        path.join(input.cwd, ".agents", "skills", "project"),
+        "---\nname: project\n---\n",
+      );
+      yield* fileSystem.makeDirectory(path.join(input.profileDirectory, "config"), {
+        recursive: true,
+      });
+      yield* fileSystem.writeFileString(
+        path.join(input.profileDirectory, "config", "config.json"),
+        " ".repeat(1_000_001),
+      );
+
+      assert.deepEqual(yield* discoverAntigravitySkills(input), [
+        { name: "project", path: projectSkill, scope: "project", enabled: true },
+        { name: "user", path: userSkill, scope: "user", enabled: true },
+      ]);
+    }),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "reads skills from enabled user plugins before the profile links them",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const input = yield* makeWorkspace();
+        const config = path.join(input.userHome, ".gemini", "config");
+        const profileConfig = path.join(input.profileDirectory, "config");
+        for (const [plugin, manifest, text] of [
+          ["on", "plugin.json"],
+          ["ag", ".antigravity-plugin/plugin.json"],
+          ["gem", ".gemini-plugin/plugin.json"],
+          ["off", "plugin.json"],
+          ["bare", undefined],
+          ["profile-off", "plugin.json"],
+          ["shadowed", "plugin.json"],
+          ["invalid", "plugin.json", "{"],
+          ["string-flag", "plugin.json", '{"disabled":"yes"}'],
+          ["null-flag", "plugin.json", '{"disabled":null}'],
+          ["default-off", "plugin.json", '{"disabled":true}'],
+          ["re-enabled", ".gemini-plugin/plugin.json", '{"disabled":true}'],
+          ["profile-blocked", "plugin.json", '{"disabled":true}'],
+        ] as const) {
+          const directory = path.join(config, "plugins", plugin);
+          yield* writeSkill(path.join(directory, "skills", plugin), `---\nname: ${plugin}\n---\n`);
+          if (manifest !== undefined) {
+            yield* fileSystem.makeDirectory(path.dirname(path.join(directory, manifest)), {
+              recursive: true,
+            });
+            yield* fileSystem.writeFileString(path.join(directory, manifest), text ?? "{}");
+          }
+        }
+        yield* fileSystem.writeFileString(
+          path.join(config, "config.json"),
+          JSON.stringify({
+            plugins: {
+              off: { enabled: false },
+              "re-enabled": { enabled: true },
+              "profile-blocked": { enabled: true },
+            },
+          }),
+        );
+        yield* writeSkill(
+          path.join(profileConfig, "plugins", "shadowed", "skills", "own"),
+          "---\nname: profile-shadowed\n---\n",
+        );
+        yield* fileSystem.writeFileString(
+          path.join(profileConfig, "config.json"),
+          JSON.stringify({
+            plugins: { "profile-off": { enabled: false }, "profile-blocked": { enabled: false } },
+          }),
+        );
+        // A link from before "off" was disabled goes on the next launch.
+        yield* fileSystem.symlink(
+          path.join(config, "plugins", "off"),
+          path.join(profileConfig, "plugins", "off"),
+        );
+
+        assert.deepEqual(
+          (yield* discoverAntigravitySkills(input)).map((skill) => [skill.name, skill.scope]),
+          [
+            ["ag", "user"],
+            ["gem", "user"],
+            ["null-flag", "user"],
+            ["on", "user"],
+            ["profile-shadowed", "user"],
+            ["re-enabled", "user"],
+          ],
+        );
+      }),
   );
 
   it.effect("uses native root order for duplicate names", () =>

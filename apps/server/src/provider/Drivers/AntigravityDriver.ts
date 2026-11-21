@@ -81,11 +81,7 @@ import {
 } from "@t3tools/provider-core/server/driver";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { withInstanceIdentity } from "@t3tools/provider-core/server/instanceIdentity";
-import {
-  discoverAntigravitySkills,
-  prepareAntigravityPluginSkills,
-  resolveAntigravityUserHome,
-} from "./AntigravitySkills.ts";
+import { discoverAntigravitySkills, resolveAntigravityUserHome } from "./AntigravitySkills.ts";
 
 const DRIVER = ProviderDriverKind.make("antigravity");
 const decodeSettings = Schema.decodeSync(AntigravitySettings);
@@ -234,7 +230,6 @@ export const AntigravityDriver: ProviderDriver<
     ): Effect.fn.Return<
       {
         readonly executable: AntigravityInstallation.AntigravityExecutable;
-        readonly runtimeTempDirectory: string;
         readonly spawn: AcpSessionRuntime.AcpSpawnInput;
       },
       AcpErrors.AcpError | ProviderSetupError,
@@ -305,7 +300,6 @@ export const AntigravityDriver: ProviderDriver<
       );
       return {
         executable,
-        runtimeTempDirectory,
         spawn: buildAntigravityAcpSpawnInput({
           installation: executable,
           profile,
@@ -327,30 +321,14 @@ export const AntigravityDriver: ProviderDriver<
       // `buildAntigravityAcpSpawnInput` sets `extendEnv: false`, so thread variables only reach the
       // agent's shell through `baseEnv`.
       const { processEnvironment: threadEnvironment, ...runtimeInput } = input;
-      const { executable, runtimeTempDirectory, spawn } = yield* prepareSpawn(
+      const { executable, spawn } = yield* prepareSpawn(
         runtimeInput.cwd,
         threadEnvironment === undefined
           ? processEnvironment
           : { ...processEnvironment, ...threadEnvironment },
       );
-      const pluginDirectories = yield* prepareAntigravityPluginSkills({
-        userHome,
-        runtimeTempDirectory,
-      }).pipe(
-        Effect.provideService(FileSystem.FileSystem, fileSystem),
-        Effect.provideService(Path.Path, path),
-        Effect.catch((cause) =>
-          Effect.logWarning("Antigravity plugin skills are unavailable.", {
-            errorTag: cause._tag,
-          }).pipe(Effect.as([])),
-        ),
-      );
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
-        additionalDirectories: [
-          ...(runtimeInput.additionalDirectories ?? []),
-          ...pluginDirectories,
-        ],
         runtimeVersion: executable.version,
         authMethod: auth.authMethod,
         childProcessSpawner: spawner,
@@ -629,7 +607,10 @@ export const AntigravityDriver: ProviderDriver<
           Effect.provideService(Path.Path, path),
           Effect.catch(() => Effect.logWarning("Could not save Antigravity permission modes.")),
         ),
-      supportsTextGeneration: isAntigravityTextGenerationAvailable(profileDirectory).pipe(
+      supportsTextGeneration: isAntigravityTextGenerationAvailable({
+        profileDirectory,
+        userHome,
+      }).pipe(
         Effect.provideService(FileSystem.FileSystem, fileSystem),
         Effect.provideService(Path.Path, path),
         Effect.orElseSucceed(() => false),
@@ -678,6 +659,7 @@ export const AntigravityDriver: ProviderDriver<
     });
     const textGeneration = yield* makeAntigravityTextGeneration({
       profileDirectory,
+      userHome,
       defaultModel,
       withProcess: authFlow.withProcess,
       makeRuntime: (cwd) =>
