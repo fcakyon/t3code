@@ -791,6 +791,36 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         yield* prepareAntigravityProfile({ profileDirectory, userHome });
         expect(yield* linkTarget("opted-in")).toBeUndefined();
         expect(yield* linkTarget("kept-off")).toBeUndefined();
+
+        // A malformed plugins map in profile config.json is never repaired during preparation.
+        const malformedProfileConfig = JSON.stringify({
+          plugins: { "opted-in": { enabled: "invalid" }, other: { enabled: true } },
+        });
+        yield* configure({ "opted-in": true });
+        yield* write(profileConfig, malformedProfileConfig);
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect(yield* fs.readFileString(profileConfig)).toBe(malformedProfileConfig);
+
+        // Plugin names colliding with Object.prototype still receive own enablement overrides.
+        for (const name of ["constructor", "__proto__"]) {
+          yield* write(path.join(userPlugins, name, "plugin.json"), '{"disabled":true}');
+        }
+        yield* write(
+          path.join(config, "config.json"),
+          '{"plugins":{"constructor":{"enabled":true},"__proto__":{"enabled":true}}}',
+        );
+        yield* fs.remove(profileConfig);
+        yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        const protoPlugins = JSON.parse(yield* fs.readFileString(profileConfig)).plugins as Record<
+          string,
+          unknown
+        >;
+        expect(Object.hasOwn(protoPlugins, "constructor")).toBe(true);
+        expect(protoPlugins.constructor).toEqual({ enabled: true });
+        expect(Object.hasOwn(protoPlugins, "__proto__")).toBe(true);
+        expect(Object.getOwnPropertyDescriptor(protoPlugins, "__proto__")?.value).toEqual({
+          enabled: true,
+        });
       }),
   );
 

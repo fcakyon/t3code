@@ -169,13 +169,14 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
         const config = path.join(input.userHome, ".gemini", "config");
         const profileConfig = path.join(input.profileDirectory, "config");
         for (const [plugin, manifest, text] of [
-          ["on", "plugin.json"],
+          ["on", "plugin.json", '{"skills":["./extra-skills"]}'],
           ["ag", ".antigravity-plugin/plugin.json"],
           ["gem", ".gemini-plugin/plugin.json"],
           ["off", "plugin.json"],
           ["bare", undefined],
           ["profile-off", "plugin.json"],
           ["shadowed", "plugin.json"],
+          ["blocked-by-file", "plugin.json"],
           ["invalid", "plugin.json", "{"],
           ["string-flag", "plugin.json", '{"disabled":"yes"}'],
           ["null-flag", "plugin.json", '{"disabled":null}'],
@@ -192,6 +193,15 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
             yield* fileSystem.writeFileString(path.join(directory, manifest), text ?? "{}");
           }
         }
+        yield* writeSkill(
+          path.join(config, "plugins", "on", "extra-skills", "extra"),
+          "---\nname: extra\n---\n",
+        );
+        // Root manifest disabled, but .antigravity-plugin/plugin.json takes precedence.
+        yield* fileSystem.writeFileString(
+          path.join(config, "plugins", "ag", "plugin.json"),
+          '{"disabled":true}',
+        );
         yield* fileSystem.writeFileString(
           path.join(config, "config.json"),
           JSON.stringify({
@@ -205,6 +215,10 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
         yield* writeSkill(
           path.join(profileConfig, "plugins", "shadowed", "skills", "own"),
           "---\nname: profile-shadowed\n---\n",
+        );
+        yield* fileSystem.writeFileString(
+          path.join(profileConfig, "plugins", "blocked-by-file"),
+          "not a directory",
         );
         yield* fileSystem.writeFileString(
           path.join(profileConfig, "config.json"),
@@ -222,6 +236,7 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
           (yield* discoverAntigravitySkills(input)).map((skill) => [skill.name, skill.scope]),
           [
             ["ag", "user"],
+            ["extra", "user"],
             ["gem", "user"],
             ["null-flag", "user"],
             ["on", "user"],
