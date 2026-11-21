@@ -242,22 +242,18 @@ interface AntigravityFlavorServices {
 export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
-  const { profileDirectory } = options;
+  const { fileSystem, path, profileDirectory } = options;
   const commandTasks = makeAntigravityCommandTaskTracker(profileDirectory);
   const repliesWithoutPrompt = (version: string | undefined) =>
     version !== undefined && compareSemverVersions(version, "1.5.11") >= 0;
   const antigravityClientFileRoots = Effect.fn("AntigravityAdapterV2.antigravityClientFileRoots")(
     function* (cwd: string | null) {
-      const worktreeGitDir = yield* resolveGitWorktreeDirectory({
-        fileSystem: options.fileSystem,
-        path: options.path,
-        cwd,
-      });
-      return [
-        ...(cwd === null ? [] : [cwd]),
-        options.host.paths.attachmentsDir,
-        ...(worktreeGitDir === undefined ? [] : [worktreeGitDir]),
-      ];
+      const { attachmentsDir } = options.host.paths;
+      if (cwd === null) return [attachmentsDir];
+      const worktreeGitDir = yield* resolveGitWorktreeDirectory({ fileSystem, path, cwd });
+      return worktreeGitDir === undefined
+        ? [cwd, attachmentsDir]
+        : [cwd, attachmentsDir, worktreeGitDir];
     },
   );
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
@@ -441,17 +437,15 @@ export function makeAntigravityAcpAdapterFlavor(
     sessionModeForPolicy: (policy) => antigravityPermissionMode(policy.runtimeMode),
     runtimeModeForSessionMode: antigravityRuntimeModeForSessionMode,
     clientFileSystem: {
-      readTextFile: (request, cwd) =>
-        antigravityClientFileRoots(cwd).pipe(
-          Effect.flatMap((allowedRoots) =>
-            readAntigravityClientTextFile({
-              fileSystem: options.fileSystem,
-              path: options.path,
-              allowedRoots,
-              request,
-            }),
-          ),
-        ),
+      readTextFile: Effect.fn("AntigravityAdapterV2.readTextFile")(function* (request, cwd) {
+        const allowedRoots = yield* antigravityClientFileRoots(cwd);
+        return yield* readAntigravityClientTextFile({
+          fileSystem,
+          path,
+          allowedRoots,
+          request,
+        });
+      }),
     },
     permissionDisposition: antigravityPermissionDisposition,
     approvalOptions: antigravityApprovalOptions,
