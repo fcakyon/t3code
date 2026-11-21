@@ -151,6 +151,9 @@ export const ACP_PROTOCOL = "acp.ndjson-jsonrpc" as const;
 const ACP_DEFERRED_FINALIZE_DEBOUNCE: Duration.Input = "3000 millis";
 // A model can stay silent this long before the first token of a reply the agent started itself.
 const ACP_OPEN_REPLY_QUIET_LIMIT: Duration.Input = "2 minutes";
+const ACP_HELD_TOOL_POLL: Duration.Input = "2 seconds";
+// A hung command never wakes the agent. After this silence its run completes and the command stays listed.
+const ACP_SILENT_HOLD_RELEASE_MILLIS = 10 * 60_000;
 const ACP_BUSY_PROMPT_RETRY_INTERVAL: Duration.Input = "1 second";
 // Agents such as omp advertise a loaded session's commands shortly after answering session/load.
 const ACP_LOADED_COMMANDS_WAIT: Duration.Input = "2 seconds";
@@ -651,6 +654,14 @@ export interface AcpAdapterV2Flavor {
    * tool ends. With `deferFinalizeForBackgroundWork`, the turn stays open until then.
    */
   readonly toolOutlivesPrompt?: (toolCall: AcpToolCallState) => boolean;
+  /**
+   * Output so far of a held `toolOutlivesPrompt` tool the user can Stop, or undefined when it
+   * is not tracked. A held turn whose tracked tools stay silent is released.
+   */
+  readonly heldToolOutput?: (input: {
+    readonly sessionId: string;
+    readonly toolCallId: string;
+  }) => Effect.Effect<string | undefined>;
   readonly isProviderWakeNotification?: (
     notification: EffectAcpSchema.SessionNotification,
   ) => boolean;
@@ -1798,6 +1809,7 @@ interface ActiveAcpTurn {
   /** Clock millis of the prompt's last progress, for `promptInactivityTimeout`. */
   lastProgressAt: number;
   inactivityWatchdog: Fiber.Fiber<void> | undefined;
+  watchingHeldTools?: boolean;
 }
 
 type AcpRuntimeTeardownState =
@@ -4666,12 +4678,79 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             acpSubagentStatusBlocksTurnSettlement(subagent.task.status),
           );
 
+        const watchHeldTools = Effect.fnUntraced(function* (context: ActiveAcpTurn) {
+          const heldToolOutput = flavor.heldToolOutput;
+          if (heldToolOutput === undefined || context.watchingHeldTools === true) return;
+          context.watchingHeldTools = true;
+          const held = () =>
+            context.finalized || !context.promptSettled
+              ? []
+              : [...context.tools.values()].filter(
+                  (tool) =>
+                    toolStatus(tool.status) === "running" &&
+                    flavor.toolOutlivesPrompt?.(tool) === true,
+                );
+          context.lastProgressAt = Math.max(context.lastProgressAt, yield* Clock.currentTimeMillis);
+          let tracked = false;
+          const streamOutput = Effect.gen(function* () {
+            const outputs = yield* Effect.forEach(held(), (tool) =>
+              heldToolOutput({
+                sessionId: context.nativeThreadId,
+                toolCallId: tool.toolCallId,
+              }).pipe(Effect.map((output) => [tool.toolCallId, output] as const)),
+            );
+            yield* runtimeCallbackPermit.withPermit(
+              Effect.gen(function* () {
+                tracked = outputs.every(([, output]) => output !== undefined);
+                for (const [toolCallId, output] of outputs) {
+                  const tool = context.tools.get(toolCallId);
+                  if (
+                    tool === undefined ||
+                    !held().includes(tool) ||
+                    !output ||
+                    output === toolOutputText(tool)
+                  )
+                    continue;
+                  context.lastProgressAt = yield* Clock.currentTimeMillis;
+                  yield* emitTool(context, setToolOutputText(tool, output));
+                }
+              }),
+            );
+          });
+          const releaseWhenSilent = Effect.gen(function* () {
+            const left =
+              context.lastProgressAt +
+              ACP_SILENT_HOLD_RELEASE_MILLIS -
+              (yield* Clock.currentTimeMillis);
+            if (left > 0 || !tracked) return left;
+            for (const tool of held()) yield* emitTool(context, { ...tool, status: "completed" });
+            return left;
+          });
+          // Log reads yield, so the release sleeps to its own deadline instead of counting polls.
+          yield* Effect.all(
+            [
+              Effect.sleep(ACP_HELD_TOOL_POLL).pipe(
+                Effect.andThen(streamOutput),
+                Effect.repeat({ while: () => held().length > 0 }),
+              ),
+              runtimeCallbackPermit.withPermit(releaseWhenSilent).pipe(
+                Effect.flatMap((left) => Effect.sleep(left > 0 ? left : ACP_HELD_TOOL_POLL)),
+                Effect.repeat({ while: () => held().length > 0 }),
+              ),
+            ],
+            { concurrency: "unbounded", discard: true },
+          ).pipe(
+            Effect.ensuring(Effect.sync(() => (context.watchingHeldTools = false))),
+            Effect.forkIn(sessionScope),
+          );
+        });
+
         const rearmDeferredFinalize =
           /* Provider events include streaming deltas; avoid a span for each update. */
           Effect.fnUntraced(function* (context: ActiveAcpTurn) {
             if (!defersFinalizeForBackgroundWork) return;
             if (!context.promptSettled || context.finalized) return;
-            if (hasDeferredBackgroundWork(context)) return;
+            if (hasDeferredBackgroundWork(context)) return yield* watchHeldTools(context);
             yield* scheduleDeferredFinalize(context);
           });
 
@@ -9557,6 +9636,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   if (deferredBackgroundWork || pendingReply) {
                     if (deferredBackgroundWork) {
                       context.deferredForBackgroundWork = true;
+                      yield* watchHeldTools(context);
                     }
                     yield* closeTextStreams(context);
                     if (pendingReply) {
@@ -10704,6 +10784,20 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           yield* Ref.set(runtimeRestartRequired, true);
                           yield* Ref.set(runtimeTeardownState, { _tag: "Idle" });
                           yield* Deferred.succeed(teardownBarrier, undefined).pipe(Effect.ignore);
+                        }
+                        // A released hold leaves no turn, yet Stop must still end the listed command.
+                        const listedBackgroundTasks = (yield* Ref.get(
+                          providerThreadByNativeSessionId,
+                        )).get(
+                          turnInput.providerThread.nativeThreadRef?.nativeId ?? "",
+                        )?.pendingBackgroundTasks;
+                        if (
+                          context === null &&
+                          turnInput.requestRuntimeRestart === true &&
+                          (listedBackgroundTasks?.length ?? 0) > 0
+                        ) {
+                          yield* quarantineStoppedRun();
+                          yield* runtime.cancel;
                         }
                         return undefined;
                       }

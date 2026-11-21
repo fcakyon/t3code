@@ -5,6 +5,7 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
 import { OrchestrationV2PendingBackgroundTask } from "@t3tools/contracts";
+import { normalizeTerminalOutput } from "@t3tools/shared/terminalOutput";
 import type {
   OrchestrationV2NativeChildStep,
   OrchestrationV2NativeChildWork,
@@ -1030,6 +1031,9 @@ const readCommandTasks = Effect.fn("AntigravityCommandTaskTracker.readNative")(f
   });
 });
 
+const COMMAND_LOG_TAIL_BYTES = 32_768;
+const COMMAND_LOG_TAIL_CHARS = 8_000;
+
 interface CommandTaskState {
   readonly commands: Map<string, { command: string; taskId: string | undefined }>;
   native: ReadonlyArray<NonNullable<ReturnType<typeof decodeCommandTask>>> | undefined;
@@ -1040,6 +1044,51 @@ interface CommandTaskState {
 export function makeAntigravityCommandTaskTracker(profileDirectory: string | undefined) {
   const sessions = new Map<string, CommandTaskState>();
   return {
+    /** The tail of a listed command's log, or undefined when the command is not listed. */
+    output: Effect.fn("AntigravityCommandTaskTracker.output")(function* (input: {
+      readonly sessionId: string;
+      readonly toolCallId: string;
+    }) {
+      const taskId = sessions.get(input.sessionId)?.commands.get(input.toolCallId)?.taskId;
+      if (profileDirectory === undefined || taskId === undefined) return undefined;
+      return yield* Effect.tryPromise({
+        try: async () => {
+          const root = await antigravityProfileRoot(profileDirectory);
+          if (root === undefined) return "";
+          const log = await antigravityManagedPath(
+            root,
+            [
+              "antigravity-acp",
+              "brain",
+              input.sessionId,
+              ".system_generated",
+              "tasks",
+              `${taskId.slice(taskId.lastIndexOf("/") + 1)}.log`,
+            ],
+            "file",
+          );
+          if (log === undefined) return "";
+          const handle = await NodeFSP.open(
+            log.path,
+            NodeFS.constants.O_RDONLY | (NodeFS.constants.O_NOFOLLOW ?? 0),
+          );
+          try {
+            const stat = await handle.stat();
+            if (!stat.isFile()) return "";
+            const start = Math.max(0, stat.size - COMMAND_LOG_TAIL_BYTES);
+            const buffer = Buffer.alloc(stat.size - start);
+            const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+            return normalizeTerminalOutput(
+              buffer.toString("utf8", 0, bytesRead),
+              COMMAND_LOG_TAIL_CHARS,
+            ).text;
+          } finally {
+            await handle.close();
+          }
+        },
+        catch: (cause) => new AntigravityChildWorkReadError({ cause }),
+      }).pipe(Effect.orElseSucceed(() => ""));
+    }),
     changes: Effect.fn("AntigravityCommandTaskTracker.changes")(function* (
       sessionId: string,
       onReady: () => void,

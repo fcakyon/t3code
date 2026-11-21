@@ -2476,6 +2476,103 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
         assert.equal(opened.cancels(), cancels);
       }).pipe(Effect.provide(layerSession)),
   );
+
+  // A hung command never wakes agy, so its run must not stay open on silence alone.
+  it.effect.each([{ after: "Stop" }, { after: "the command finishing" }] as const)(
+    "streams a listed command's log and completes its run after 10 silent minutes ($after)",
+    ({ after }) =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const { profile } = yield* makeProfile({
+          sessionId: "mock-session-1",
+          steps: () => [
+            [
+              7,
+              21,
+              commandTaskStep({
+                taskId: "mock-session-1/task-7",
+                command: "node fetch_throughput.mjs",
+                summary: "Fetch throughput",
+                callId: "call_fetch",
+              }),
+            ],
+          ],
+        });
+        const tasks = path.join(
+          profile,
+          "antigravity-acp",
+          "brain",
+          "mock-session-1",
+          ".system_generated",
+          "tasks",
+        );
+        yield* fileSystem.makeDirectory(tasks, { recursive: true });
+        const log = (text: string) =>
+          fileSystem.writeFileString(path.join(tasks, "task-7.log"), text);
+        const opened = yield* openSessionWithRunningCommand(
+          { WaitMsBeforeAsync: 10000 },
+          undefined,
+          undefined,
+          {
+            profileDirectory: profile,
+          },
+        );
+        const throughOutput = (text: string) =>
+          TestClock.adjust("2 seconds").pipe(
+            Effect.andThen(
+              opened.until(
+                (event) =>
+                  event.type === "turn_item.updated" &&
+                  event.turnItem.nativeItemRef?.nativeId === "call_fetch" &&
+                  JSON.stringify(event.turnItem).includes(text),
+              ),
+            ),
+          );
+        yield* log("page 1\n");
+        yield* opened.startTurn(1, false);
+        const started = yield* opened.throughPromptSettled;
+        yield* throughOutput("page 1");
+        yield* TestClock.adjust("8 minutes");
+        yield* log("page 1\npage 2\n");
+        yield* throughOutput("page 2");
+        // Output moved the silence window, so the run still streams 17 minutes after settling.
+        yield* TestClock.adjust("9 minutes");
+        yield* log("page 1\npage 2\npage 3\n");
+        yield* throughOutput("page 3");
+        yield* TestClock.adjust("10 minutes");
+        const item = (yield* opened.until(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === "call_fetch" &&
+            event.turnItem.status === "completed",
+        )).at(-1);
+        assert.include(JSON.stringify(item), "page 3", "the handoff keeps the command's output");
+        yield* TestClock.adjust("3 seconds");
+        const terminal = (yield* opened.throughTerminal).at(-1);
+        assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
+        assert.isTrue(yield* opened.session.hasPendingBackgroundWork!, "the command stays listed");
+        assert.equal(opened.cancels(), 0);
+        if (after === "Stop") {
+          const turn = started.find((event) => event.type === "provider_turn.updated");
+          if (turn?.type !== "provider_turn.updated") return assert.fail("the turn must start");
+          yield* opened.session.interruptTurn({
+            providerThread: opened.providerThread,
+            providerTurnId: turn.providerTurn.id,
+            requestRuntimeRestart: true,
+          });
+          assert.equal(opened.cancels(), 1, "Stop must still reach the listed command");
+        } else {
+          yield* opened.send({
+            sessionUpdate: "tool_call_update",
+            ...opened.command,
+            status: "completed",
+            rawOutput: { output: "Command exited with code 0.", exit_code: 0 },
+          });
+          assert.lengthOf(opened.offers, 1, "the late finish still wakes the thread");
+        }
+      }).pipe(Effect.provide(layerSession)),
+  );
 });
 
 describe("AntigravityAdapterV2 subagent reads", () => {
