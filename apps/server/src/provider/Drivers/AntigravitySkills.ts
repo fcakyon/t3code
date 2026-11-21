@@ -303,30 +303,19 @@ function narrowSkillFilter(
   return { includeGroups, excludePatterns };
 }
 
-function resolveSkillsConfigPath(
-  path: Path.Path,
-  rawPath: string,
-  baseDir: string,
-  userHome: string,
-): string {
-  if (rawPath === "~") return userHome;
-  if (rawPath.startsWith("~/") || rawPath.startsWith("~\\")) {
-    return path.join(userHome, rawPath.slice(2));
-  }
+// agy does not expand ~, so a ~/ path stays relative to the config file.
+function resolveSkillsConfigPath(path: Path.Path, rawPath: string, baseDir: string): string {
   return path.isAbsolute(rawPath) ? path.resolve(rawPath) : path.resolve(baseDir, rawPath);
 }
 
 const scanSkillDirectories = Effect.fn("scanAntigravitySkillDirectories")(function* (
   roots: ReadonlyArray<SkillRoot>,
   budget: ScanBudget,
-  skillsConfigs?: {
-    readonly userHome: string;
-    readonly configs: ReadonlyArray<{
-      readonly configPath: string;
-      readonly baseDir: string;
-      readonly scope: string;
-    }>;
-  },
+  skillsConfigs?: ReadonlyArray<{
+    readonly configPath: string;
+    readonly baseDir: string;
+    readonly scope: string;
+  }>,
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -405,7 +394,6 @@ const scanSkillDirectories = Effect.fn("scanAntigravitySkillDirectories")(functi
     configPath: string,
     baseDir: string,
     scope: string,
-    userHome: string,
     filter: SkillEntryFilter,
     visitedConfigs: ReadonlySet<string>,
     depth: number,
@@ -437,19 +425,18 @@ const scanSkillDirectories = Effect.fn("scanAntigravitySkillDirectories")(functi
     const nextVisited = new Set(visitedConfigs);
     nextVisited.add(resolvedConfigPath);
     for (const inherited of parsed.value.inherits ?? []) {
-      const inheritedPath = resolveSkillsConfigPath(path, inherited.path, baseDir, userHome);
+      const inheritedPath = resolveSkillsConfigPath(path, inherited.path, baseDir);
       yield* scanSkillsConfig(
         inheritedPath,
         path.dirname(inheritedPath),
         scope,
-        userHome,
         narrowSkillFilter(filter, inherited),
         nextVisited,
         depth + 1,
       );
     }
     for (const entry of parsed.value.entries ?? []) {
-      const entryDirectory = resolveSkillsConfigPath(path, entry.path, baseDir, userHome);
+      const entryDirectory = resolveSkillsConfigPath(path, entry.path, baseDir);
       yield* scanDirectory(entryDirectory, scope, true, narrowSkillFilter(filter, entry), true);
     }
   });
@@ -458,18 +445,15 @@ const scanSkillDirectories = Effect.fn("scanAntigravitySkillDirectories")(functi
     yield* scanDirectory(root.directory, root.scope, true);
   }
 
-  if (skillsConfigs !== undefined) {
-    for (const config of skillsConfigs.configs) {
-      yield* scanSkillsConfig(
-        config.configPath,
-        config.baseDir,
-        config.scope,
-        skillsConfigs.userHome,
-        EMPTY_SKILL_FILTER,
-        new Set(),
-        0,
-      );
-    }
+  for (const config of skillsConfigs ?? []) {
+    yield* scanSkillsConfig(
+      config.configPath,
+      config.baseDir,
+      config.scope,
+      EMPTY_SKILL_FILTER,
+      new Set(),
+      0,
+    );
   }
   return [...skillsByName.values()].sort((left, right) => left.name.localeCompare(right.name));
 });
@@ -600,26 +584,23 @@ export const discoverAntigravitySkills = Effect.fn("discoverAntigravitySkills")(
       { directory: path.resolve(input.cwd, ".agent", "skills"), scope: "project" },
     ],
     { remainingBytes: MAX_SCAN_BYTES, remainingEntries: MAX_SCAN_ENTRIES },
-    {
-      userHome: input.userHome,
-      configs: [
-        {
-          configPath: path.resolve(input.cwd, ".agents", "skills.json"),
-          baseDir: input.cwd,
-          scope: "project",
-        },
-        {
-          configPath: path.resolve(input.cwd, ".agent", "skills.json"),
-          baseDir: input.cwd,
-          scope: "project",
-        },
-        {
-          configPath: path.join(input.userHome, ".gemini", "config", "skills.json"),
-          baseDir: path.join(input.userHome, ".gemini", "config"),
-          scope: "user",
-        },
-      ],
-    },
+    [
+      {
+        configPath: path.resolve(input.cwd, ".agents", "skills.json"),
+        baseDir: input.cwd,
+        scope: "project",
+      },
+      {
+        configPath: path.resolve(input.cwd, ".agent", "skills.json"),
+        baseDir: input.cwd,
+        scope: "project",
+      },
+      {
+        configPath: path.join(input.userHome, ".gemini", "config", "skills.json"),
+        baseDir: path.join(input.userHome, ".gemini", "config"),
+        scope: "user",
+      },
+    ],
   );
   const userConfig = path.join(input.userHome, ".gemini", "config");
   const plugins = yield* discoverAntigravityPlugins(userConfig, false);
