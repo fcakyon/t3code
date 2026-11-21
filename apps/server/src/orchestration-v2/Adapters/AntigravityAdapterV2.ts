@@ -44,6 +44,7 @@ import {
   makeAntigravitySubagentTracker,
   makeAntigravityCommandTaskTracker,
   readAntigravityChildrenAtWork,
+  readAntigravityPendingReply,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import {
   readAntigravityClientTextFile,
@@ -55,7 +56,7 @@ import {
 } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
-  antigravityCommandOutlivesPrompt,
+  antigravityToolOutlivesPrompt,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
   extractAntigravityUserInputQuestion,
@@ -416,7 +417,7 @@ export function makeAntigravityAcpAdapterFlavor(
     // reply and asks for permissions, and no prompt response ever ends that reply.
     wakeOnDetachedRequest: true,
     replyEndsWithUsageUpdate: ({ agentInfo }) => repliesWithoutPrompt(agentInfo?.version),
-    toolOutlivesPrompt: antigravityCommandOutlivesPrompt,
+    toolOutlivesPrompt: antigravityToolOutlivesPrompt,
     // session/cancel ends the agent's running commands, so only Stop sends it once the prompt
     // has ended. A message sent while a command runs leaves the command alone.
     preserveRuntimeOnSettledInterrupt: true,
@@ -488,6 +489,11 @@ export function makeAntigravityAcpAdapterFlavor(
                   toolCallIds: nativeTaskIds,
                 })
               : Effect.undefined,
+          hasPendingReply: (sessionId: string) =>
+            readAntigravityPendingReply({
+              profileDirectory,
+              sessionId,
+            }),
         }),
   };
 }
