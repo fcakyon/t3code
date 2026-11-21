@@ -220,25 +220,30 @@ function extractPrimaryPath(data: Record<string, unknown> | undefined): string |
   return collectToolFilePaths(data)[0];
 }
 
-function mergeToolContent(previous: unknown, next: unknown): unknown {
-  if (!Array.isArray(previous) || !Array.isArray(next)) {
-    return next;
+/** A diff resent without a patch keeps the located patch an earlier update computed for its path. */
+function withLocatedDiffPatches(previous: unknown, next: ReadonlyArray<unknown>) {
+  const located = new Map<string, Record<string, unknown>>();
+  for (const entry of Array.isArray(previous) ? previous : []) {
+    const diff = asRecord(entry);
+    const patch = asRecord(diff?.patch);
+    if (
+      diff?.type === "diff" &&
+      typeof diff.path === "string" &&
+      patch?.format === undefined &&
+      typeof patch?.text === "string"
+    )
+      located.set(diff.path, diff);
   }
+  if (located.size === 0) return next;
+  // An update that empties content would drop a patch a later normalizer can no longer compute.
+  if (next.length === 0) return [...located.values()];
   return next.map((entry) => {
-    const nextEntry = asRecord(entry);
-    if (!nextEntry || nextEntry.type !== "diff" || nextEntry.patch !== undefined) {
-      return entry;
-    }
-    const previousDiff = previous
-      .map(asRecord)
-      .find(
-        (candidate) =>
-          candidate?.type === "diff" &&
-          candidate.path === nextEntry.path &&
-          candidate.patch !== undefined &&
-          asRecord(candidate.patch)?.format !== "omitted",
-      );
-    return previousDiff ? { ...nextEntry, patch: previousDiff.patch } : entry;
+    const diff = asRecord(entry);
+    const patch =
+      diff?.type === "diff" && diff.patch === undefined && typeof diff.path === "string"
+        ? located.get(diff.path)?.patch
+        : undefined;
+    return patch === undefined ? entry : { ...diff, patch };
   });
 }
 
@@ -261,8 +266,8 @@ export function mergeToolActivityData(
       delete merged[key];
     }
   }
-  if (previousRecord && nextRecord.content !== undefined && nextRecord.content !== null) {
-    merged.content = mergeToolContent(previousRecord.content, nextRecord.content);
+  if (Array.isArray(nextRecord.content)) {
+    merged.content = withLocatedDiffPatches(previousRecord?.content, nextRecord.content);
   }
   if (!previousRecord || nextRecord.rawInput === null) {
     return merged;

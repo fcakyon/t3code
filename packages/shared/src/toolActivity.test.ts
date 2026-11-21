@@ -32,36 +32,24 @@ describe("toolActivity", () => {
     expect(
       mergeToolActivityData({ rawInput: { path: "src/a.ts" } }, { rawInput: { startLine: 4 } }),
     ).toEqual({ rawInput: { startLine: 4 } });
-    expect(
-      mergeToolActivityData(
-        {
-          content: [
-            { type: "diff", path: "src/a.ts", patch: { text: "@@ -1,1 +1,1 @@\n-a\n+b\n" } },
-          ],
-        },
-        {
-          content: [{ type: "diff", path: "src/a.ts", oldText: "a\n", newText: "b\n" }],
-        },
-      ),
-    ).toEqual({
-      content: [
-        {
-          type: "diff",
-          path: "src/a.ts",
-          oldText: "a\n",
-          newText: "b\n",
-          patch: { text: "@@ -1,1 +1,1 @@\n-a\n+b\n" },
-        },
-      ],
-    });
-    expect(
-      mergeToolActivityData(
-        { content: [{ type: "diff", path: "src/a.ts", patch: { format: "omitted" } }] },
-        { content: [{ type: "diff", path: "src/a.ts", oldText: "", newText: "created\n" }] },
-      ),
-    ).toEqual({
-      content: [{ type: "diff", path: "src/a.ts", oldText: "", newText: "created\n" }],
-    });
+  });
+
+  it("keeps a located diff patch when a later update resends that diff without one", () => {
+    const resent = { type: "diff", path: "src/a.ts", oldText: "a\n", newText: "b\n" };
+    const merge = (patch: unknown, content: unknown = [resent, { ...resent, path: "src/b.ts" }]) =>
+      mergeToolActivityData({ content: [{ ...resent, patch }] }, { content })?.content;
+    const located = { text: "@@ -9,1 +9,1 @@\n-a\n+b\n" };
+    expect(merge(located)).toEqual([
+      { ...resent, patch: located },
+      { ...resent, path: "src/b.ts" },
+    ]);
+    // An update that empties content keeps the located diff, and null still clears it.
+    expect(merge(located, [])).toEqual([{ ...resent, patch: located }]);
+    expect(merge(located, null)).toBeUndefined();
+    for (const patch of [{ format: "snippet", text: located.text }, { format: "omitted" }]) {
+      expect(merge(patch)).toEqual([resent, { ...resent, path: "src/b.ts" }]);
+      expect(merge(patch, [])).toEqual([]);
+    }
   });
 
   it("recognizes computer-use REPL calls before result metadata exists", () => {

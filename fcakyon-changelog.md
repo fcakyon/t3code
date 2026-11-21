@@ -4,7 +4,8 @@ Active fork-only features, fixes, and release infrastructure on `nightly` (relat
 
 - feat: Fork nightly release pipeline, `fcakyon/t3code` update feeds, unsigned macOS `.zip` update swap in `ElectronUpdater`, and SSH reconnect test Node resolution ([`aa3e7435e4`](https://github.com/fcakyon/t3code/commit/aa3e7435e4), [`b38ff47b14`](https://github.com/fcakyon/t3code/commit/b38ff47b14), [`59b6cf0ff9`](https://github.com/fcakyon/t3code/commit/59b6cf0ff9), [`453db3b3ab`](https://github.com/fcakyon/t3code/commit/453db3b3ab), [`935e25e3aa`](https://github.com/fcakyon/t3code/commit/935e25e3aa))
 - fix: Resume Antigravity sessions without replaying old tools and enable linked Gemini video attachments on qualified 1.5.9/1.5.11 runtimes ([`18265feecd`](https://github.com/fcakyon/t3code/commit/18265feecd), [`e20aeaa67d`](https://github.com/fcakyon/t3code/commit/e20aeaa67d))
-- fix: Restore Antigravity 1.5 `edit_file` diff previews while running and over 8 KB ([`e20aeaa67d`](https://github.com/fcakyon/t3code/commit/e20aeaa67d))
+- fix: Place running Antigravity edits and use the completed file diff for final line numbers ([pingdotgg/t3code#39073](https://github.com/pingdotgg/t3code/pull/39073)).
+- docs: Remove the root Claude configuration shim.
 - fix: Let Antigravity sessions read a linked git worktree's backing gitdir, also from subdirectories, after checking its backlink ([pingdotgg/t3code#39078](https://github.com/pingdotgg/t3code/pull/39078))
 - fix: Link enabled global Antigravity plugins from `~/.gemini/config/plugins` into each instance profile, so their skills, hooks and MCP servers load in T3 threads, replacing the earlier skills-only catalog ([pingdotgg/t3code#39082](https://github.com/pingdotgg/t3code/pull/39082))
 - fix: Auto-refresh expired Antigravity 1.5 CLI OAuth tokens during usage limit probes ([`d2803c084a`](https://github.com/fcakyon/t3code/commit/d2803c084a))

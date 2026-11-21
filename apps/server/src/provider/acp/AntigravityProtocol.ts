@@ -15,6 +15,7 @@ import type { AcpToolCallState } from "@t3tools/provider-acp/server/runtimeModel
 import {
   ANTIGRAVITY_EDIT_DIFF_OMITTED,
   antigravityEditPatch,
+  antigravityWholeFilePatch,
   isAntigravitySnippetPatch,
   readAntigravityPreEditFile,
 } from "./AntigravityEditLocation.ts";
@@ -353,6 +354,40 @@ export function makeAntigravityReadRepair() {
   };
 }
 
+const WHOLE_FILE_PATCH_META_KEY = "t3code.wholeFilePatch";
+function readEditFileInput(input: unknown) {
+  if (!Predicate.isObject(input)) return undefined;
+  const Target = input.Target ?? input.target;
+  const Replacement = input.Replacement ?? input.replacement;
+  return typeof Target === "string" && typeof Replacement === "string"
+    ? { Target, Replacement }
+    : undefined;
+}
+
+/**
+ * 1.5 runtimes complete `edit_file` with the whole file before and after it; over 8 KB both are
+ * cut. Any other diff may hold the edit's snippets, whose lines are not the file's.
+ */
+function wholeFilePatchBeforeCut(
+  update: { readonly status?: string | null; readonly rawInput?: unknown },
+  entry: EffectAcpSchema.ToolCallContent,
+  budget: ToolPayloadBudget,
+): string | undefined {
+  if (
+    update.status !== "completed" ||
+    readEditFileInput(update.rawInput) === undefined ||
+    entry.type !== "diff" ||
+    !("path" in entry) ||
+    typeof entry.oldText !== "string"
+  )
+    return undefined;
+  const patch = antigravityWholeFilePatch(entry.path, entry.oldText, entry.newText);
+  if (patch === undefined || patch.length > Math.min(TOOL_TEXT_LIMIT, budget.text))
+    return undefined;
+  budget.text -= patch.length;
+  return patch;
+}
+
 export function normalizeAntigravitySessionUpdate(
   notification: EffectAcpSchema.SessionNotification,
 ): EffectAcpSchema.SessionNotification {
@@ -361,13 +396,24 @@ export function normalizeAntigravitySessionUpdate(
     return notification;
   }
   const contentBudget = { nodes: 512, text: 32_000 };
+  const wholeFilePatches: Record<string, string> = {};
   const content = update.content?.flatMap((entry) => {
+    const patch = wholeFilePatchBeforeCut(update, entry, contentBudget);
+    if (patch !== undefined && "path" in entry) wholeFilePatches[entry.path] = patch;
     const decoded = Option.getOrUndefined(
       decodeToolCallContent(sanitizeToolValue(entry, contentBudget, 0)),
     );
     return decoded === undefined ? [] : [decoded];
   });
-  const meta = sanitizeAntigravityToolPayload(update._meta);
+  const receivedMeta = sanitizeAntigravityToolPayload(update._meta);
+  // A v1 diff has no patch field, so the patches travel in the update's metadata.
+  const meta =
+    Object.keys(wholeFilePatches).length === 0
+      ? receivedMeta
+      : {
+          ...(Predicate.isObject(receivedMeta) ? receivedMeta : {}),
+          [WHOLE_FILE_PATCH_META_KEY]: wholeFilePatches,
+        };
   return {
     ...notification,
     update: {
@@ -380,7 +426,9 @@ export function normalizeAntigravitySessionUpdate(
         ? { rawOutput: sanitizeAntigravityToolPayload(update.rawOutput) }
         : {}),
       ...(update.content !== undefined ? { content: content ?? [] } : {}),
-      ...(update._meta !== undefined ? { _meta: isJsonRecord(meta) ? meta : null } : {}),
+      ...(update._meta !== undefined || meta !== receivedMeta
+        ? { _meta: isJsonRecord(meta) ? meta : null }
+        : {}),
     },
   };
 }
@@ -411,6 +459,100 @@ function hasTruncatedText(value: unknown): boolean {
   return Predicate.isObject(value) && Object.values(value).some(hasTruncatedText);
 }
 
+/** The ACP adapter renders a diff's `patch.text` ahead of its bare old/new snippets. */
+function withAntigravityEditPatches(
+  content: ReadonlyArray<unknown>,
+  data: Record<string, unknown>,
+  readPreEditFile: ((path: string) => string | undefined) | undefined,
+  wholeFilePatches: unknown,
+) {
+  return content.map((received) => {
+    if (
+      !Predicate.isObject(received) ||
+      received.type !== "diff" ||
+      typeof received.path !== "string"
+    )
+      return received;
+    const wholeFilePatch = Predicate.isObject(wholeFilePatches)
+      ? wholeFilePatches[received.path]
+      : undefined;
+    const entry: Record<string, unknown> =
+      typeof wholeFilePatch !== "string"
+        ? received
+        : { ...received, patch: { text: wholeFilePatch } };
+    // Keep the first patch: once the edit runs, the file no longer holds the old text. A later
+    // update's shared text budget can cut or drop it, and a cut patch would misplace the hunk.
+    if (entry.patch !== undefined) {
+      const patch: unknown = entry.patch;
+      const cut =
+        Predicate.isObject(patch) &&
+        patch.format !== "omitted" &&
+        (typeof patch.text !== "string" || patch.text.startsWith(TOOL_TEXT_TRUNCATED));
+      return cut ? { ...entry, patch: { format: "omitted" } } : entry;
+    }
+    // Bounding keeps only the tail of long text, so a cut snippet cannot be located and a cut
+    // old or new text would render the cut as file content.
+    if ([data.rawInput, entry.oldText, entry.newText].some(hasTruncatedText))
+      return { ...entry, patch: { format: "omitted" } };
+    const edit = readEditFileInput(data.rawInput);
+    const text = antigravityEditPatch({
+      path: received.path,
+      rawInput: data.rawInput,
+      locations: data.locations,
+      readPreEditFile:
+        edit && readPreEditFile
+          ? (path) => preEditFileOfRunningEdit(readPreEditFile(path), edit)
+          : readPreEditFile,
+    });
+    // A truncated patch would no longer parse, and bare snippets would render at line 1.
+    if (
+      text === ANTIGRAVITY_EDIT_DIFF_OMITTED ||
+      (text !== undefined && text.length > TOOL_TEXT_LIMIT)
+    )
+      return { ...entry, patch: { format: "omitted" } };
+    if (text === undefined) return entry;
+    return {
+      ...entry,
+      patch: isAntigravitySnippetPatch(text) ? { format: "snippet", text } : { text },
+    };
+  });
+}
+
+/**
+ * The file as it was before a running `edit_file`, which the runtime may already have applied.
+ * Undefined when the file does not say which: the target and the replacement can each be part of
+ * the other, or already be in the file elsewhere.
+ */
+function preEditFileOfRunningEdit(
+  file: string | undefined,
+  edit: { readonly Target: string; readonly Replacement: string },
+): string | undefined {
+  const target = edit.Target.replaceAll("\r\n", "\n");
+  const replacement = edit.Replacement.replaceAll("\r\n", "\n");
+  if (file === undefined || target === "" || replacement === "") return undefined;
+  const text = file.replaceAll("\r\n", "\n");
+  const targetAt = text.indexOf(target);
+  const replacementAt = text.indexOf(replacement);
+  const oneTarget = targetAt !== -1 && targetAt === text.lastIndexOf(target);
+  const oneReplacement = replacementAt !== -1 && replacementAt === text.lastIndexOf(replacement);
+  const unwritten =
+    oneTarget &&
+    (replacementAt === -1 ||
+      (oneReplacement && replacementAt === targetAt && target.startsWith(replacement)));
+  if (unwritten) return text;
+  const written =
+    oneReplacement &&
+    (targetAt === -1
+      ? !target.includes(replacement)
+      : oneTarget &&
+        replacement.includes(target) &&
+        (targetAt === replacementAt || text[targetAt - 1] === "\n") &&
+        (target.endsWith("\n") ||
+          targetAt + target.length === text.length ||
+          text[targetAt + target.length] === "\n"));
+  return written ? text.replace(replacement, () => target) : undefined;
+}
+
 function extractAntigravityEditPath(data: Record<string, unknown>): string | undefined {
   const firstLocation = Array.isArray(data.locations) ? data.locations[0] : undefined;
   if (Predicate.isObject(firstLocation) && typeof firstLocation.path === "string") {
@@ -427,58 +569,32 @@ function extractAntigravityEditPath(data: Record<string, unknown>): string | und
   return undefined;
 }
 
-/** The ACP adapter renders a diff's `patch.text` ahead of its bare old/new snippets. */
-function withAntigravityEditPatches(
-  content: ReadonlyArray<unknown>,
+/**
+ * 1.5 runtimes announce `edit_file` already running, with its arguments and no diff. An edit
+ * the file cannot place shows as an unplaced snippet.
+ */
+function announcedEditDiff(
   data: Record<string, unknown>,
-  readPreEditFile: ((path: string) => string | undefined) | undefined,
+  readFile: ((path: string) => string | undefined) | undefined,
 ) {
-  return content.map((entry) => {
-    if (!Predicate.isObject(entry) || entry.type !== "diff" || typeof entry.path !== "string")
-      return entry;
-    // Keep the first patch: once the edit runs, the file no longer holds the old text. A later
-    // update's shared text budget can cut or drop it, and a cut patch would misplace the hunk.
-    if (entry.patch !== undefined) {
-      const patch: unknown = entry.patch;
-      const cut =
-        Predicate.isObject(patch) &&
-        patch.format !== "omitted" &&
-        (typeof patch.text !== "string" || patch.text.startsWith(TOOL_TEXT_TRUNCATED));
-      return cut ? { ...entry, patch: { format: "omitted" } } : entry;
-    }
-    // Bounding keeps only the tail of long text, so a cut snippet cannot be located.
-    if (hasTruncatedText(data.rawInput)) return { ...entry, patch: { format: "omitted" } };
-    const oldText =
-      typeof entry.oldText === "string" && !hasTruncatedText(entry.oldText)
-        ? entry.oldText
-        : undefined;
-    const preEditFromOldText =
-      oldText === undefined
-        ? undefined
-        : (candidatePath: string) => (candidatePath === entry.path ? oldText : undefined);
-    const text = antigravityEditPatch({
-      path: entry.path,
-      rawInput: data.rawInput,
-      locations: data.locations,
-      readPreEditFile: readPreEditFile ?? preEditFromOldText,
-    });
-    // A truncated patch would no longer parse, and bare snippets would render at line 1.
-    if (
-      text === ANTIGRAVITY_EDIT_DIFF_OMITTED ||
-      (text !== undefined && text.length > TOOL_TEXT_LIMIT)
-    )
-      return { ...entry, patch: { format: "omitted" } };
-    if (text === undefined) {
-      // A whole-file write whose old or new text was cut to its tail would render the cut as file content.
-      return [entry.oldText, entry.newText].some(hasTruncatedText)
-        ? { ...entry, patch: { format: "omitted" } }
-        : entry;
-    }
-    return {
-      ...entry,
-      patch: isAntigravitySnippetPatch(text) ? { format: "snippet", text } : { text },
-    };
+  const omitted = { type: "diff", patch: { format: "omitted" } };
+  const path = extractAntigravityEditPath(data);
+  const edit = readEditFileInput(data.rawInput);
+  if (typeof path !== "string" || edit === undefined || hasTruncatedText(edit)) return omitted;
+  const preEditFile = preEditFileOfRunningEdit(readFile?.(path), edit);
+  const text = antigravityEditPatch({
+    path,
+    rawInput: { TargetContent: edit.Target, ReplacementContent: edit.Replacement },
+    readPreEditFile: preEditFile === undefined ? undefined : () => preEditFile,
   });
+  if (typeof text !== "string" || text.length > TOOL_TEXT_LIMIT) return omitted;
+  return {
+    type: "diff",
+    path,
+    oldText: edit.Target,
+    newText: edit.Replacement,
+    patch: isAntigravitySnippetPatch(text) ? { format: "snippet", text } : { text },
+  };
 }
 
 export function normalizeAntigravityToolCall(
@@ -516,26 +632,29 @@ export function normalizeAntigravityToolCall(
   if (command !== undefined) data.command = command;
   if (cwd !== undefined) data.cwd = cwd;
   if (imagePath !== undefined) data.imagePath = imagePath;
+  const { [WHOLE_FILE_PATCH_META_KEY]: wholeFilePatches, ...meta } = Predicate.isObject(data.meta)
+    ? data.meta
+    : {};
+  if (wholeFilePatches !== undefined) data.meta = meta;
   if (kind === "edit") {
     const content = Array.isArray(data.content) ? data.content : [];
-    const preEditReader = toolCall.status === "pending" ? readPreEditFile : undefined;
-    if (content.some((entry) => Predicate.isObject(entry) && entry.type === "diff")) {
-      data.content = withAntigravityEditPatches(content, data, preEditReader);
-    } else {
-      // 1.5+ pending edit_file announcements omit `content` and send `{ Path, Target, Replacement }` in `rawInput`.
-      // Full-access edits report only a path; without a hunk the checkpoint diff is the review.
-      const editPath = extractAntigravityEditPath(data);
-      const synthesized =
-        editPath === undefined
-          ? undefined
-          : withAntigravityEditPatches([{ type: "diff", path: editPath }], data, preEditReader)[0];
-      data.content = [
-        ...content,
-        Predicate.isObject(synthesized) && synthesized.patch !== undefined
-          ? synthesized
-          : { type: "diff", patch: { format: "omitted" } },
-      ];
-    }
+    // Full-access edits report only a path; without a hunk the checkpoint diff is the review.
+    data.content = content.some((entry) => Predicate.isObject(entry) && entry.type === "diff")
+      ? withAntigravityEditPatches(
+          content,
+          data,
+          toolCall.status === "pending" ? readPreEditFile : undefined,
+          wholeFilePatches,
+        )
+      : [
+          ...content,
+          announcedEditDiff(
+            data,
+            toolCall.status === "inProgress" || toolCall.status === "pending"
+              ? readPreEditFile
+              : undefined,
+          ),
+        ];
   }
   if (kind === "execute") {
     data.item = {
