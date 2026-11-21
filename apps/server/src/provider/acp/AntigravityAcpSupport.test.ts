@@ -102,7 +102,7 @@ describe("Antigravity Auto", () => {
     expect(antigravitySessionMode("auto", modeState)).toBe(expected);
   });
 
-  it.each(["execute", "read"] as const)("asks about the %s requests agy's Auto sends", (kind) => {
+  it.each(["execute", "edit"] as const)("asks about the %s requests agy's Auto sends", (kind) => {
     const request = {
       sessionId: "session-1",
       toolCall: { toolCallId: "call-1", title: "Tool call", kind },
@@ -112,6 +112,74 @@ describe("Antigravity Auto", () => {
       "ask",
     );
   });
+
+  it.each(["read", "search", "think"] as const)(
+    "allows %s requests in Auto unless a sandbox denies them",
+    (kind) => {
+      const request = {
+        sessionId: "session-1",
+        toolCall: { toolCallId: "call-1", title: "Read", kind },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      } satisfies EffectAcpSchema.RequestPermissionRequest;
+      expect(antigravityPermissionDisposition({ runtimeMode: "auto", cwd: null }, request)).toBe(
+        "allow",
+      );
+      expect(
+        antigravityPermissionDisposition(
+          { runtimeMode: "auto", cwd: null, approvalPolicy: "on-request" },
+          request,
+        ),
+      ).toBe("allow");
+      expect(
+        antigravityPermissionDisposition(
+          { runtimeMode: "auto", cwd: null, sandboxPolicy: { type: "unknown" } },
+          request,
+        ),
+      ).toBe("deny");
+    },
+  );
+
+  it.each(["auto", "auto-accept-edits"] as const)(
+    "runs only server-qualified T3 MCP calls unasked in %s",
+    (runtimeMode) => {
+      const policy = { runtimeMode, cwd: "/workspace" };
+      const request = (
+        title: string,
+        rawInput?: Record<string, unknown>,
+      ): EffectAcpSchema.RequestPermissionRequest => ({
+        sessionId: "session-1",
+        toolCall: { toolCallId: "call-1", title, kind: "execute", rawInput },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      });
+      for (const t3Call of [
+        request("Run mcp_t3-code_t3_thread_list?"),
+        request("Run mcp_t3-code_pull_request_read"),
+        request("MCP Tool delegate_task", { ServerName: "t3-code", ToolName: "delegate_task" }),
+      ]) {
+        expect(antigravityPermissionDisposition(policy, t3Call)).toBe("allow");
+        expect(
+          antigravityPermissionDisposition({ ...policy, approvalPolicy: "on-request" }, t3Call),
+        ).toBe("ask");
+        expect(
+          antigravityPermissionDisposition(
+            { ...policy, sandboxPolicy: { type: "readOnly" } },
+            t3Call,
+          ),
+        ).toBe("deny");
+      }
+      for (const otherCall of [
+        // Names no server, so another MCP server's tool of the same name looks identical.
+        request("Running preview_status"),
+        request("Run mcp_github_create_issue"),
+        request("MCP Tool preview_status", { ServerName: "other", ToolName: "preview_status" }),
+        request("Run mcp_t3-code_preview_status", {
+          CommandLine: "Run mcp_t3-code_preview_status",
+        }),
+      ]) {
+        expect(antigravityPermissionDisposition(policy, otherCall)).toBe("ask");
+      }
+    },
+  );
 
   it.each([{ type: "readOnly" }, { type: "workspaceWrite", writableRoots: [] }])(
     "keeps the $type sandbox's denials in Auto",
