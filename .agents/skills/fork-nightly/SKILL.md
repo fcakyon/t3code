@@ -10,6 +10,7 @@ Fork notes live here so the root `AGENTS.md` stays identical to upstream and mer
 - `main` mirrors `upstream/main` (pingdotgg/t3code) with no fork commits.
 - `nightly` carries the fork patches listed in `fcakyon-changelog.md` plus `main` merged in. Add a concise note for each fork-only commit before pushing, including fixes and maintenance changes.
 - Before fixing a bug or adding a workaround on `nightly`, search open issues and pull requests in `upstream` (`pingdotgg/t3code`). If a matching upstream issue or PR already exists, adopt or build on that upstream fix (and link it in `fcakyon-changelog.md`) instead of introducing a divergent workaround, so future upstream syncs merge cleanly. When you have live reproduction evidence for an open upstream issue or PR, add it there rather than opening duplicates.
+- Before every push to `nightly`, run `/code-review --fix` on what the fork adds: a merged fork branch or upstream PR, and for a `main` sync only the conflict resolutions, since upstream already reviewed `main`.
 - `.github/workflows/fork-nightly.yml` only builds, and only on dispatch. The sync runs locally with the user's `gh` token because the workflow's `GITHUB_TOKEN` cannot push upstream changes to `.github/workflows/`.
 
 ## Sync and release
