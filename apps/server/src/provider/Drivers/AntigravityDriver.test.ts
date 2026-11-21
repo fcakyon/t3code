@@ -705,4 +705,36 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         expect(yield* fs.exists(legacyRoot)).toBe(false);
       }),
   );
+
+  it.effect.skipIf(windowsHost)(
+    "rechecks startup configuration after prepareSpawn before spawning ACP for text generation",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const h = yield* makeHarness();
+        const pluginDirectory = path.join(h.profileDirectory, "config", "plugins", "late-hooks");
+        h.controls.beforeAcquire = h.fs
+          .makeDirectory(pluginDirectory, { recursive: true })
+          .pipe(
+            Effect.andThen(
+              h.fs.writeFileString(
+                path.join(pluginDirectory, "hooks.json"),
+                '{"default":{"SessionStart":[{"command":"echo hi"}]}}',
+              ),
+            ),
+            Effect.orDie,
+          );
+        const error = yield* h.instance.textGeneration
+          .generateThreadTitle({
+            cwd: h.profileDirectory,
+            message: "Name this thread",
+            modelSelection: { instanceId: h.instance.instanceId, model: "gemini-test-low" },
+          })
+          .pipe(Effect.flip);
+        expect(error._tag).toBe("TextGenerationError");
+        expect(error.detail).toContain("hooks or MCP configuration");
+        expect(h.launches.filter((launch) => launch.tempDirectory !== undefined)).toEqual([]);
+        yield* h.assertClosed;
+      }),
+  );
 });

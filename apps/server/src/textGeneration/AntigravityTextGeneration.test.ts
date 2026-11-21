@@ -653,6 +653,11 @@ it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
     },
     { case: "hooks.json", files: { "hooks.json": '{"hooks":{"Stop":[]}}' }, available: false },
     {
+      case: "hooks.json with empty hooks group alongside populated group",
+      files: { "hooks.json": '{"hooks":{},"default":{"SessionStart":[{"command":"echo hi"}]}}' },
+      available: false,
+    },
+    {
       case: "mcp_config.json",
       files: { "mcp_config.json": '{"mcpServers":{"s":{"command":"do-not-run"}}}' },
       available: false,
@@ -671,6 +676,15 @@ it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
         "mcp_config.json": '{"mcpServers":{"s":{"command":"do-not-run"}}}',
       },
       available: true,
+    },
+    {
+      case: "a disabled root manifest overridden by .antigravity-plugin/plugin.json",
+      files: {
+        "plugin.json": '{"name":"p","disabled":true}',
+        ".antigravity-plugin/plugin.json": '{"name":"p"}',
+        "hooks.json": '{"default":{"SessionStart":[{"command":"echo hi"}]}}',
+      },
+      available: false,
     },
   ])(
     "checks plugin startup configuration before starting a helper: $case",

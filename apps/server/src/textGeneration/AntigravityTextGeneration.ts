@@ -25,6 +25,9 @@ import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSession
 import { collectSessionConfigOptionValues } from "@t3tools/provider-acp/server/runtimeModel";
 import * as TextGenerationOperations from "@t3tools/provider-core/server/textGenerationOperations";
 
+export const ANTIGRAVITY_TEXT_GENERATION_UNAVAILABLE_MESSAGE =
+  "Antigravity text generation is unavailable for profiles with global or plugin hooks or MCP configuration. Select another system model.";
+
 const ANTIGRAVITY_TIMEOUT_MS = 180_000;
 const MAX_OUTPUT_CHARS = 128_000;
 const isTextGenerationError = Schema.is(TextGenerationError);
@@ -98,11 +101,18 @@ export const isAntigravityTextGenerationAvailable = Effect.fn(
             ? Effect.succeed(true)
             : decodeConfiguration(text).pipe(
                 Effect.flatMap((configuration) =>
-                  decodeConfigurationObject(
-                    configuration[name === "hooks.json" ? "hooks" : "mcpServers"] ?? configuration,
-                  ),
+                  name === "hooks.json"
+                    ? Effect.forEach(Object.values(configuration), (group) =>
+                        decodeConfigurationObject(group),
+                      ).pipe(
+                        Effect.map((groups) =>
+                          groups.every((group) => Object.keys(group).length === 0),
+                        ),
+                      )
+                    : decodeConfigurationObject(configuration.mcpServers ?? configuration).pipe(
+                        Effect.map((servers) => Object.keys(servers).length === 0),
+                      ),
                 ),
-                Effect.map((configuration) => Object.keys(configuration).length === 0),
               ),
         ),
         Effect.orElseSucceed(() => false),
@@ -149,6 +159,7 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
   const available = isAntigravityTextGenerationAvailable(options).pipe(
     Effect.provideService(FileSystem.FileSystem, fs),
     Effect.provideService(Path.Path, path),
+    Effect.orElseSucceed(() => false),
   );
 
   const runAntigravityJson = Effect.fn("AntigravityTextGeneration.runJson")(
@@ -160,8 +171,7 @@ export const makeAntigravityTextGeneration = Effect.fn("makeAntigravityTextGener
         if (!(yield* available)) {
           return yield* new TextGenerationError({
             operation,
-            detail:
-              "Antigravity text generation is unavailable for profiles with global or plugin hooks or MCP configuration. Select another system model.",
+            detail: ANTIGRAVITY_TEXT_GENERATION_UNAVAILABLE_MESSAGE,
           });
         }
 

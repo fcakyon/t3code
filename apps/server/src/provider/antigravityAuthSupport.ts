@@ -343,6 +343,9 @@ const ProfileConfigJson = Schema.fromJsonString(
 );
 const decodeProfileConfig = Schema.decodeUnknownEffect(ProfileConfigJson);
 const encodeProfileConfig = Schema.encodeSync(ProfileConfigJson);
+const isValidProfilePluginPreferences = Schema.is(
+  Schema.Record(Schema.String, Schema.Struct({ enabled: Schema.optional(Schema.Boolean) })),
+);
 
 /** agy reads plugin overrides only from the profile's config.json, and an explicit profile value wins. */
 const enableAntigravityProfilePlugins = Effect.fn("enableAntigravityProfilePlugins")(
@@ -351,8 +354,20 @@ const enableAntigravityProfilePlugins = Effect.fn("enableAntigravityProfilePlugi
     const config = yield* decodeProfileConfig(
       (yield* readAntigravityBoundedFile(configPath)) ?? "{}",
     );
-    const plugins = { ...config.plugins };
-    const missing = names.filter((name) => plugins[name]?.enabled === undefined);
+    if (config.plugins !== undefined && !isValidProfilePluginPreferences(config.plugins)) {
+      yield* Effect.logWarning("Antigravity plugin overrides are not carried into the profile.", {
+        configPath,
+      });
+      return;
+    }
+    const plugins: Record<string, Record<string, unknown>> = Object.assign(
+      Object.create(null) as Record<string, Record<string, unknown>>,
+      config.plugins,
+    );
+    const missing = names.filter((name) => {
+      const current = plugins[name];
+      return current === undefined || !Object.hasOwn(current, "enabled");
+    });
     if (missing.length === 0) return;
     for (const name of missing) plugins[name] = { ...plugins[name], enabled: true };
     yield* fs.writeFileString(configPath, encodeProfileConfig({ ...config, plugins }));
@@ -376,8 +391,8 @@ const linkAntigravityUserPlugins = Effect.fn("linkAntigravityUserPlugins")(funct
 }): Effect.fn.Return<void, never, FileSystem.FileSystem | Path.Path> {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const userPlugins = path.join(input.userHome, ".gemini", "config", "plugins");
-  const profilePlugins = path.join(input.profileDirectory, "config", "plugins");
+  const userPlugins = path.resolve(input.userHome, ".gemini", "config", "plugins");
+  const profilePlugins = path.resolve(input.profileDirectory, "config", "plugins");
   yield* Effect.gen(function* () {
     const enabled = yield* readAntigravityUserPlugins(input.userHome);
     const existing = new Set(

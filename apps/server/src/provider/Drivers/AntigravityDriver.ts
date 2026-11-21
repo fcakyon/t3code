@@ -29,6 +29,7 @@ import * as AcpErrors from "effect-acp/errors";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import {
+  ANTIGRAVITY_TEXT_GENERATION_UNAVAILABLE_MESSAGE,
   isAntigravityTextGenerationAvailable,
   makeAntigravityTextGeneration,
 } from "../../textGeneration/AntigravityTextGeneration.ts";
@@ -292,7 +293,9 @@ export const AntigravityDriver: ProviderDriver<
     });
 
     const makeRuntime = Effect.fn("AntigravityDriver.makeRuntime")(function* (
-      input: AntigravityAdapterV2RuntimeInput,
+      input: AntigravityAdapterV2RuntimeInput & {
+        readonly beforeSpawn?: Effect.Effect<void, AcpErrors.AcpError | ProviderSetupError>;
+      },
     ): Effect.fn.Return<
       AcpSessionRuntime.AcpSessionRuntime["Service"],
       AcpErrors.AcpError | ProviderSetupError,
@@ -300,13 +303,14 @@ export const AntigravityDriver: ProviderDriver<
     > {
       // `buildAntigravityAcpSpawnInput` sets `extendEnv: false`, so thread variables only reach the
       // agent's shell through `baseEnv`.
-      const { processEnvironment: threadEnvironment, ...runtimeInput } = input;
+      const { processEnvironment: threadEnvironment, beforeSpawn, ...runtimeInput } = input;
       const { executable, spawn } = yield* prepareSpawn(
         runtimeInput.cwd,
         threadEnvironment === undefined
           ? processEnvironment
           : { ...processEnvironment, ...threadEnvironment },
       );
+      if (beforeSpawn) yield* beforeSpawn;
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
         runtimeVersion: executable.version,
@@ -565,6 +569,14 @@ export const AntigravityDriver: ProviderDriver<
       Effect.provideService(Digest.Digest, digest),
       Effect.provideService(HttpClient.HttpClient, httpClient),
     );
+    const textGenerationAvailable = isAntigravityTextGenerationAvailable({
+      profileDirectory,
+      userHome,
+    }).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+      Effect.orElseSucceed(() => false),
+    );
     const provider = yield* makeAntigravityProvider(settings, {
       environment: processEnvironment,
       stampIdentity: classifyModels,
@@ -572,14 +584,7 @@ export const AntigravityDriver: ProviderDriver<
       probeUsage: usage.probe,
       clearUsage: usage.clear,
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
-      supportsTextGeneration: isAntigravityTextGenerationAvailable({
-        profileDirectory,
-        userHome,
-      }).pipe(
-        Effect.provideService(FileSystem.FileSystem, fileSystem),
-        Effect.provideService(Path.Path, path),
-        Effect.orElseSucceed(() => false),
-      ),
+      supportsTextGeneration: textGenerationAvailable,
     }).pipe(
       Effect.mapError(
         (cause) =>
@@ -631,6 +636,20 @@ export const AntigravityDriver: ProviderDriver<
         makeRuntime({
           cwd,
           mcpServers: [],
+          // Recheck after prepareSpawn prepares the profile, before spawning ACP.
+          beforeSpawn: textGenerationAvailable.pipe(
+            Effect.flatMap((available) =>
+              available
+                ? Effect.void
+                : Effect.fail(
+                    new ProviderSetupError({
+                      instanceId,
+                      operation: "textGeneration",
+                      detail: ANTIGRAVITY_TEXT_GENERATION_UNAVAILABLE_MESSAGE,
+                    }),
+                  ),
+            ),
+          ),
         }),
     });
 
