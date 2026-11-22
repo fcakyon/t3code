@@ -57,6 +57,7 @@ import {
 import {
   antigravityApprovalOptions,
   antigravityToolOutlivesPrompt,
+  antigravityCommandOutlivesPrompt,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
   extractAntigravityUserInputQuestion,
@@ -417,6 +418,12 @@ export function makeAntigravityAcpAdapterFlavor(
     wakeOnDetachedRequest: true,
     replyEndsWithUsageUpdate: ({ agentInfo }) => repliesWithoutPrompt(agentInfo?.version),
     toolOutlivesPrompt: antigravityToolOutlivesPrompt,
+    // agy sometimes loses the terminal update or wake for a background command, which would
+    // hold the turn in Working forever. 30 minutes still leaves long commands room.
+    postSettleCommandHold: {
+      timeout: "30 minutes",
+      isCommand: antigravityCommandOutlivesPrompt,
+    },
     // session/cancel ends the agent's running commands, so only Stop sends it once the prompt
     // has ended. A message sent while a command runs leaves the command alone.
     preserveRuntimeOnSettledInterrupt: true,
