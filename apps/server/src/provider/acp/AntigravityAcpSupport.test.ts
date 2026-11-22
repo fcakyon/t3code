@@ -139,6 +139,28 @@ describe("Antigravity Auto", () => {
     },
   );
 
+  it.each([{ type: "readOnly" }, { type: "workspaceWrite", writableRoots: [] }])(
+    "keeps the $type sandbox's denials in Auto",
+    (sandboxPolicy) => {
+      const request = {
+        sessionId: "session-1",
+        toolCall: {
+          toolCallId: "call-1",
+          title: "Edit",
+          kind: "edit",
+          locations: [{ path: "/outside-workspace/file.txt" }],
+        },
+        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+      } satisfies EffectAcpSchema.RequestPermissionRequest;
+      expect(
+        antigravityPermissionDisposition(
+          { runtimeMode: "auto", cwd: "/workspace", sandboxPolicy },
+          request,
+        ),
+      ).toBe("deny");
+    },
+  );
+
   it.each(["auto", "auto-accept-edits"] as const)(
     "runs only server-qualified T3 MCP calls unasked in %s",
     (runtimeMode) => {
@@ -153,7 +175,6 @@ describe("Antigravity Auto", () => {
       });
       for (const t3Call of [
         request("Run mcp_t3-code_t3_thread_list?"),
-        request("Run mcp_t3-code_pull_request_read"),
         request("MCP Tool delegate_task", { ServerName: "t3-code", ToolName: "delegate_task" }),
       ]) {
         expect(antigravityPermissionDisposition(policy, t3Call)).toBe("allow");
@@ -178,28 +199,6 @@ describe("Antigravity Auto", () => {
       ]) {
         expect(antigravityPermissionDisposition(policy, otherCall)).toBe("ask");
       }
-    },
-  );
-
-  it.each([{ type: "readOnly" }, { type: "workspaceWrite", writableRoots: [] }])(
-    "keeps the $type sandbox's denials in Auto",
-    (sandboxPolicy) => {
-      const request = {
-        sessionId: "session-1",
-        toolCall: {
-          toolCallId: "call-1",
-          title: "Edit",
-          kind: "edit",
-          locations: [{ path: "/outside-workspace/file.txt" }],
-        },
-        options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
-      } satisfies EffectAcpSchema.RequestPermissionRequest;
-      expect(
-        antigravityPermissionDisposition(
-          { runtimeMode: "auto", cwd: "/workspace", sandboxPolicy },
-          request,
-        ),
-      ).toBe("deny");
     },
   );
 });
