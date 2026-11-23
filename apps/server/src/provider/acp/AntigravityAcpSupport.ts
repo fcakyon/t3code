@@ -6,7 +6,6 @@ import {
   type ProviderSendTurnInput,
   type RuntimeMode,
 } from "@t3tools/contracts";
-import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -70,16 +69,6 @@ function compareVersions(left: ReadonlyArray<number>, right: ReadonlyArray<numbe
     if (difference !== 0) return difference;
   }
   return 0;
-}
-
-const QUALIFIED_ANTIGRAVITY_RELEASES = new Set(["1.5.9", "1.5.11"]);
-
-/**
- * These releases support linked video.
- */
-function isQualifiedAntigravityRelease(version: string | null | undefined): boolean {
-  const trimmed = version?.trim();
-  return trimmed !== undefined && QUALIFIED_ANTIGRAVITY_RELEASES.has(trimmed);
 }
 
 // `agy acp` 1.5.1 offers every model to every ACP client; older runtimes allowlist editors.
@@ -353,18 +342,6 @@ const AUDIO_MIME_TYPES = new Set([
   "audio/webm",
 ]);
 const ANTIGRAVITY_MAX_AUDIO_ATTACHMENT_BYTES = 20 * 1024 * 1024;
-// Keep linked video within the agent's media limit.
-const ANTIGRAVITY_MAX_VIDEO_ATTACHMENT_BYTES = 20 * 1024 * 1024;
-
-/**
- * Only Gemini takes video. The evidence is the session's resolved model, so an account default
- * counts once the agent reports it; opaque ids such as `agy-model` need a Gemini display name.
- */
-function antigravityModelAcceptsVideo(
-  model: { readonly id: string; readonly name: string | undefined } | undefined,
-): boolean {
-  return model !== undefined && (/^gemini-/i.test(model.id) || /^gemini\b/i.test(model.name ?? ""));
-}
 const TEXT_MIME_TYPES = new Set([
   "application/json",
   "application/ld+json",
@@ -434,9 +411,6 @@ export const buildAntigravityPrompt = Effect.fn("buildAntigravityPrompt")(functi
     attachment: NonNullable<ProviderSendTurnInput["attachments"]>[number],
   ) => string | null;
   readonly promptCapabilities: EffectAcpSchema.AgentCapabilities["promptCapabilities"];
-  /** Linked video needs a runtime whose `resource_link` handling is qualified and a Gemini model. */
-  readonly agentVersion?: string | undefined;
-  readonly currentModel?: { readonly id: string; readonly name: string | undefined } | undefined;
 }): Effect.fn.Return<
   ReadonlyArray<EffectAcpSchema.ContentBlock>,
   EffectAcpErrors.AcpError,
@@ -444,8 +418,6 @@ export const buildAntigravityPrompt = Effect.fn("buildAntigravityPrompt")(functi
 > {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  // The agent runs on this host.
-  const platform = yield* HostProcess.Platform;
   const blocks: Array<EffectAcpSchema.ContentBlock> = [];
   const text = input.input?.trim();
   if (text) blocks.push({ type: "text", text });
@@ -461,14 +433,6 @@ export const buildAntigravityPrompt = Effect.fn("buildAntigravityPrompt")(functi
     const image = attachment.type === "image" && IMAGE_MIME_TYPES.has(mimeType);
     const audio = attachment.type === "file" && AUDIO_MIME_TYPES.has(mimeType);
     const pdf = attachment.type === "file" && mimeType === "application/pdf";
-    const video =
-      attachment.type === "file" &&
-      mimeType === "video/mp4" &&
-      isQualifiedAntigravityRelease(input.agentVersion) &&
-      // The agent turns a file URI into a path with unquote(urlparse(uri).path), which drops
-      // Windows drives and UNC hosts. Keep the saved path there until Google fixes it.
-      platform !== "win32" &&
-      antigravityModelAcceptsVideo(input.currentModel);
     const textFile =
       attachment.type === "file" &&
       (mimeType.startsWith("text/") ||
@@ -480,9 +444,7 @@ export const buildAntigravityPrompt = Effect.fn("buildAntigravityPrompt")(functi
         (isPastedText ||
           (audio
             ? input.promptCapabilities?.audio !== true
-            : pdf || textFile
-              ? input.promptCapabilities?.embeddedContext !== true
-              : !video)));
+            : !(pdf || textFile) || input.promptCapabilities?.embeddedContext !== true)));
     const attachmentPath = input.resolveAttachmentPath(attachment);
     if (!attachmentPath) {
       return yield* EffectAcpErrors.AcpRequestError.invalidParams(
@@ -511,9 +473,7 @@ export const buildAntigravityPrompt = Effect.fn("buildAntigravityPrompt")(functi
         ? ANTIGRAVITY_MAX_AUDIO_ATTACHMENT_BYTES
         : pdf
           ? MAX_TOTAL_ATTACHMENT_BYTES
-          : video
-            ? ANTIGRAVITY_MAX_VIDEO_ATTACHMENT_BYTES
-            : ANTIGRAVITY_MAX_TEXT_ATTACHMENT_BYTES;
+          : ANTIGRAVITY_MAX_TEXT_ATTACHMENT_BYTES;
     if (
       attachment.type === "file" &&
       (size > limit || totalBytes + size > MAX_TOTAL_ATTACHMENT_BYTES)
@@ -532,7 +492,7 @@ export const buildAntigravityPrompt = Effect.fn("buildAntigravityPrompt")(functi
         EffectAcpErrors.AcpRequestError.invalidParams(`Invalid attachment '${attachment.name}'.`),
       ),
     );
-    if (pdf || video) {
+    if (pdf) {
       blocks.push({ type: "resource_link", uri, name: attachment.name, mimeType, size });
       continue;
     }

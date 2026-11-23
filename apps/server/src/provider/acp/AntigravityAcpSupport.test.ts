@@ -5,7 +5,6 @@ import {
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   type ChatAttachment,
 } from "@t3tools/contracts";
-import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -370,89 +369,6 @@ const makeAttachmentFixture = Effect.fn("AntigravityAcpSupportTest.makeAttachmen
 );
 
 it.layer(NodeServices.layer)("buildAntigravityPrompt", (it) => {
-  it.effect.each([
-    {
-      case: "a Gemini model id",
-      model: { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-      linked: true,
-    },
-    {
-      case: "an opaque id named Gemini",
-      model: { id: "agy-model", name: "Gemini 4 Carbon" },
-      linked: true,
-    },
-    { case: "an unknown model", model: { id: "agy-custom", name: "Custom" }, linked: false },
-    { case: "an unlisted opaque id", model: { id: "agy-custom", name: undefined }, linked: false },
-    { case: "an unresolved model", model: undefined, linked: false },
-    {
-      case: "a Claude model",
-      model: { id: "claude-opus-5-5", name: "Claude Opus 5.5" },
-      linked: false,
-    },
-    {
-      case: "an unqualified runtime",
-      agentVersion: "1.4.1",
-      model: { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-      linked: false,
-    },
-    {
-      case: "a Windows host",
-      platform: "win32" as const,
-      model: { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-      linked: false,
-    },
-    {
-      case: "a clip over 20 MiB",
-      model: { id: "gemini-3.8-flash", name: "Gemini 3.8 Flash" },
-      linked: false,
-      sizeBytes: 20 * 1024 * 1024 + 1,
-    },
-  ])(
-    "links an MP4 for $case only when supported",
-    ({ agentVersion = "1.5.9", platform = "linux", model, linked, ...size }) =>
-      Effect.gen(function* () {
-        const fixture = yield* makeAttachmentFixture();
-        const clip = {
-          ...textAttachment,
-          id: "clip",
-          name: "clip.mp4",
-          mimeType: "video/mp4",
-          sizeBytes: 6 * 1024 * 1024,
-          ...size,
-        };
-        const upload = yield* fixture.write(clip, "");
-        yield* fixture.fs.truncate(upload.filePath, clip.sizeBytes);
-        const prompt = yield* buildAntigravityPrompt({
-          input: "What colors appear?",
-          attachments: [clip],
-          resolveAttachmentPath: fixture.resolve,
-          promptCapabilities: { image: true, audio: true, embeddedContext: true },
-          agentVersion,
-          currentModel: model,
-        }).pipe(
-          Effect.provideService(HostProcess.Platform, platform),
-          Effect.provideService(FileSystem.FileSystem, {
-            ...fixture.fs,
-            stream: () => Effect.die("Linked video is read by the agent").pipe(Stream.fromEffect),
-          }),
-        );
-        expect(prompt).toEqual([
-          { type: "text", text: "What colors appear?" },
-          ...(linked
-            ? [
-                {
-                  type: "resource_link",
-                  uri: upload.uri,
-                  name: "clip.mp4",
-                  mimeType: "video/mp4",
-                  size: clip.sizeBytes,
-                },
-              ]
-            : []),
-        ]);
-      }),
-  );
-
   it.effect("sends image bytes as native image content alongside the user prompt", () =>
     Effect.gen(function* () {
       const fixture = yield* makeAttachmentFixture();
