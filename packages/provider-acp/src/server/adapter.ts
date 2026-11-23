@@ -152,9 +152,6 @@ export const ACP_PROTOCOL = "acp.ndjson-jsonrpc" as const;
 const ACP_DEFERRED_FINALIZE_DEBOUNCE: Duration.Input = "3000 millis";
 // A model can stay silent this long before the first token of a reply the agent started itself.
 const ACP_OPEN_REPLY_QUIET_LIMIT: Duration.Input = "2 minutes";
-const ACP_HELD_TOOL_POLL: Duration.Input = "2 seconds";
-// A hung command never wakes the agent. After this silence its run completes and the command stays listed.
-const ACP_SILENT_HOLD_RELEASE_MILLIS = 10 * 60_000;
 const ACP_BUSY_PROMPT_RETRY_INTERVAL: Duration.Input = "1 second";
 // Agents such as omp advertise a loaded session's commands shortly after answering session/load.
 const ACP_LOADED_COMMANDS_WAIT: Duration.Input = "2 seconds";
@@ -577,9 +574,7 @@ export interface AcpAdapterV2Flavor {
     event: AcpSessionRuntime.AcpSessionRuntimeEvent,
     cwd: string,
   ) => Effect.Effect<void>;
-  readonly subagentsIdleOnTurnCompletion?:
-    | boolean
-    | ((initializeResult: EffectAcpSchema.InitializeResponse) => boolean);
+  readonly subagentsIdleOnTurnCompletion?: boolean;
   /**
    * Subagents the agent goes on running after its prompt, with no update when one ends. Asked
    * when the prompt ends and when a reply the agent started by itself ends; the native task ids
@@ -588,8 +583,7 @@ export interface AcpAdapterV2Flavor {
   readonly subagentsOutlivingPrompt?: (input: {
     readonly sessionId: string;
     readonly nativeTaskIds: ReadonlyArray<string>;
-    readonly agentVersion: string | undefined;
-  }) => Effect.Effect<ReadonlyArray<string> | undefined>;
+  }) => Effect.Effect<ReadonlyArray<string>>;
   readonly supportsCompaction?: boolean;
   /** Sends `/compact` as a prompt, only to sessions whose advertised commands include `compact`. */
   readonly compactViaAdvertisedCommand?: boolean;
@@ -689,14 +683,6 @@ export interface AcpAdapterV2Flavor {
    */
   readonly toolOutlivesPrompt?: (toolCall: AcpToolCallState) => boolean;
   /**
-   * Output so far of a held `toolOutlivesPrompt` tool the user can Stop, or undefined when it
-   * is not tracked. A held turn whose tracked tools stay silent is released.
-   */
-  readonly heldToolOutput?: (input: {
-    readonly sessionId: string;
-    readonly toolCallId: string;
-  }) => Effect.Effect<string | undefined>;
-  /**
    * Finalize a settled turn held only by running commands once the session has been silent for
    * `timeout`, so a command that never reports back cannot leave the thread in Working forever.
    * Other holds (questions, schedules, subagents) keep the turn open as before.
@@ -713,9 +699,7 @@ export interface AcpAdapterV2Flavor {
    * Every model reply ends with `usage_update`, also the ones the agent starts with no prompt
    * open. A turn that ends on the deferred finalize waits for it instead of the short debounce.
    */
-  readonly replyEndsWithUsageUpdate?: AcpNegotiatedFlag;
-  /** Send an ACP prompt when a continuation turn has no buffered wake notifications. */
-  readonly promptOnEmptyContinuationWake?: AcpNegotiatedFlag;
+  readonly replyEndsWithUsageUpdate?: boolean;
   /**
    * True when the agent has a queued wake or in-flight reply that has not streamed yet (for
    * example, a second background task finished while the first wake's reply was running).
@@ -1862,7 +1846,6 @@ interface ActiveAcpTurn {
   readonly promptStarted: Deferred.Deferred<void, never>;
   promptUsage: EffectAcpSchema.Usage | undefined;
   backgroundFinalizeGeneration: number;
-  deferredForBackgroundWork?: boolean;
   /** `replyEndsWithUsageUpdate`: output arrived and its closing `usage_update` has not. */
   replyOpen: boolean;
   /** The agent's own id for this turn's prompt, from `forkFromTurn.nativeTurnId`. */
@@ -1870,7 +1853,6 @@ interface ActiveAcpTurn {
   /** Clock millis of the prompt's last progress, for `promptInactivityTimeout`. */
   lastProgressAt: number;
   inactivityWatchdog: Fiber.Fiber<void> | undefined;
-  watchingHeldTools?: boolean;
 }
 
 const PROMPT_OUTCOME_CHECK_TIMEOUT = Duration.seconds(5);
@@ -2390,8 +2372,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         let followsAgentWorkState = false;
         let postSettleContinuationEnabled = false;
         let defersFinalizeForBackgroundWork = false;
-        let promptOnEmptyContinuationWake = false;
-        let replyEndsWithUsageUpdate = false;
         let agentWork: Extract<
           EffectAcpSchema.SessionUpdate,
           { sessionUpdate: "state_update" }
@@ -2441,14 +2421,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             readNegotiatedFlag(flavor.enablePostSettleContinuation, setup.initializeResult);
           defersFinalizeForBackgroundWork = readNegotiatedFlag(
             flavor.deferFinalizeForBackgroundWork,
-            setup.initializeResult,
-          );
-          promptOnEmptyContinuationWake = readNegotiatedFlag(
-            flavor.promptOnEmptyContinuationWake,
-            setup.initializeResult,
-          );
-          replyEndsWithUsageUpdate = readNegotiatedFlag(
-            flavor.replyEndsWithUsageUpdate,
             setup.initializeResult,
           );
           agentWork = null;
@@ -2890,7 +2862,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
 
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
           Queue.offer(events, event).pipe(Effect.asVoid);
-        const sessionsWithPendingBackgroundTasks = new Set<string>();
         // Session updates include streaming chunks, so share their tracing boundary.
         const syncPendingBackgroundTasks = Effect.fnUntraced(function* (
           notification: EffectAcpSchema.SessionNotification,
@@ -2901,12 +2872,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (thread === undefined || flavor.pendingBackgroundTasks === undefined) return thread;
           const tasks = yield* flavor.pendingBackgroundTasks(notification);
           if (tasks === undefined) return thread;
-          const hadPending = sessionsWithPendingBackgroundTasks.has(notification.sessionId);
-          if (tasks.length > 0) {
-            sessionsWithPendingBackgroundTasks.add(notification.sessionId);
-          } else {
-            sessionsWithPendingBackgroundTasks.delete(notification.sessionId);
-          }
           const updated = {
             ...thread,
             pendingBackgroundTasks: tasks,
@@ -2920,22 +2885,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             driver,
             providerThread: updated,
           });
-          if (hadPending && tasks.length === 0) {
-            const context = yield* Ref.get(activeTurn);
-            const readyToFinalize =
-              context !== null &&
-              context.nativeThreadId === notification.sessionId &&
-              context.promptSettled &&
-              !context.finalized &&
-              !context.interrupted &&
-              !hasDeferredBackgroundWork(context);
-            if (readyToFinalize && flavor.deferFinalizeForBackgroundWork === true) {
-              yield* finalizeTurn(context, context.promptSettledStatus ?? "completed");
-            }
-            if ((readyToFinalize || context === null) && postSettleContinuationEnabled) {
-              yield* offerContinuationRun(notification.sessionId);
-            }
-          }
           return updated;
         });
         let scheduleDeferredFinalize: (context: ActiveAcpTurn) => Effect.Effect<void> = () =>
@@ -4748,13 +4697,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             acpSubagentStatusBlocksTurnSettlement(subagent.task.status),
           );
           if (running.length === 0) return;
-          const setup = yield* Ref.get(activeSessionSetup);
           const atWork = yield* flavor.subagentsOutlivingPrompt({
             sessionId: context.nativeThreadId,
             nativeTaskIds: running.map(nativeTaskId),
-            agentVersion: setup?.initializeResult.agentInfo?.version,
           });
-          if (atWork === undefined || context.finalized) return;
+          if (context.finalized) return;
           for (const subagent of running) {
             if (
               atWork.includes(nativeTaskId(subagent)) ||
@@ -4783,79 +4730,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             acpSubagentStatusBlocksTurnSettlement(subagent.task.status),
           );
 
-        const watchHeldTools = Effect.fnUntraced(function* (context: ActiveAcpTurn) {
-          const heldToolOutput = flavor.heldToolOutput;
-          if (heldToolOutput === undefined || context.watchingHeldTools === true) return;
-          context.watchingHeldTools = true;
-          const held = () =>
-            context.finalized || !context.promptSettled
-              ? []
-              : [...context.tools.values()].filter(
-                  (tool) =>
-                    toolStatus(tool.status) === "running" &&
-                    flavor.toolOutlivesPrompt?.(tool) === true,
-                );
-          context.lastProgressAt = Math.max(context.lastProgressAt, yield* Clock.currentTimeMillis);
-          let tracked = false;
-          const streamOutput = Effect.gen(function* () {
-            const outputs = yield* Effect.forEach(held(), (tool) =>
-              heldToolOutput({
-                sessionId: context.nativeThreadId,
-                toolCallId: tool.toolCallId,
-              }).pipe(Effect.map((output) => [tool.toolCallId, output] as const)),
-            );
-            yield* runtimeCallbackPermit.withPermit(
-              Effect.gen(function* () {
-                tracked = outputs.every(([, output]) => output !== undefined);
-                for (const [toolCallId, output] of outputs) {
-                  const tool = context.tools.get(toolCallId);
-                  if (
-                    tool === undefined ||
-                    !held().includes(tool) ||
-                    !output ||
-                    output === toolOutputText(tool)
-                  )
-                    continue;
-                  context.lastProgressAt = yield* Clock.currentTimeMillis;
-                  yield* emitTool(context, setToolOutputText(tool, output));
-                }
-              }),
-            );
-          });
-          const releaseWhenSilent = Effect.gen(function* () {
-            const left =
-              context.lastProgressAt +
-              ACP_SILENT_HOLD_RELEASE_MILLIS -
-              (yield* Clock.currentTimeMillis);
-            if (left > 0 || !tracked) return left;
-            for (const tool of held()) yield* emitTool(context, { ...tool, status: "completed" });
-            return left;
-          });
-          // Log reads yield, so the release sleeps to its own deadline instead of counting polls.
-          yield* Effect.all(
-            [
-              Effect.sleep(ACP_HELD_TOOL_POLL).pipe(
-                Effect.andThen(streamOutput),
-                Effect.repeat({ while: () => held().length > 0 }),
-              ),
-              runtimeCallbackPermit.withPermit(releaseWhenSilent).pipe(
-                Effect.flatMap((left) => Effect.sleep(left > 0 ? left : ACP_HELD_TOOL_POLL)),
-                Effect.repeat({ while: () => held().length > 0 }),
-              ),
-            ],
-            { concurrency: "unbounded", discard: true },
-          ).pipe(
-            Effect.ensuring(Effect.sync(() => (context.watchingHeldTools = false))),
-            Effect.forkIn(sessionScope),
-          );
-        });
-
         const rearmDeferredFinalize =
           /* Provider events include streaming deltas; avoid a span for each update. */
           Effect.fnUntraced(function* (context: ActiveAcpTurn) {
             if (!defersFinalizeForBackgroundWork) return;
             if (!context.promptSettled || context.finalized) return;
-            if (hasDeferredBackgroundWork(context)) return yield* watchHeldTools(context);
+            if (hasDeferredBackgroundWork(context)) return;
             yield* scheduleDeferredFinalize(context);
           });
 
@@ -6160,7 +6040,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           if (context !== null) yield* settleIdleWork(context);
                           if (context !== null && flavor.wakeOnDetachedRequest) {
                             // The agent goes on with its reply once the request is answered.
-                            if (replyEndsWithUsageUpdate) context.replyOpen = true;
+                            if (flavor.replyEndsWithUsageUpdate === true) context.replyOpen = true;
                             yield* rearmDeferredFinalize(context);
                           }
                         }),
@@ -6256,7 +6136,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             return;
           if (yield* projectAgentTerminalUpdate(notification, context)) return;
           if (yield* projectDetachedBackgroundCommand(notification, context)) return;
-          if (replyEndsWithUsageUpdate) {
+          if (flavor.replyEndsWithUsageUpdate === true) {
             if (context === null) {
               // A reply can end before its continuation run starts; replay its end with its output.
               if (
@@ -9096,12 +8976,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             yield* Fiber.interrupt(watchdog).pipe(Effect.forkDetach, Effect.asVoid);
           }
           const directStopQuarantine = yield* Ref.get(stoppedRunQuarantine);
-          const setup = yield* Ref.get(activeSessionSetup);
-          const subagentsIdleOnTurnCompletion =
-            typeof flavor.subagentsIdleOnTurnCompletion === "function"
-              ? setup !== null && flavor.subagentsIdleOnTurnCompletion(setup.initializeResult)
-              : flavor.subagentsIdleOnTurnCompletion === true;
-          if (subagentsIdleOnTurnCompletion) {
+          if (flavor.subagentsIdleOnTurnCompletion === true) {
             for (const subagent of context.subagents.values()) {
               if (!acpSubagentStatusBlocksTurnSettlement(subagent.task.status)) continue;
               yield* emitSubagent(context, {
@@ -9316,18 +9191,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             }
             const status = context.promptSettledStatus ?? "completed";
             yield* finalizeTurn(context, status);
-            if (
-              context.deferredForBackgroundWork === true &&
-              status === "completed" &&
-              postSettleContinuationEnabled &&
-              promptOnEmptyContinuationWake &&
-              !(yield* Ref.get(continuationRequested))
-            ) {
-              const sessionId = yield* Ref.get(activeSessionId);
-              if (sessionId !== null) {
-                yield* offerContinuationRun(sessionId);
-              }
-            }
           }).pipe(Effect.forkIn(sessionScope), Effect.asVoid);
           yield* options.testHooks?.onDeferredFinalizeScheduled?.(debounce) ?? Effect.void;
         });
@@ -9910,10 +9773,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       : false;
                   if (context.finalized) return;
                   if (deferredBackgroundWork || pendingReply) {
-                    if (deferredBackgroundWork) {
-                      context.deferredForBackgroundWork = true;
-                      yield* watchHeldTools(context);
-                    }
                     yield* closeTextStreams(context);
                     yield* schedulePostSettleHoldExpiry(context);
                     if (pendingReply) {
@@ -9988,23 +9847,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             ),
           );
         };
-
-        const initialAppContextOffered = Effect.fnUntraced(function* (
-          sessionId: string,
-          parts: Effect.Success<ReturnType<typeof resolvePromptParts>> | null,
-        ) {
-          if (
-            parts === null ||
-            parts.appContextEntries.length === 0 ||
-            (yield* Ref.get(compactionMarkers)).get(sessionId) !== parts.compactionMarker
-          ) {
-            return undefined;
-          }
-          return mergeAcpAppContext(
-            (yield* Ref.get(deliveredAppContext)).get(sessionId),
-            parts.appContextEntries,
-          );
-        });
 
         const startTurnUnlocked = Effect.fn("AcpAdapterV2.startTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
@@ -10117,7 +9959,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 return wasRequested;
               }),
             );
-            let promptParts = isContinuationTurn
+            const promptParts = isContinuationTurn
               ? null
               : yield* resolvePromptParts(turnInput, requestedSessionId);
             const startedAt = yield* DateTime.now;
@@ -10157,7 +9999,16 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 (yield* Ref.get(activeSessionSetup))?.initializeResult.protocolVersion === 2
                   ? promptParts?.prompt
                   : undefined,
-              appContextOffered: yield* initialAppContextOffered(requestedSessionId, promptParts),
+              appContextOffered:
+                promptParts !== null &&
+                promptParts.appContextEntries.length > 0 &&
+                (yield* Ref.get(compactionMarkers)).get(requestedSessionId) ===
+                  promptParts.compactionMarker
+                  ? mergeAcpAppContext(
+                      (yield* Ref.get(deliveredAppContext)).get(requestedSessionId),
+                      promptParts.appContextEntries,
+                    )
+                  : undefined,
               appContextCommittedSequence: new Map(),
               appContextSequence: 0,
               user: { current: null, nextSegment: 0, closedNamedSegments: new Map() },
@@ -10321,44 +10172,29 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               }
               context.promptSettled = true;
               context.promptSettledStatus = "completed";
-              if (
-                promptOnEmptyContinuationWake &&
-                (drainedWakeCount === 0 ||
-                  (context.assistant.current === null &&
-                    context.assistant.closedNamedSegments.size === 0))
-              ) {
-                promptParts = yield* resolvePromptParts(turnInput, requestedSessionId);
-                context.appContextOffered = yield* initialAppContextOffered(
-                  requestedSessionId,
-                  promptParts,
-                );
-                context.promptSettled = false;
-                context.promptSettledStatus = null;
-              } else {
-                // The replayed reply ended before the prompt counted as settled.
-                yield* idleReportedSubagents(context);
-                if (drainedWakeCount === 0) {
-                  if (continuationWasRequested && defersFinalizeForBackgroundWork) {
-                    if (hasDeferredBackgroundWork(context)) {
-                      yield* rearmDeferredFinalize(context);
-                    } else {
-                      yield* scheduleDeferredFinalize(context);
-                    }
-                  } else {
-                    yield* finalizeTurn(context, "completed");
-                  }
-                  return;
-                }
-                if (!context.finalized) {
-                  yield* schedulePostSettleHoldExpiry(context);
+              // The replayed reply ended before the prompt counted as settled.
+              yield* idleReportedSubagents(context);
+              if (drainedWakeCount === 0) {
+                if (continuationWasRequested && defersFinalizeForBackgroundWork) {
                   if (hasDeferredBackgroundWork(context)) {
                     yield* rearmDeferredFinalize(context);
                   } else {
                     yield* scheduleDeferredFinalize(context);
                   }
+                } else {
+                  yield* finalizeTurn(context, "completed");
                 }
                 return;
               }
+              if (!context.finalized) {
+                yield* schedulePostSettleHoldExpiry(context);
+                if (hasDeferredBackgroundWork(context)) {
+                  yield* rearmDeferredFinalize(context);
+                } else {
+                  yield* scheduleDeferredFinalize(context);
+                }
+              }
+              return;
             }
             const checkPromptOutcome =
               flavor.watchPromptOutcome === undefined
@@ -11182,20 +11018,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           yield* Ref.set(runtimeRestartRequired, true);
                           yield* Ref.set(runtimeTeardownState, { _tag: "Idle" });
                           yield* Deferred.succeed(teardownBarrier, undefined).pipe(Effect.ignore);
-                        }
-                        // A released hold leaves no turn, yet Stop must still end the listed command.
-                        const listedBackgroundTasks = (yield* Ref.get(
-                          providerThreadByNativeSessionId,
-                        )).get(
-                          turnInput.providerThread.nativeThreadRef?.nativeId ?? "",
-                        )?.pendingBackgroundTasks;
-                        if (
-                          context === null &&
-                          turnInput.requestRuntimeRestart === true &&
-                          (listedBackgroundTasks?.length ?? 0) > 0
-                        ) {
-                          yield* quarantineStoppedRun();
-                          yield* runtime.cancel;
                         }
                         return undefined;
                       }

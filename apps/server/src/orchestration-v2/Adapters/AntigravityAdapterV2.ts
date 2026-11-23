@@ -8,7 +8,6 @@ import {
 } from "@t3tools/contracts";
 import { createModelSelection, modelSelectionsEqual } from "@t3tools/shared/model";
 import type { SelfInvocation } from "@t3tools/shared/nodeRuntime";
-import { compareSemverVersions } from "@t3tools/shared/semver";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
@@ -102,7 +101,9 @@ const AntigravityProviderCapabilitiesV2 = {
 export type AntigravityAdapterV2RuntimeInput = Omit<
   AntigravityAcpRuntimeInput,
   "spawn" | "childProcessSpawner"
-> & { readonly processEnvironment?: NodeJS.ProcessEnv };
+> & {
+  readonly processEnvironment?: NodeJS.ProcessEnv;
+};
 
 export interface AntigravityAdapterV2Options {
   readonly instanceId: ProviderInstanceId;
@@ -245,8 +246,6 @@ export function makeAntigravityAcpAdapterFlavor(
 ): AcpAdapterV2Flavor {
   const { fileSystem, path, profileDirectory } = options;
   const commandTasks = makeAntigravityCommandTaskTracker(profileDirectory);
-  const repliesWithoutPrompt = (version: string | undefined) =>
-    version !== undefined && compareSemverVersions(version, "1.5.11") >= 0;
   const antigravityClientFileRoots = Effect.fn("AntigravityAdapterV2.antigravityClientFileRoots")(
     function* (cwd: string | null) {
       const { attachmentsDir } = options.host.paths;
@@ -379,7 +378,6 @@ export function makeAntigravityAcpAdapterFlavor(
     runtimeHarness: "Antigravity",
     capabilities: AntigravityProviderCapabilitiesV2,
     pendingBackgroundTasks: commandTasks.read,
-    heldToolOutput: commandTasks.output,
     supportsNativeGoals: options.supportsNativeGoals ?? Effect.succeed(false),
     // Agents that advertise HTTP MCP skip the stdio bridge process; others keep stdio.
     mcpOverHttp: true,
@@ -409,14 +407,13 @@ export function makeAntigravityAcpAdapterFlavor(
       ),
     // Loading history replays old tool calls into the current turn.
     resumeMethod: "resume",
-    subagentsIdleOnTurnCompletion: (initializeResult) => {
-      const version = initializeResult.agentInfo?.version;
-      return version === undefined || compareSemverVersions(version, "1.5.0") < 0;
-    },
+    subagentsIdleOnTurnCompletion: true,
     // A finished background command or timer wakes the agent with no prompt open: it streams a
     // reply and asks for permissions, and no prompt response ever ends that reply.
+    enablePostSettleContinuation: true,
+    deferFinalizeForBackgroundWork: true,
     wakeOnDetachedRequest: true,
-    replyEndsWithUsageUpdate: ({ agentInfo }) => repliesWithoutPrompt(agentInfo?.version),
+    replyEndsWithUsageUpdate: true,
     toolOutlivesPrompt: antigravityToolOutlivesPrompt,
     // agy sometimes loses the terminal update or wake for a background command, which would
     // hold the turn in Working forever. 30 minutes still leaves long commands room.
@@ -468,9 +465,6 @@ export function makeAntigravityAcpAdapterFlavor(
     },
     normalizeToolCall: normalizeAntigravityToolCall,
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
-    deferFinalizeForBackgroundWork: true,
-    enablePostSettleContinuation: true,
-    promptOnEmptyContinuationWake: ({ agentInfo }) => !repliesWithoutPrompt(agentInfo?.version),
     supportsImagePrompts: true,
     compactViaAdvertisedCommand: true,
     requiresSignIn: isAntigravitySignInRequiredError,
@@ -484,14 +478,12 @@ export function makeAntigravityAcpAdapterFlavor(
       : {
           watchPromptOutcome: (sessionId: string) =>
             watchAntigravityPromptOutcome(profileDirectory, sessionId),
-          subagentsOutlivingPrompt: ({ sessionId, nativeTaskIds, agentVersion }) =>
-            repliesWithoutPrompt(agentVersion)
-              ? readAntigravityChildrenAtWork({
-                  profileDirectory,
-                  rootSessionId: sessionId,
-                  toolCallIds: nativeTaskIds,
-                })
-              : Effect.undefined,
+          subagentsOutlivingPrompt: ({ sessionId, nativeTaskIds }) =>
+            readAntigravityChildrenAtWork({
+              profileDirectory,
+              rootSessionId: sessionId,
+              toolCallIds: nativeTaskIds,
+            }),
           hasPendingReply: (sessionId: string) =>
             readAntigravityPendingReply({
               profileDirectory,
