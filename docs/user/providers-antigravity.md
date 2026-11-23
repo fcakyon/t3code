@@ -117,10 +117,8 @@ Antigravity cannot serve as a
 [text generation model](./text-generation.md), so pick another one.
 
 Antigravity receives images and audio directly, and reads PDFs and text files as
-documents. With a qualified runtime on macOS or Linux, T3 sends Gemini a file link
-for MP4 videos up to 20 MiB. The native agent can open the link to inspect the video.
-Other attachments, and videos for other models, are passed as a
-saved file path for the agent to inspect with its tools.
+documents. Other attachments, including videos, are passed as a saved file path for
+the agent to inspect with its tools.
 
 ### Subagents
 
