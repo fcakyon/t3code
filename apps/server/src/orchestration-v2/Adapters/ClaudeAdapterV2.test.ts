@@ -10601,6 +10601,76 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         : [],
     );
 
+  it.effect("measures Claude context from the last main-model pass in an advisor response", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("attempt-advisor-context"),
+          text: "Continue.",
+          attachments: [],
+        }),
+      );
+      const usage = {
+        input_tokens: 4,
+        cache_read_input_tokens: 1087272,
+        cache_creation_input_tokens: 1222,
+        output_tokens: 711,
+        iterations: [
+          {
+            type: "message",
+            input_tokens: 2,
+            cache_read_input_tokens: 543529,
+            cache_creation_input_tokens: 214,
+            output_tokens: 268,
+          },
+          { type: "advisor_message", input_tokens: 545497, output_tokens: 3144 },
+          {
+            type: "message",
+            input_tokens: 2,
+            cache_read_input_tokens: 543743,
+            cache_creation_input_tokens: 1008,
+            output_tokens: 443,
+          },
+        ],
+      };
+      for (const frame of [
+        usageStreamFrame({
+          type: "message_start",
+          message: { id: "msg_advisor", usage: zeroUsage },
+        }),
+        usageStreamFrame({
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage,
+        }),
+        usageSnapshotFrame("msg_snapshot_only", "00000000-0000-4000-8000-000000000690", {
+          ...zeroUsage,
+          iterations: [
+            ...usage.iterations,
+            { type: "advisor_message", input_tokens: 547000, output_tokens: 25 },
+          ],
+        }),
+        makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000691", result: "Done." }),
+      ])
+        yield* Queue.offer(harness.sdkMessages, frame);
+      assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "completed");
+      assert.deepEqual(reportedContextTokens(harness.events), [545196, 545196]);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
   it.effect("reports context from final stream usage when the request starts at zero", () =>
     Effect.gen(function* () {
       const harness = yield* makeWakeHarness;
@@ -19785,6 +19855,128 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       assert.equal(
         finalSubagent?.type === "subagent.updated" && finalSubagent.subagent.status,
         "completed",
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          NodeServices.layer,
+          NodeCrypto.layer,
+        ),
+      ),
+    ),
+  );
+
+  it.effect("keeps a background subagent's card on the turn that launched it", () =>
+    Effect.gen(function* () {
+      const FIRST_TASK = "task-card-turn-a";
+      const FIRST_TOOL = "toolu-card-turn-a";
+      const SECOND_TASK = "task-card-turn-b";
+      const SECOND_TOOL = "toolu-card-turn-b";
+      const harness = yield* makeWakeHarness;
+      const now = yield* DateTime.now;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make("attempt-claude-card-turn-1"),
+          text: "Audit in the background.",
+          attachments: [],
+        }),
+      );
+      for (const frame of [
+        makeSubagentTaskStartedFrame({
+          taskId: FIRST_TASK,
+          toolUseId: FIRST_TOOL,
+          uuid: "00000000-0000-4000-8000-000000000a51",
+        }),
+        makeSubagentTaskStartedFrame({
+          taskId: SECOND_TASK,
+          toolUseId: SECOND_TOOL,
+          uuid: "00000000-0000-4000-8000-000000000a52",
+        }),
+        claudeSdkFrame({
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [
+            { task_id: FIRST_TASK, task_type: "local_agent", description: "Audit" },
+            { task_id: SECOND_TASK, task_type: "local_agent", description: "Audit" },
+          ],
+          uuid: "00000000-0000-4000-8000-000000000a53",
+          session_id: WAKE_NATIVE_SESSION,
+        }),
+        makeResultFrame({
+          uuid: "00000000-0000-4000-8000-000000000a54",
+          result: "Auditing in the background.",
+        }),
+      ]) {
+        yield* Queue.offer(harness.sdkMessages, frame);
+      }
+      yield* harness.awaitTerminal(1);
+
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeSubagentNotificationFrame({
+          taskId: FIRST_TASK,
+          toolUseId: FIRST_TOOL,
+          summary: "Audit done.",
+          uuid: "00000000-0000-4000-8000-000000000a55",
+        }),
+      );
+      yield* harness.awaitContinuation(1);
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make("attempt-claude-card-turn-2"),
+          text: "Background task completed.",
+          attachments: [],
+          providerTurnOrdinal: 2,
+          messageCreatedBy: "agent",
+          messageCreationSource: "provider",
+        }),
+      );
+      for (const frame of [
+        claudeSdkFrame({
+          type: "system",
+          subtype: "task_progress",
+          task_id: SECOND_TASK,
+          description: "Reading the last commits",
+          uuid: "00000000-0000-4000-8000-000000000a56",
+          session_id: WAKE_NATIVE_SESSION,
+        }),
+        makeSubagentNotificationFrame({
+          taskId: SECOND_TASK,
+          toolUseId: SECOND_TOOL,
+          summary: "Audit done.",
+          uuid: "00000000-0000-4000-8000-000000000a57",
+        }),
+        makeResultFrame({
+          uuid: "00000000-0000-4000-8000-000000000a58",
+          result: "Both auditors finished.",
+        }),
+      ]) {
+        yield* Queue.offer(harness.sdkMessages, frame);
+      }
+      yield* harness.awaitTerminal(2);
+
+      const cards = harness.events.flatMap((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "subagent"
+          ? [event.turnItem]
+          : [],
+      );
+      const turnIds = harness.events.flatMap((event) =>
+        event.type === "provider_turn.updated" ? [event.providerTurn.id] : [],
+      );
+      assert.equal(new Set(turnIds).size, 2);
+      assert.equal(new Set(cards.map((card) => card.subagentId)).size, 2);
+      assert.equal(cards.filter((card) => card.status === "completed").length, 2);
+      assert.deepEqual(
+        [...new Set(cards.map((card) => card.providerTurnId))],
+        [cards[0]?.providerTurnId],
       );
     }).pipe(
       Effect.provide(
