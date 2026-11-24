@@ -2,7 +2,7 @@
 
 Active fork-only features, fixes, and release infrastructure on `nightly` (relative to `upstream/main`):
 
-- feat: Fork nightly release pipeline, `fcakyon/t3code` update feeds, unsigned macOS `.zip` update swap in `ElectronUpdater`, and SSH reconnect test Node resolution ([`aa3e7435e4`](https://github.com/fcakyon/t3code/commit/aa3e7435e4), [`b38ff47b14`](https://github.com/fcakyon/t3code/commit/b38ff47b14), [`59b6cf0ff9`](https://github.com/fcakyon/t3code/commit/59b6cf0ff9), [`453db3b3ab`](https://github.com/fcakyon/t3code/commit/453db3b3ab), [`935e25e3aa`](https://github.com/fcakyon/t3code/commit/935e25e3aa))
+- feat: Fork nightly release pipeline, `fcakyon/t3code` update feeds, and unsigned macOS `.zip` update swap in `ElectronUpdater` ([`aa3e7435e4`](https://github.com/fcakyon/t3code/commit/aa3e7435e4), [`b38ff47b14`](https://github.com/fcakyon/t3code/commit/b38ff47b14), [`59b6cf0ff9`](https://github.com/fcakyon/t3code/commit/59b6cf0ff9), [`453db3b3ab`](https://github.com/fcakyon/t3code/commit/453db3b3ab), [`935e25e3aa`](https://github.com/fcakyon/t3code/commit/935e25e3aa))
 - fix: Resume Antigravity sessions without replaying old tools ([`18265feecd`](https://github.com/fcakyon/t3code/commit/18265feecd))
 - fix: Place running Antigravity edits and use the completed file diff for final line numbers ([pingdotgg/t3code#39073](https://github.com/pingdotgg/t3code/pull/39073)).
 - docs: Remove the root Claude configuration shim.
