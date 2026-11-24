@@ -383,6 +383,7 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
       );
       yield* fileSystem.makeDirectory(path.join(root, ".not-a-skill"));
       yield* fileSystem.writeFileString(path.join(root, "README.md"), "Not a skill.");
+      yield* fileSystem.writeFileString(path.join(root, "SKILL.MD"), "---\nname: uppercase\n---\n");
       const skillPath = yield* writeSkill(
         path.join(root, ".native-hidden-skill"),
         "---\nname: native-name\ndescription: >\n  Review the code\n  and run tests.\n---\n",
@@ -558,6 +559,9 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
           "---\nname: release\n---\n",
         );
         yield* writeSkill(path.join(projectSkills, "excluded"), "---\nname: excluded-root\n---\n");
+        const explicitRoot = path.join(projectSkills, "explicit");
+        yield* writeSkill(path.join(explicitRoot, "child"), "---\nname: not-discovered\n---\n");
+        yield* fileSystem.writeFileString(path.join(explicitRoot, "SKILL.MD"), "---\n---\n");
 
         // agy does not expand ~, so a ~/ entry loads nothing.
         yield* writeSkill(
@@ -603,6 +607,7 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
               { path: "tools/skills/public", include_only: ["public"] },
               { path: "tools/skills/excluded", exclude: ["excluded"] },
               { path: "tools/skills/excluded", include_only: ["public"] },
+              { path: "tools/skills/explicit" },
             ],
           }),
         );
