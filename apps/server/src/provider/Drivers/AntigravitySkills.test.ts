@@ -125,8 +125,14 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
       const input = { ...workspace, profileDirectory };
 
       assert.deepEqual(
-        (yield* discoverAntigravitySkills(input)).map((skill) => skill.name),
-        ["demo-skill", "opted-in-skill"],
+        (yield* discoverAntigravitySkills(input)).map(({ name, displayName }) => ({
+          name,
+          displayName,
+        })),
+        [
+          { name: "demo-skill", displayName: "demo:demo-skill" },
+          { name: "opted-in-skill", displayName: "opted-in:opted-in-skill" },
+        ],
       );
     }),
   );
@@ -219,14 +225,18 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
         );
 
         assert.deepEqual(
-          (yield* discoverAntigravitySkills(input)).map((skill) => [skill.name, skill.scope]),
+          (yield* discoverAntigravitySkills(input)).map((skill) => [
+            skill.name,
+            skill.scope,
+            skill.displayName,
+          ]),
           [
-            ["ag", "user"],
-            ["gem", "user"],
-            ["null-flag", "user"],
-            ["on", "user"],
-            ["profile-shadowed", "user"],
-            ["re-enabled", "user"],
+            ["ag", "user", "ag:ag"],
+            ["gem", "user", "gem:gem"],
+            ["null-flag", "user", "null-flag:null-flag"],
+            ["on", "user", "on:on"],
+            ["profile-shadowed", "user", "shadowed:profile-shadowed"],
+            ["re-enabled", "user", "re-enabled:re-enabled"],
           ],
         );
       }),
