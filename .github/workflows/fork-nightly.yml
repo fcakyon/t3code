@@ -70,6 +70,15 @@ jobs:
       - name: Apply nightly web client branding
         run: node scripts/apply-web-brand-assets.ts nightly apps/server/dist/client
 
+      # Upload only the expected hidden file, without opting all build outputs into hidden uploads.
+      - name: Stage web asset manifest
+        shell: bash
+        run: |
+          manifest=apps/server/dist/client/.vite/manifest.json
+          if [[ -f "$manifest" ]]; then
+            cp "$manifest" apps/server/dist/client/vite-manifest.release.json
+          fi
+
       - name: Upload JS bundle
         uses: actions/upload-artifact@v7
         with:
@@ -79,6 +88,10 @@ jobs:
             apps/desktop/dist-electron
           if-no-files-found: error
           retention-days: 1
+
+      - name: Clean staged web asset manifest
+        shell: bash
+        run: rm -f apps/server/dist/client/vite-manifest.release.json
 
       - name: Cache Linux x64 resource monitor
         id: resource_monitor_cache
@@ -159,6 +172,15 @@ jobs:
         with:
           name: js-bundle
           path: apps
+
+      - name: Restore web asset manifest
+        shell: bash
+        run: |
+          client=apps/server/dist/client
+          if [[ -f "$client/vite-manifest.release.json" ]]; then
+            mkdir -p "$client/.vite"
+            mv "$client/vite-manifest.release.json" "$client/.vite/manifest.json"
+          fi
 
       - name: Cache macOS arm64 resource monitor
         id: resource_monitor_cache
