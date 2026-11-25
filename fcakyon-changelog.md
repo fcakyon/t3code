@@ -8,7 +8,6 @@ Active fork-only features, fixes, and release infrastructure on `nightly` (relat
 - docs: Remove the root Claude configuration shim.
 - fix: Let Antigravity sessions read a linked git worktree's backing gitdir, also from subdirectories, after checking its backlink ([pingdotgg/t3code#39078](https://github.com/pingdotgg/t3code/pull/39078))
 - fix: Link enabled global Antigravity plugins from `~/.gemini/config/plugins` into each instance profile, so their skills, hooks and MCP servers load in T3 threads, replacing the earlier skills-only catalog ([pingdotgg/t3code#39082](https://github.com/pingdotgg/t3code/pull/39082))
-- fix: Auto-refresh expired Antigravity 1.5 CLI OAuth tokens during usage limit probes ([`d2803c084a`](https://github.com/fcakyon/t3code/commit/d2803c084a))
 - fix: Keep delegation available in Antigravity and let it find and call other T3 tools in the same turn ([pingdotgg/t3code#39362](https://github.com/pingdotgg/t3code/pull/39362))
 - fix: Allow read-only Antigravity requests without prompting in Auto ([pingdotgg/t3code#40127](https://github.com/pingdotgg/t3code/issues/40127))
 - fix: Show managed Antigravity updates beside the provider version in Settings ([`53de663bb1`](https://github.com/fcakyon/t3code/commit/53de663bb1))
