@@ -49,6 +49,7 @@ import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { makeAcpAdapterV2 } from "@t3tools/provider-acp/server/adapter";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
+import { antigravitySubagentChildSessionId } from "../../provider/acp/AntigravityChildWork.ts";
 import {
   agentReportStep,
   commandTaskStep,
@@ -3747,6 +3748,97 @@ describe("AntigravityAdapterV2 subagent reads", () => {
             model: "gemini-test-high",
             options: [{ id: "thinking_level", value: "high" }],
           },
+        );
+      }).pipe(Effect.provide(layerSession), Effect.scoped),
+  );
+
+  it.effect(
+    "preserves swarm child conversation_id and explicit model while keeping antigravity-task ids for invoke_subagent",
+    () =>
+      Effect.gen(function* () {
+        const { profile } = yield* makeProfile({
+          sessionId: "mock-session-1",
+          steps: () => [],
+        });
+        const swarmConversationId = "11111111-1111-4000-8000-111111111111";
+
+        const { events, instanceId } = yield* runSubagentTurn({
+          slug: "swarm-and-invoke",
+          profile,
+          runPrompt: (update) =>
+            Effect.gen(function* () {
+              yield* update({
+                sessionUpdate: "tool_call",
+                toolCallId: "swarm-add-1",
+                title: "Run swarm",
+                kind: "other",
+                status: "in_progress",
+                rawInput: {
+                  action: "add",
+                  name: "parser",
+                  brief: "Audit parser module",
+                  model: "flash",
+                },
+              });
+              yield* update({
+                sessionUpdate: "tool_call_update",
+                toolCallId: "swarm-add-1",
+                status: "completed",
+                rawOutput: {
+                  status: "added",
+                  name: "parser",
+                  conversation_id: swarmConversationId,
+                  model: "gemini-flash",
+                },
+              });
+              yield* update({
+                sessionUpdate: "tool_call",
+                toolCallId: "invoke-1",
+                title: "Running invoke_subagent",
+                kind: "other",
+                status: "in_progress",
+                rawInput: { Role: "Reviewer", Prompt: "Check diff" },
+              });
+              yield* update({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Done." },
+              });
+            }),
+        });
+
+        const subagentUpdates = events.flatMap((event) =>
+          event.type === "subagent.updated" ? [event.subagent] : [],
+        );
+        const swarmInitial = subagentUpdates.find(
+          (entry) => entry.nativeTaskRef?.nativeId === "swarm-add-1",
+        );
+        const swarmCompleted = subagentUpdates.findLast(
+          (entry) => entry.nativeTaskRef?.nativeId === "swarm-add-1",
+        );
+        const invokeSubagent = subagentUpdates.findLast(
+          (entry) => entry.nativeTaskRef?.nativeId === "invoke-1",
+        );
+        const providerThreads = events.flatMap((event) =>
+          event.type === "provider_thread.updated" ? [event.providerThread] : [],
+        );
+        const swarmProviderThread = providerThreads.find(
+          (thread) => thread.id === swarmCompleted?.providerThreadId,
+        );
+        const invokeProviderThread = providerThreads.find(
+          (thread) => thread.id === invokeSubagent?.providerThreadId,
+        );
+
+        assert.equal(swarmInitial?.providerThreadId, null);
+        assert.equal(swarmInitial?.model, "flash");
+        assert.equal(swarmCompleted?.model, "gemini-flash");
+        assert.deepEqual(swarmCompleted?.modelSelection, {
+          instanceId,
+          model: "gemini-flash",
+        });
+        assert.equal(swarmProviderThread?.nativeThreadRef?.nativeId, swarmConversationId);
+        assert.equal(
+          invokeProviderThread?.nativeThreadRef?.nativeId,
+          antigravitySubagentChildSessionId("invoke-1"),
         );
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );

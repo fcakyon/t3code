@@ -55,11 +55,14 @@ import {
 } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
+  antigravitySwarmAddChildSessionId,
+  antigravitySwarmAddModel,
   antigravityToolOutlivesPrompt,
   antigravityCommandOutlivesPrompt,
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
   extractAntigravityUserInputQuestion,
+  isAntigravitySwarmSubagentToolCall,
   makeAntigravityReadRepair,
   makeAntigravityUpdateStepsPlans,
   makeAntigravityUserInputResponse,
@@ -213,7 +216,22 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
           : "running";
   const launches = antigravitySubagentLaunches(toolCall.data.rawInput);
   const launch = launches === undefined ? undefined : describeAntigravitySubagentLaunches(launches);
-  const { model, modelSelection } = resolveAntigravitySubagentModel(launches, context);
+  const isSwarm = isAntigravitySwarmSubagentToolCall(toolCall);
+  const swarmModel = isSwarm ? antigravitySwarmAddModel(toolCall) : null;
+  const resolvedModel =
+    swarmModel !== null
+      ? {
+          model: swarmModel,
+          ...(context?.parentModelSelection === undefined
+            ? {}
+            : {
+                modelSelection: createModelSelection(
+                  context.parentModelSelection.instanceId,
+                  swarmModel,
+                ),
+              }),
+        }
+      : resolveAntigravitySubagentModel(launches, context);
   return {
     nativeTaskId: toolCall.toolCallId,
     prompt:
@@ -223,10 +241,14 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
       toolCall.title ??
       ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
     title: launch?.title ?? ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
-    model,
-    ...(modelSelection === undefined ? {} : { modelSelection }),
+    model: resolvedModel.model,
+    ...(resolvedModel.modelSelection === undefined
+      ? {}
+      : { modelSelection: resolvedModel.modelSelection }),
     status,
-    childSessionId: antigravitySubagentChildSessionId(toolCall.toolCallId),
+    childSessionId: isSwarm
+      ? antigravitySwarmAddChildSessionId(toolCall)
+      : antigravitySubagentChildSessionId(toolCall.toolCallId),
     result:
       status === "failed" || status === "completed"
         ? (antigravitySubagentOutput(toolCall) ?? null)
