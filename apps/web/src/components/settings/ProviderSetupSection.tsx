@@ -22,9 +22,9 @@ import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { Button } from "../ui/button";
 import { Spinner } from "../ui/spinner";
-import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { SettingsRow } from "./settingsLayout";
 import { ProviderAuthenticationSection } from "./ProviderAuthenticationSection";
+import { SharedTooltipTrigger } from "../ui/shared-tooltip";
 
 interface ProviderSetupSectionProps {
   readonly compact?: boolean | undefined;
@@ -177,7 +177,9 @@ function ProviderSetupActions({
     const confirmed = await ensureLocalApi().dialogs.confirm(
       gt(
         "Remove the downloaded Antigravity runtime from {environment}? Google sign-in and thread history are kept.",
-        { environment: environmentLabel },
+        {
+          environment: environmentLabel,
+        },
       ),
     );
     if (confirmed) {
@@ -191,25 +193,21 @@ function ProviderSetupActions({
       ? gt("Updating Antigravity")
       : gt("Update Antigravity to v{version}", { version: updateVersion });
     return (
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <Button
-              size="icon-micro"
-              variant="ghost-muted"
-              className="pointer-events-auto relative shrink-0"
-              aria-label={label}
-              disabled={actionsDisabled || authActive || installActive}
-              onClick={() =>
-                void runCommand(gt("Starting installation"), () => startInstall(target))
-              }
-            >
-              {installActive ? <Spinner tone="muted" size="sm" /> : <ArrowUpCircleIcon />}
-            </Button>
-          }
-        />
-        <TooltipPopup>{error ?? label}</TooltipPopup>
-      </Tooltip>
+      <SharedTooltipTrigger
+        render={
+          <Button
+            size="icon-micro"
+            variant="ghost-muted"
+            className="pointer-events-auto relative shrink-0"
+            aria-label={label}
+            disabled={actionsDisabled || authActive || installActive}
+            onClick={() => void runCommand(gt("Starting installation"), () => startInstall(target))}
+          >
+            {installActive ? <Spinner tone="muted" size="sm" /> : <ArrowUpCircleIcon />}
+          </Button>
+        }
+        label={error ?? label}
+      />
     );
   }
 
@@ -338,25 +336,25 @@ function ProviderSetupActions({
                 ) : null}
               </div>
               {installation?.canRemove && !installActive ? (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <Button
-                        size="icon-sm"
-                        variant="ghost"
-                        className="col-start-1 row-start-1"
-                        aria-label={gt("Remove downloaded runtime")}
-                        disabled={actionsDisabled || authActive}
-                        onClick={() => void removeRuntime()}
-                      />
-                    }
-                  >
-                    <Trash2Icon className="size-3.5" />
-                  </TooltipTrigger>
-                  <TooltipPopup>
-                    <T>Remove downloaded runtime</T>
-                  </TooltipPopup>
-                </Tooltip>
+                <SharedTooltipTrigger
+                  render={
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      className="col-start-1 row-start-1"
+                      aria-label={gt("Remove downloaded runtime")}
+                      disabled={actionsDisabled || authActive}
+                      onClick={() => void removeRuntime()}
+                    />
+                  }
+                  label={
+                    <>
+                      <T>Remove downloaded runtime</T>
+                    </>
+                  }
+                >
+                  <Trash2Icon className="size-3.5" />
+                </SharedTooltipTrigger>
               ) : null}
             </div>
           </div>
