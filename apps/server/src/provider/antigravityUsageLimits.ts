@@ -45,6 +45,12 @@ const decodeUsageOutput = Schema.decodeUnknownEffect(
   ),
 );
 
+// `/usage` names no account, so the email agy saves beside its tokens is what lets clients count
+// one account signed in on several servers once. The tokens themselves are never used.
+const decodeSignIn = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ id_token_email: Schema.optional(Schema.String) })),
+);
+
 /** Windows from the JSON that `agy -p /usage --output-format json` prints. */
 export const antigravityUsageWindows = Effect.fn("antigravityUsageWindows")(function* (
   stdout: string,
@@ -91,9 +97,12 @@ export const readAntigravityUsageLimits = Effect.fn("readAntigravityUsageLimits"
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   // Without a sign-in agy only waits for one, so it is not asked.
-  if (!(yield* fileSystem.exists(input.signInFile).pipe(Effect.orElseSucceed(() => false)))) {
-    return undefined;
-  }
+  const signIn = yield* fileSystem.readFileString(input.signInFile).pipe(Effect.option);
+  if (Option.isNone(signIn)) return undefined;
+  const email = yield* decodeSignIn(signIn.value).pipe(
+    Effect.map((decoded) => decoded.id_token_email),
+    Effect.orElseSucceed(() => undefined),
+  );
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   return yield* Effect.gen(function* () {
     const home = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-usage-" });
@@ -123,5 +132,6 @@ export const readAntigravityUsageLimits = Effect.fn("readAntigravityUsageLimits"
     Effect.flatMap((result) => antigravityUsageWindows(result.stdout)),
     Effect.map((windows): ServerProviderUsageLimits => makeUsageLimits({ checkedAt, windows })),
     Effect.orElseSucceed(() => makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" })),
+    Effect.map((usageLimits) => ({ usageLimits, email })),
   );
 });

@@ -200,7 +200,10 @@ interface AntigravityProviderOptions {
   >;
   readonly supportsTextGeneration: Effect.Effect<boolean>;
   /** Reads nothing while the instance holds no sign-in. */
-  readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits | undefined>;
+  readonly probeUsage?: Effect.Effect<
+    | { readonly usageLimits: ServerProviderUsageLimits; readonly email: string | undefined }
+    | undefined
+  >;
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
   readonly auth?: { readonly type: string; readonly label: string };
   /** Modes the last session advertised, saved because initialize alone does not report them. */
@@ -329,7 +332,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
               : `Antigravity did not respond to its local health check within ${timeoutMs / 1_000} seconds.`;
     const supportsTextGeneration =
       initialized !== undefined ? yield* options.supportsTextGeneration : false;
-    const usageLimits =
+    const usage =
       options.probeUsage !== undefined && initialized !== undefined
         ? yield* options.probeUsage
         : undefined;
@@ -354,11 +357,13 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
           version: version === "unknown" ? draft.version : version || draft.version,
           status: errorMessage ? "error" : authenticated ? "ready" : "warning",
           checkedAt: updatedAt,
-          ...(usageLimits
+          ...(usage
             ? {
+                // The sign-in file is the only source, so an earlier account's email never stays.
+                auth: { ...draft.auth, email: usage.email },
                 usageLimits: resolveUsageLimitsAfterProbe({
                   published: draft.usageLimits,
-                  probed: usageLimits,
+                  probed: usage.usageLimits,
                 }),
               }
             : {}),
@@ -450,6 +455,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
             status: "authenticated",
             type: options.auth?.type ?? "oauth-personal",
             label: options.auth?.label ?? "Google account",
+            ...(draft.auth.email ? { email: draft.auth.email } : {}),
           },
           checkedAt: updatedAt,
           models: buildAntigravityModelsFromSession(started.sessionSetupResult, thinkingLevels, {

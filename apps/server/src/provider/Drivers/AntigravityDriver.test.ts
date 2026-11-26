@@ -329,12 +329,17 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         yield* h.fs.writeFileString(h.path.join(plugin, "plugin.json"), "x".repeat(1_000_001));
         const signIn = h.path.join(h.profileDirectory, "antigravity-acp");
         yield* h.fs.makeDirectory(signIn, { recursive: true });
-        yield* h.fs.writeFileString(h.path.join(signIn, "antigravity-oauth-token"), "fixture");
+        yield* h.fs.writeFileString(
+          h.path.join(signIn, "antigravity-oauth-token"),
+          '{"id_token_email":"user@example.com"}',
+        );
         yield* h.refresh();
         yield* h.instance.snapshot.refresh;
         const snapshot = yield* h.instance.snapshot.getSnapshot;
         expect(snapshot.status).toBe("ready");
         expect(snapshot.auth.status).toBe("authenticated");
+        // The email is the only identity shared by servers signed in to one account.
+        expect(snapshot.auth.email).toBe("user@example.com");
         expect(snapshot.models.map((model) => model.slug)).toEqual([
           "gemini-test-low",
           "gemini-test-high",
