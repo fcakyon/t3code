@@ -70,6 +70,7 @@ import {
 import { makeAcpNativeLoggerFactory } from "@t3tools/provider-acp/server/nativeLogging";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeAntigravityProvider } from "../AntigravityProvider.ts";
+import { readAntigravityUsageLimits } from "../antigravityUsageLimits.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ModelCatalog from "@t3tools/provider-core/server/ModelCatalog";
 import {
@@ -223,6 +224,8 @@ export const AntigravityDriver: ProviderDriver<
     const prepareSpawn = Effect.fn("AntigravityDriver.prepareSpawn")(function* (
       cwd: string,
       baseEnv: NodeJS.ProcessEnv,
+      // A session holds its executable until it exits. The few seconds of a usage read need no lease.
+      locate: typeof installation.acquire = installation.acquire,
     ): Effect.fn.Return<
       {
         readonly executable: AntigravityInstallation.AntigravityExecutable;
@@ -238,7 +241,7 @@ export const AntigravityDriver: ProviderDriver<
           detail: authConfigIssue,
         });
       }
-      const executable = yield* installation.acquire(settings.binaryPath, processEnvironment).pipe(
+      const executable = yield* locate(settings.binaryPath, processEnvironment).pipe(
         Effect.mapError(
           (cause) =>
             new ProviderSetupError({
@@ -572,6 +575,19 @@ export const AntigravityDriver: ProviderDriver<
       environment: processEnvironment,
       stampIdentity: classifyModels,
       probe,
+      // API keys carry no subscription quota, and agy refuses `/usage` for them.
+      ...(auth.authMethod === "oauth-personal"
+        ? {
+            probeUsage: readAntigravityUsageLimits(
+              fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-usage-" }).pipe(
+                Effect.flatMap((cwd) =>
+                  prepareSpawn(cwd, processEnvironment, installation.resolve),
+                ),
+                Effect.map(({ spawn }) => spawn),
+              ),
+            ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+          }
+        : {}),
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },
       ...(rememberedRuntimeModes ? { rememberedRuntimeModes } : {}),
       rememberRuntimeModes: (modes) =>

@@ -160,6 +160,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     tempDirectory: string | undefined;
     handle: ChildProcessSpawner.ChildProcessHandle;
   }> = [];
+  const usageReads: typeof launches = [];
 
   const layerInstallation = Layer.mock(AntigravityInstallation.AntigravityInstallation)({
     managedDirectory: root,
@@ -210,7 +211,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
         const value = environment[name];
         return Redacted.isRedacted(value) ? Redacted.value(value) : value;
       };
-      launches.push({
+      (command.args[0] === "-p" ? usageReads : launches).push({
         command: command.command,
         args: command.args.map(String),
         cwd: command.options.cwd,
@@ -261,7 +262,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     );
   });
   const assertClosed = Effect.gen(function* () {
-    for (const launch of launches) {
+    for (const launch of [...launches, ...usageReads]) {
       yield* launch.handle.exitCode.pipe(Effect.ignore);
       expect(yield* launch.handle.isRunning).toBe(false);
       if (launch.cwd) expect(yield* fs.exists(launch.cwd)).toBe(false);
@@ -285,6 +286,7 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     acquisitions,
     releases,
     launches,
+    usageReads,
     readRequests,
     assertClosed,
   };
@@ -337,6 +339,9 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         expect(snapshot.models.every((model) => model.isLegacy !== true)).toBe(true);
         expect(snapshot.slashCommands.map((command) => command.name)).toEqual(["plan", "logout"]);
         expect(snapshot.supportsTextGeneration).toBe(true);
+        // Limits come from the official CLI's own `/usage` answer.
+        expect(snapshot.usageLimits?.windows.map((window) => window.id)).toEqual(["gemini-weekly"]);
+        expect(h.usageReads[0]?.args.slice(0, 2)).toEqual(["-p", "/usage"]);
         h.controls.selected = h.second;
         yield* h.refresh();
 

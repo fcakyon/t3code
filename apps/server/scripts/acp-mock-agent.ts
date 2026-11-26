@@ -16,6 +16,33 @@ import type * as AcpCompat from "effect-acp/compat";
 
 import { beginAcpMockPrompt } from "./acpMockCancellationState.ts";
 
+// `agy -p /usage` answers and exits without serving ACP.
+if (process.argv.includes("/usage")) {
+  NodeFS.writeSync(
+    1,
+    JSON.stringify({
+      command: {
+        data: {
+          groups: [
+            {
+              name: "Gemini Models",
+              buckets: [
+                {
+                  id: "gemini-weekly",
+                  window: "weekly",
+                  remaining_fraction: 0.5,
+                  reset_time: "2099-01-01T00:00:00Z",
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }),
+  );
+  process.exit(0);
+}
+
 const requestLogPath = process.env.T3_ACP_REQUEST_LOG_PATH;
 const antigravityProfile = process.env.T3_ACP_ANTIGRAVITY === "1";
 const antigravityThoughtLevel = process.env.T3_ACP_ANTIGRAVITY_THOUGHT_LEVEL === "1";
