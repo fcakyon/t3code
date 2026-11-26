@@ -1,4 +1,8 @@
-import type { ServerProviderUsageLimits, ServerProviderUsageWindow } from "@t3tools/contracts";
+import {
+  TrimmedNonEmptyString,
+  type ServerProviderUsageLimits,
+  type ServerProviderUsageWindow,
+} from "@t3tools/contracts";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { spawnAndCollect } from "@t3tools/provider-core/server/snapshotProbe";
 import {
@@ -48,7 +52,7 @@ const decodeUsageOutput = Schema.decodeUnknownEffect(
 // `/usage` names no account, so the email agy saves beside its tokens is what lets clients count
 // one account signed in on several servers once. The tokens themselves are never used.
 const decodeSignIn = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(Schema.Struct({ id_token_email: Schema.optional(Schema.String) })),
+  Schema.fromJsonString(Schema.Struct({ id_token_email: Schema.optional(TrimmedNonEmptyString) })),
 );
 
 /** Windows from the JSON that `agy -p /usage --output-format json` prints. */

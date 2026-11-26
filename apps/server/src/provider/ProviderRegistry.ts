@@ -351,7 +351,9 @@ const carrySavedAntigravityAccount = (
   }
   const status =
     nextProvider.installed && nextProvider.status === "warning" ? "ready" : nextProvider.status;
-  return { auth: previousProvider.auth, status };
+  // The check reads the email from the sign-in file, which the saved account may predate.
+  const email = nextProvider.auth.email;
+  return { auth: email ? { ...previousProvider.auth, email } : previousProvider.auth, status };
 };
 
 /** One failed check after a ready one is often transient, so its retained catalog stays offered. */

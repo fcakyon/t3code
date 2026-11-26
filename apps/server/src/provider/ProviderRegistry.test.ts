@@ -2346,6 +2346,17 @@ it.layer(
         models: [],
       } as const satisfies ServerProvider;
 
+      it("keeps the email a restart health check reads for the saved Google account", () => {
+        const email = "user@example.com";
+        assert.deepStrictEqual(
+          ProviderRegistry.mergeProviderSnapshot(signedIn, {
+            ...restartProbe,
+            auth: { status: "unknown", email },
+          }).auth,
+          { ...signedIn.auth, email },
+        );
+      });
+
       it("keeps the saved Google account through restart health checks", () => {
         const merged = ProviderRegistry.mergeProviderSnapshot(signedIn, restartProbe);
         const { message: _uncheckedMessage, ...probeWithoutMessage } = restartProbe;
