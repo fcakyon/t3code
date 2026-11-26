@@ -11,19 +11,16 @@ import * as Path from "effect/Path";
 import {
   ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
   antigravitySubagentLaunches,
-  antigravitySubagentChildSessionId,
   describeAntigravitySubagentLaunches,
-  makeAntigravitySubagentTracker,
   makeAntigravityCommandTaskTracker,
   readAntigravityChildrenAtWork,
   readAntigravityChildWork,
   readAntigravityPendingReply,
-  readAntigravitySessionSubagentState,
-  toAntigravitySubagentRawInput,
+  readAntigravitySubagentTranscript,
+  transcriptToSubagentEntries,
 } from "./AntigravityChildWork.ts";
 import { sanitizeAntigravityToolPayload } from "./AntigravityProtocol.ts";
 import {
-  agentReportStep,
   autoApproved,
   commandTaskStep,
   CHILD,
@@ -250,149 +247,6 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
     }),
   );
 
-  it.effect.each([127, 132] as const)(
-    "matches an auto-approved call id with silent planner steps and native step type %s",
-    (stepType) =>
-      Effect.gen(function* () {
-        const { profile } = yield* makeProfile({
-          steps: (logUri) => [
-            [1, 15, plannerStep([])],
-            [4, 15, plannerStep([])],
-            [9, 15, plannerStep([])],
-            [
-              14,
-              15,
-              plannerStep(["other-call"], { thought: "Visible thought keeps its step index" }),
-            ],
-            [20, 15, plannerStep([])],
-            [29, 15, plannerStep(["call-30"])],
-            [
-              30,
-              stepType,
-              invokeStep({
-                stepType,
-                callId: "call-30",
-                launches: [LAUNCH],
-                children: [{ id: CHILD, logUri }],
-              }),
-            ],
-            [
-              31,
-              101,
-              agentReportStep({
-                recipientSessionId: ROOT,
-                senderConversationId: CHILD,
-                text: "marker 4242 found in README.md",
-              }),
-            ],
-            ...Array.from(
-              { length: 201 },
-              (_, index) =>
-                [
-                  100 + index,
-                  132,
-                  commandTaskStep({
-                    stepType: 132,
-                    taskId: `${ROOT}/task-${100 + index}`,
-                    command: "echo invoke_subagent",
-                    summary: "Unrelated command",
-                    callId: `command-${index}`,
-                  }),
-                ] as const,
-            ),
-          ],
-        });
-        // 5 silent planner steps precede idx 30 (at 1, 4, 9, 20, 29), so StepUpdate.step_index is 25.
-        const [child] = yield* read(profile, `${ROOT}:25`);
-        expect(child?.conversationId).toBe(CHILD);
-        expect(child?.role).toBe(LAUNCH.role);
-
-        const state = yield* readAntigravitySessionSubagentState({
-          profileDirectory: profile,
-          rootSessionId: ROOT,
-        });
-        expect(state?.batches).toEqual([
-          {
-            stepUpdateIndex: 25,
-            toolCallId: "call-30",
-            launches: [LAUNCH],
-            children: [{ conversationId: CHILD, role: LAUNCH.role }],
-          },
-        ]);
-        expect(state?.reports).toEqual([
-          {
-            stepIndex: 31,
-            conversationId: CHILD,
-            text: "marker 4242 found in README.md",
-          },
-        ]);
-      }),
-  );
-
-  it.effect(
-    "reads subagent launch specs from in-progress, compacted, and planner-only steps before child resultados exist",
-    () =>
-      Effect.gen(function* () {
-        const compactedLaunch = { role: "Compacted Reviewer", prompt: "Review compacted diff" };
-        const runningLaunch = { role: "Running Reviewer", prompt: "Inspect active files" };
-        const plannerLaunch = { role: "Planner Reviewer", prompt: "Check planner args" };
-        const { profile } = yield* makeProfile({
-          steps: () => [
-            [1, 15, plannerStep(["call-compacted"])],
-            [
-              2,
-              127,
-              invokeStep({
-                callId: "call-compacted",
-                launches: [],
-                children: [],
-                omitInvokePayload: true,
-                metadataArgsJson: JSON.stringify({
-                  Subagents: [{ Role: compactedLaunch.role, Prompt: compactedLaunch.prompt }],
-                }),
-              }),
-            ],
-            [3, 15, plannerStep(["call-running"])],
-            [
-              4,
-              127,
-              invokeStep({
-                callId: "call-running",
-                launches: [runningLaunch],
-                children: [],
-              }),
-            ],
-            [5, 15, plannerStep([{ id: "call-planner", launches: [plannerLaunch] }])],
-          ],
-        });
-        const state = yield* readAntigravitySessionSubagentState({
-          profileDirectory: profile,
-          rootSessionId: ROOT,
-          includeReports: false,
-        });
-        expect(state?.batches).toEqual([
-          {
-            stepUpdateIndex: 1,
-            toolCallId: "call-compacted",
-            launches: [compactedLaunch],
-            children: [],
-          },
-          {
-            stepUpdateIndex: 2,
-            toolCallId: "call-running",
-            launches: [runningLaunch],
-            children: [],
-          },
-          {
-            stepUpdateIndex: 3,
-            toolCallId: "call-planner",
-            launches: [plannerLaunch],
-            children: [],
-          },
-        ]);
-      }),
-  );
-
   it.effect("needs proof that the call id belongs to the parent's record", () =>
     Effect.gen(function* () {
       const { profile } = yield* makeProfile({
@@ -611,62 +465,41 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
     }),
   );
 
-  it.effect.each([127, 132] as const)(
-    "declines an unproven launch-text match for native step %s",
-    (stepType) =>
-      Effect.gen(function* () {
-        const record = (callId: string, logUri: string) =>
-          invokeStep({ stepType, callId, launches: [LAUNCH], children: [{ id: CHILD, logUri }] });
-        const other = { role: "Test Runner", prompt: "Run the tests" };
-        const filler = (idx: number, logUri: string) =>
-          [
-            idx,
-            stepType,
-            invokeStep({
-              stepType,
-              callId: `f${idx}`,
-              launches: [other],
-              children: [{ id: CHILD, logUri }],
-            }),
-          ] as const;
-        const opaque = "35bea692fa95447fbdae6333fec5515f";
-        const launch = describeAntigravitySubagentLaunches([LAUNCH]);
-        const cases = [
-          // More records than one open may scan.
-          (logUri: string) => [
-            [1, stepType, record("x", logUri)] as const,
-            ...Array.from({ length: 200 }, (_, index) => filler(index + 2, logUri)),
-          ],
-          // An oversized record could hold an identical launch.
-          (logUri: string) => [
-            [1, stepType, record("x", logUri)] as const,
-            [
-              2,
-              stepType,
-              Uint8Array.from([...record("oversized", logUri), ...new Uint8Array(1024 * 1024)]),
-            ] as const,
-          ],
-          // So could one this reader cannot decode.
-          (logUri: string) => [
-            [1, stepType, record("x", logUri)] as const,
-            [2, stepType, Uint8Array.from([...record("invalid", logUri), 0xff, 0xff])] as const,
-          ],
-        ];
-        for (const steps of cases) {
-          const { profile } = yield* makeProfile({ steps });
-          expect(yield* read(profile, opaque, launch)).toEqual([]);
-        }
-        const { profile } = yield* makeProfile({
-          steps: (logUri) => [[1, stepType, record("x", logUri)]],
-        });
-        const path = yield* Path.Path;
-        const database = new NodeSqlite.DatabaseSync(
-          path.join(profile, "antigravity-acp", "conversations", `${ROOT}.db`),
-        );
-        database.prepare("UPDATE steps SET step_format = 1").run();
-        database.close();
+  it.effect("declines a launch-text match it cannot prove unique within its scan bounds", () =>
+    Effect.gen(function* () {
+      const record = (callId: string, logUri: string) =>
+        invokeStep({ callId, launches: [LAUNCH], children: [{ id: CHILD, logUri }] });
+      const other = { role: "Test Runner", prompt: "Run the tests" };
+      const filler = (idx: number, logUri: string) =>
+        [
+          idx,
+          127,
+          invokeStep({ callId: `f${idx}`, launches: [other], children: [{ id: CHILD, logUri }] }),
+        ] as const;
+      const opaque = "35bea692fa95447fbdae6333fec5515f";
+      const launch = describeAntigravitySubagentLaunches([LAUNCH]);
+      const cases = [
+        // More records than one open may scan.
+        (logUri: string) => [
+          [1, 127, record("x", logUri)] as const,
+          ...Array.from({ length: 200 }, (_, index) => filler(index + 2, logUri)),
+        ],
+        // An oversized record could hold an identical launch.
+        (logUri: string) => [
+          [1, 127, record("x", logUri)] as const,
+          [2, 127, new Uint8Array(1024 * 1024 + 1)] as const,
+        ],
+        // So could one this reader cannot decode.
+        (logUri: string) => [
+          [1, 127, record("x", logUri)] as const,
+          [2, 127, Uint8Array.from([0xff, 0xff])] as const,
+        ],
+      ];
+      for (const steps of cases) {
+        const { profile } = yield* makeProfile({ steps });
         expect(yield* read(profile, opaque, launch)).toEqual([]);
-      }),
+      }
+    }),
   );
 
   it.effect("keeps the batch view for a batch over the child limit", () =>
@@ -1021,207 +854,24 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
     }),
   );
 
-  it.effect(
-    "binds a drifted auto-approved call id to the newest unclaimed DB batch without synthesizing duplicate historical batches",
-    () =>
-      Effect.gen(function* () {
-        const historicalLaunch = { role: "Earlier Researcher", prompt: "Inspect earlier wave" };
-        const historicalChild = "11111111111111111111111111111111";
-        const { profile } = yield* makeProfile({
-          steps: (logUri) => [
-            [10, 15, plannerStep([{ id: "call-old", launches: [historicalLaunch] }])],
-            [
-              11,
-              127,
-              invokeStep({
-                callId: "call-old",
-                launches: [historicalLaunch],
-                children: [{ id: historicalChild, logUri }],
-              }),
-            ],
-            [1669, 15, plannerStep([{ id: "call-new", launches: [LAUNCH] }])],
-            [
-              1670,
-              127,
-              invokeStep({
-                callId: "call-new",
-                launches: [LAUNCH],
-                children: [{ id: CHILD, logUri }],
-              }),
-            ],
-            [
-              1671,
-              101,
-              agentReportStep({
-                recipientSessionId: ROOT,
-                senderConversationId: CHILD,
-                text: "marker 4242 found in README.md",
-              }),
-            ],
-          ],
-        });
-
-        const driftedTaskId = `${ROOT}:1624`;
-        const tracker = makeAntigravitySubagentTracker(profile);
-        const launchNotifications = yield* tracker.rewriteAndDrain({
-          sessionId: ROOT,
-          update: {
-            sessionUpdate: "tool_call",
-            toolCallId: driftedTaskId,
-            title: "Running invoke_subagent",
-            kind: "other",
-            status: "in_progress",
-          },
-        });
-        expect(launchNotifications).toHaveLength(1);
-        const launchUpdate = launchNotifications[0]?.update;
-        expect(
-          launchUpdate?.sessionUpdate === "tool_call"
-            ? antigravitySubagentLaunches(launchUpdate.rawInput)
-            : undefined,
-        ).toEqual([LAUNCH]);
-
-        const childToolNotifications = yield* tracker.rewriteAndDrain({
-          sessionId: ROOT,
-          update: {
-            sessionUpdate: "tool_call",
-            toolCallId: `${CHILD}:1`,
-            title: "Running command",
-            kind: "execute",
-            status: "in_progress",
-            rawInput: { command_line: "orc status" },
-          },
-        });
-        // Must route the child tool call to the drifted batch's child session and never synthesize
-        // phantom tool_call_update notifications for historical `:9` or duplicate `:1668` batches.
-        expect(childToolNotifications).toHaveLength(1);
-        expect(childToolNotifications[0]?.sessionId).toBe(
-          antigravitySubagentChildSessionId(driftedTaskId),
-        );
-
-        const settledNotifications = yield* tracker.rewriteAndDrain({
-          sessionId: ROOT,
-          update: {
-            sessionUpdate: "agent_thought_chunk",
-            content: { type: "text", text: "processing" },
-          },
-        });
-        expect(settledNotifications.map((entry) => entry.sessionId)).toEqual([
-          antigravitySubagentChildSessionId(driftedTaskId),
-          ROOT,
-          ROOT,
-        ]);
-        expect(settledNotifications[1]?.update).toMatchObject({
-          sessionUpdate: "tool_call_update",
-          toolCallId: driftedTaskId,
-          status: "completed",
-          rawOutput: "marker 4242 found in README.md",
-        });
-
-        const hydratedLaunch = describeAntigravitySubagentLaunches([LAUNCH]);
-        const [resolvedChild] = yield* read(profile, driftedTaskId, hydratedLaunch);
-        expect(resolvedChild?.conversationId).toBe(CHILD);
-        expect(resolvedChild?.role).toBe(LAUNCH.role);
+  it("extracts optional Model from flat and batched invoke_subagent inputs", () => {
+    expect(
+      antigravitySubagentLaunches({
+        Role: LAUNCH.role,
+        Prompt: LAUNCH.prompt,
+        Model: "flash",
       }),
-  );
+    ).toEqual([{ ...LAUNCH, model: "flash" }]);
 
-  it.effect.each([127, 132] as const)(
-    "hydrates subagent models from raw input, native step %s, and planner args",
-    (stepType) =>
-      Effect.gen(function* () {
-        expect(
-          antigravitySubagentLaunches({
-            Subagents: [{ Role: LAUNCH.role, Prompt: LAUNCH.prompt }],
-          }),
-        ).toEqual([LAUNCH]);
-        expect(toAntigravitySubagentRawInput([LAUNCH])).toEqual({
-          Subagents: [{ Role: LAUNCH.role, Prompt: LAUNCH.prompt }],
-        });
-
-        const flashLaunch = { role: "Fast Reader", prompt: "Inspect index.ts", model: "flash" };
-        const proLaunch = { role: "Deep Reviewer", prompt: "Review diff", model: "pro" };
-        expect(
-          antigravitySubagentLaunches(toAntigravitySubagentRawInput([flashLaunch, proLaunch])),
-        ).toEqual([flashLaunch, proLaunch]);
-
-        const { profile } = yield* makeProfile({
-          steps: (logUri) => [
-            [1, 15, plannerStep(["call-proto"])],
-            [
-              2,
-              stepType,
-              invokeStep({
-                stepType,
-                callId: "call-proto",
-                launches: [
-                  { role: "Lite", prompt: "A", model: "flash_lite" },
-                  { role: "Inherited", prompt: "B", model: "inherit" },
-                ],
-                children: [
-                  { id: CHILD, logUri },
-                  { id: "b468c0e1d2f34a5b6c7d8e9f0a1b2c3d", logUri },
-                ],
-              }),
-            ],
-            [3, 15, plannerStep([{ id: "call-planner-model", launches: [flashLaunch] }])],
-            [
-              4,
-              stepType,
-              invokeStep({
-                stepType,
-                callId: "call-planner-model",
-                launches: [{ role: flashLaunch.role, prompt: flashLaunch.prompt }],
-                children: [{ id: CHILD, logUri }],
-              }),
-            ],
-          ],
-        });
-
-        const state = yield* readAntigravitySessionSubagentState({
-          profileDirectory: profile,
-          rootSessionId: ROOT,
-          includeReports: false,
-        });
-        expect(state?.batches).toEqual([
-          {
-            stepUpdateIndex: 1,
-            toolCallId: "call-proto",
-            launches: [
-              { role: "Lite", prompt: "A", model: "flash_lite" },
-              { role: "Inherited", prompt: "B", model: "inherit" },
-            ],
-            children: [
-              { conversationId: CHILD, role: "Lite" },
-              { conversationId: "b468c0e1d2f34a5b6c7d8e9f0a1b2c3d", role: "Inherited" },
-            ],
-          },
-          {
-            stepUpdateIndex: 2,
-            toolCallId: "call-planner-model",
-            launches: [flashLaunch],
-            children: [{ conversationId: CHILD, role: flashLaunch.role }],
-          },
-        ]);
-
-        const tracker = makeAntigravitySubagentTracker(profile);
-        const hydrated = yield* tracker.rewriteAndDrain({
-          sessionId: ROOT,
-          update: {
-            sessionUpdate: "tool_call",
-            toolCallId: `${ROOT}:2`,
-            title: "Running invoke_subagent",
-            kind: "other",
-            status: "in_progress",
-          },
-        });
-        const hydratedUpdate = hydrated[0]?.update;
-        expect(
-          hydratedUpdate?.sessionUpdate === "tool_call"
-            ? antigravitySubagentLaunches(hydratedUpdate.rawInput)
-            : undefined,
-        ).toEqual([flashLaunch]);
+    expect(
+      antigravitySubagentLaunches({
+        Subagents: [
+          { Role: "Deep Reviewer", Prompt: "Review diff", Model: "pro" },
+          { Role: LAUNCH.role, Prompt: LAUNCH.prompt },
+        ],
       }),
-  );
+    ).toEqual([{ role: "Deep Reviewer", prompt: "Review diff", model: "pro" }, LAUNCH]);
+  });
 
   it.effect(
     "detects unread high-priority inbox wakes and trailing waking SYSTEM_MESSAGE steps",
@@ -1331,6 +981,365 @@ it.layer(NodeServices.layer)("readAntigravityChildWork", (it) => {
         yield* fs.remove(transcriptPath);
         yield* fs.symlink(external, transcriptPath);
         expect(yield* pending()).toBe(false);
+      }),
+  );
+
+  // A backtracking parser takes tens of seconds here and trips the test timeout.
+  it("parses an unterminated inter-agent message with a long whitespace run in linear time", () => {
+    const line = JSON.stringify({
+      step_index: 1,
+      type: "SYSTEM_MESSAGE",
+      content: `<SYSTEM_MESSAGE>\n[Message] sender=root content=hi${" ".repeat(200_000)}x`,
+    });
+    const entries = transcriptToSubagentEntries(line, { prompt: "launch" });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.kind === "user_message" && entries[0].text.startsWith("hi")).toBe(true);
+  });
+
+  it("maps Antigravity child transcript steps into standard thinking, tool, user, assistant, and error entries", () => {
+    const transcript = [
+      // Step 0 launch envelope is skipped (already projected as the child thread prompt).
+      {
+        step_index: 0,
+        source: "SYSTEM",
+        type: "SYSTEM_MESSAGE",
+        status: "DONE",
+        created_at: "2026-11-26T01:33:44Z",
+        content:
+          "The following is a <SYSTEM_MESSAGE>...\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T01:33:44Z sender=root priority=MESSAGE_PRIORITY_HIGH content=Read README.md and fix the typo\n</SYSTEM_MESSAGE>",
+      },
+      {
+        step_index: 1,
+        source: "MODEL",
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        created_at: "2026-11-26T01:33:45Z",
+        thinking: "Inspect README.md first and check lines.",
+        tool_calls: [
+          { name: "read_file", args: { Path: '"/project/README.md"' } },
+          {
+            name: "edit_file",
+            args: {
+              Path: '"/project/README.md"',
+              Target: '"teh"',
+              Replacement: '"the"',
+            },
+          },
+          {
+            name: "run_command",
+            args: {
+              CommandLine: '"npm test"',
+              Cwd: '"/project"',
+              toolSummary: '"Run tests"',
+            },
+          },
+          {
+            name: "grep_search",
+            args: { Query: '"marker"', SearchPath: '"/project/src"' },
+          },
+          {
+            name: "search_web",
+            args: { query: '"antigravity acp"' },
+          },
+          {
+            name: "read_url_content",
+            args: { Url: '"https://example.com/docs"' },
+          },
+        ],
+      },
+      {
+        step_index: 2,
+        source: "MODEL",
+        type: "GENERIC",
+        status: "DONE",
+        created_at: "2026-11-26T01:33:46Z",
+        content:
+          "Created At: 2026-11-26T02:33:46+01:00\nCompleted At: 2026-11-26T02:33:47+01:00\n1: teh readme",
+      },
+      {
+        step_index: 3,
+        source: "MODEL",
+        type: "GENERIC",
+        status: "DONE",
+        created_at: "2026-11-26T01:33:47Z",
+        content: "Edited README.md",
+      },
+      {
+        step_index: 4,
+        source: "MODEL",
+        type: "GENERIC",
+        status: "ERROR",
+        created_at: "2026-11-26T01:33:48Z",
+        error: "Command exited with code 1",
+        content:
+          "Created At: 2026-11-26T02:33:48+01:00\nEncountered error in step execution: Command exited with code 1",
+      },
+      {
+        step_index: 5,
+        source: "MODEL",
+        type: "GENERIC",
+        status: "DONE",
+        created_at: "2026-11-26T01:33:49Z",
+        content: "src/index.ts:10:marker",
+      },
+      {
+        step_index: 6,
+        source: "MODEL",
+        type: "GENERIC",
+        status: "DONE",
+        created_at: "2026-11-26T01:33:50Z",
+        content: "See https://example.com/acp",
+      },
+      // Step 7 intentionally omitted for read_url_content to verify live in_progress vs finalized interrupted.
+      // Internal harness reminders are skipped; inter-agent [Message] updates become user_message.
+      {
+        step_index: 8,
+        source: "SYSTEM",
+        type: "SYSTEM_MESSAGE",
+        status: "DONE",
+        content:
+          "The following is a <SYSTEM_MESSAGE>...\n\n<SYSTEM_MESSAGE>\nReminder: work efficiently.\n</SYSTEM_MESSAGE>",
+      },
+      {
+        step_index: 9,
+        source: "SYSTEM",
+        type: "SYSTEM_MESSAGE",
+        status: "DONE",
+        created_at: "2026-11-26T01:33:52Z",
+        content:
+          "The following is a <SYSTEM_MESSAGE>...\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-26T01:33:52Z sender=root priority=MESSAGE_PRIORITY_HIGH content=Also check CHANGELOG.md\n</SYSTEM_MESSAGE>",
+      },
+      { step_index: 10, source: "SYSTEM", type: "CHECKPOINT", status: "DONE" },
+      {
+        step_index: 11,
+        source: "MODEL",
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        created_at: "2026-11-26T01:33:55Z",
+        content: "Fixed the typo in README.md and checked CHANGELOG.md.",
+      },
+      {
+        step_index: 12,
+        source: "SYSTEM",
+        type: "ERROR_MESSAGE",
+        status: "ERROR",
+        error: "Transient warning",
+      },
+    ]
+      .map((line) => JSON.stringify(line))
+      .join("\n");
+
+    const live = transcriptToSubagentEntries(transcript, {
+      prompt: "Read README.md and fix the typo",
+      finalize: false,
+    });
+    expect(live.map((entry) => entry.kind)).toEqual([
+      "reasoning",
+      "tool",
+      "tool",
+      "tool",
+      "tool",
+      "tool",
+      "tool",
+      "user_message",
+      "assistant_message",
+      "error",
+    ]);
+
+    const reasoning = live[0];
+    expect(reasoning?.kind === "reasoning" && reasoning.text).toBe(
+      "Inspect README.md first and check lines.",
+    );
+    const readTool = live[1];
+    expect(readTool?.kind === "tool" && readTool.toolCall).toMatchObject({
+      kind: "read",
+      status: "completed",
+      data: {
+        locations: [{ path: "/project/README.md" }],
+        rawOutput: "1: teh readme",
+      },
+    });
+    const editTool = live[2];
+    expect(editTool?.kind === "tool" && editTool.toolCall).toMatchObject({
+      kind: "edit",
+      status: "completed",
+      data: {
+        locations: [{ path: "/project/README.md" }],
+        content: [{ type: "diff", path: "/project/README.md", oldText: "teh", newText: "the" }],
+      },
+    });
+    const execTool = live[3];
+    expect(execTool?.kind === "tool" && execTool.toolCall).toMatchObject({
+      kind: "execute",
+      status: "failed",
+      command: "npm test",
+      title: "Run tests",
+      data: { rawOutput: "Command exited with code 1" },
+    });
+    const grepTool = live[4];
+    expect(grepTool?.kind === "tool" && grepTool.toolCall).toMatchObject({
+      kind: "search",
+      status: "completed",
+      data: {
+        rawInput: { query: "marker", pattern: "marker", path: "/project/src" },
+        locations: [{ path: "/project/src" }],
+      },
+    });
+    const webSearchTool = live[5];
+    expect(webSearchTool?.kind === "tool" && webSearchTool.toolCall).toMatchObject({
+      kind: "search",
+      title: "Web search",
+      status: "completed",
+    });
+    const pendingFetchLive = live[6];
+    expect(pendingFetchLive?.kind === "tool" && pendingFetchLive.toolCall.status).toBe(
+      "inProgress",
+    );
+    const followUpUser = live[7];
+    expect(followUpUser?.kind === "user_message" && followUpUser.text).toBe(
+      "Also check CHANGELOG.md",
+    );
+    const assistant = live[8];
+    expect(assistant?.kind === "assistant_message" && assistant.text).toBe(
+      "Fixed the typo in README.md and checked CHANGELOG.md.",
+    );
+
+    const finalized = transcriptToSubagentEntries(transcript, {
+      prompt: "Read README.md and fix the typo",
+      finalize: true,
+    });
+    const pendingFetchFinal = finalized[6];
+    expect(pendingFetchFinal?.kind === "tool" && pendingFetchFinal.projectedStatus).toBe(
+      "interrupted",
+    );
+
+    const checkpointMidToolTranscript = [
+      {
+        step_index: 1,
+        source: "MODEL",
+        type: "PLANNER_RESPONSE",
+        status: "DONE",
+        tool_calls: [{ name: "read_file", args: { Path: JSON.stringify("/project/a.ts") } }],
+      },
+      { step_index: 2, source: "SYSTEM", type: "CHECKPOINT", status: "DONE" },
+      {
+        step_index: 3,
+        source: "MODEL",
+        type: "GENERIC",
+        status: "DONE",
+        content: "export const a = 1;",
+      },
+    ]
+      .map((line) => JSON.stringify(line))
+      .join("\n");
+    const checkpointEntries = transcriptToSubagentEntries(checkpointMidToolTranscript, {
+      prompt: "Read a.ts",
+    });
+    expect(checkpointEntries).toHaveLength(1);
+    expect(checkpointEntries[0]?.kind === "tool" && checkpointEntries[0].toolCall).toMatchObject({
+      kind: "read",
+      status: "completed",
+      data: { rawOutput: "export const a = 1;" },
+    });
+  });
+
+  it.effect(
+    "reads detached agy 1.5 and direct childSessionId transcripts via readAntigravitySubagentTranscript",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const profile = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agy-transcript-" });
+        const write = (segments: ReadonlyArray<string>, body: string) => {
+          const file = path.join(profile, "antigravity-acp", "brain", ...segments);
+          return fs
+            .makeDirectory(path.dirname(file), { recursive: true })
+            .pipe(Effect.andThen(fs.writeFileString(file, body)));
+        };
+
+        yield* write(
+          [ROOT, ".system_generated", "subagents", `${CHILD}.json`],
+          JSON.stringify({ conversationId: CHILD, subagentDescriptor: { role: "Researcher" } }),
+        );
+        yield* write(
+          [CHILD, ".system_generated", "messages", "launch.json"],
+          JSON.stringify({
+            sender: ROOT,
+            content: "Check package.json",
+            sourceMetadata: {
+              tool: {
+                toolCall: {
+                  id: "call_sub_1",
+                  name: "invoke_subagent",
+                  argumentsJson: JSON.stringify({
+                    Role: "Researcher",
+                    Prompt: "Check package.json",
+                  }),
+                },
+              },
+            },
+          }),
+        );
+        yield* write(
+          [CHILD, ".system_generated", "logs", "transcript.jsonl"],
+          [
+            {
+              step_index: 0,
+              type: "SYSTEM_MESSAGE",
+              status: "DONE",
+              content: "Check package.json",
+            },
+            {
+              step_index: 1,
+              type: "PLANNER_RESPONSE",
+              status: "DONE",
+              thinking: "Reading package.json now.",
+              tool_calls: [{ name: "read_file", args: { Path: '"/project/package.json"' } }],
+            },
+            { step_index: 2, type: "GENERIC", status: "DONE", content: '{"name":"demo"}' },
+            {
+              step_index: 3,
+              type: "PLANNER_RESPONSE",
+              status: "DONE",
+              content: "Package name is demo.",
+            },
+          ]
+            .map((line) => JSON.stringify(line))
+            .join("\n") + "\n",
+        );
+
+        const detached = yield* readAntigravitySubagentTranscript({
+          profileDirectory: profile,
+          rootSessionId: ROOT,
+          nativeTaskId: "call_sub_1",
+          launch: { title: "Researcher", prompt: "Check package.json" },
+          siblings: [],
+          finalize: false,
+        });
+        expect(detached.map((entry) => entry.kind)).toEqual([
+          "reasoning",
+          "tool",
+          "assistant_message",
+        ]);
+        // A lone child's ids and key already name it, so a sibling appearing later renames nothing.
+        expect(detached.every((entry) => entry.childKey === CHILD)).toBe(true);
+        expect(detached.every((entry) => entry.itemId.startsWith(`${CHILD}:`))).toBe(true);
+
+        // Direct childSessionId fallback works even when no subagents/ inbox record exists (e.g. swarm worker).
+        const direct = yield* readAntigravitySubagentTranscript({
+          profileDirectory: profile,
+          rootSessionId: ROOT,
+          nativeTaskId: "call_swarm_unknown",
+          childSessionId: CHILD,
+          launch: { title: "@worker", prompt: "Check package.json" },
+          siblings: [],
+          finalize: true,
+        });
+        expect(direct.map((entry) => entry.kind)).toEqual([
+          "reasoning",
+          "tool",
+          "assistant_message",
+        ]);
       }),
   );
 });

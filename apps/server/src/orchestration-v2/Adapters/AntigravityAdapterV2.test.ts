@@ -49,17 +49,7 @@ import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { makeAcpAdapterV2 } from "@t3tools/provider-acp/server/adapter";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
-import { antigravitySubagentChildSessionId } from "../../provider/acp/AntigravityChildWork.ts";
-import {
-  agentReportStep,
-  commandTaskStep,
-  CHILD,
-  invokeStep,
-  LAUNCH,
-  makeProfile,
-  plannerStep,
-  ROOT,
-} from "../../provider/acp/AntigravityChildWork.testkit.ts";
+import { commandTaskStep, makeProfile } from "../../provider/acp/AntigravityChildWork.testkit.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -106,32 +96,13 @@ describe("AntigravityAdapterV2 flavor", () => {
     });
     assert.equal(batch?.status, "running");
     assert.equal(batch?.prompt, "Started two agents.");
-    assert.equal(batch?.childSessionId, "antigravity-task:trajectory:4");
+    assert.isNull(batch?.childSessionId);
     assert.isNull(batch?.result);
     assert.isTrue(flavor.subagentsIdleOnTurnCompletion);
     assert.isTrue(flavor.deferFinalizeForBackgroundWork);
     assert.isTrue(flavor.enablePostSettleContinuation);
 
-    const completedBatch = flavor.extractSubagentUpdate?.({
-      toolCallId: "trajectory:4",
-      title: "Running invoke_subagent",
-      kind: "other",
-      status: "completed",
-      data: {
-        rawInput: {
-          Subagents: [{ TypeName: "research", Role: "Readme Reader", Prompt: "Read README.md" }],
-        },
-        rawOutput: "marker 4242 found",
-        meta: { antigravitySubagentCompleted: true },
-      },
-    });
-    assert.equal(completedBatch?.status, "completed");
-    assert.equal(completedBatch?.title, "Readme Reader");
-    assert.equal(completedBatch?.prompt, "Read README.md");
-    assert.equal(completedBatch?.result, "marker 4242 found");
-    assert.equal(completedBatch?.childSessionId, "antigravity-task:trajectory:4");
-
-    // Permission prompts carry the launch; later updates for the same call do not.
+    // Permission prompts carry the launch. Later updates for the same call do not.
     const launch = flavor.extractSubagentUpdate?.({
       toolCallId: "35bea692fa95447fbdae6333fec5515f",
       title: "Run invoke_subagent?",
@@ -2808,6 +2779,353 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
     }).pipe(Effect.provide(layerSession)),
   );
 
+  it.effect(
+    "projects Antigravity subagent transcript thinking, typed tools, and assistant reply live and keeps them when Idle",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const profile = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-subagent-live-",
+        });
+        const records = (conversationId: string, kind: string) =>
+          path.join(profile, "antigravity-acp", "brain", conversationId, ".system_generated", kind);
+        const writeJson = (directory: string, name: string, value: unknown) =>
+          fileSystem
+            .makeDirectory(directory, { recursive: true })
+            .pipe(
+              Effect.andThen(
+                fileSystem.writeFileString(path.join(directory, name), JSON.stringify(value)),
+              ),
+            );
+        const writeTranscript = (lines: ReadonlyArray<unknown>) => {
+          const directory = records("child-1", "logs");
+          return fileSystem
+            .makeDirectory(directory, { recursive: true })
+            .pipe(
+              Effect.andThen(
+                fileSystem.writeFileString(
+                  path.join(directory, "transcript.jsonl"),
+                  `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`,
+                ),
+              ),
+            );
+        };
+
+        yield* writeJson(records("mock-session-1", "subagents"), "child-1.json", {
+          conversationId: "child-1",
+          subagentDescriptor: { role: "Codebase Researcher" },
+        });
+        yield* writeJson(records("child-1", "messages"), "launch.json", {
+          sender: "mock-session-1",
+          content: "Read README.md",
+          sourceMetadata: {
+            tool: { toolCall: { id: "call_research", name: "invoke_subagent" } },
+          },
+        });
+        // While running, the child has written thinking, a completed read_file, an edit_file, and a running command.
+        yield* writeTranscript([
+          { step_index: 0, type: "SYSTEM_MESSAGE", status: "DONE", content: "Read README.md" },
+          {
+            step_index: 1,
+            type: "PLANNER_RESPONSE",
+            status: "DONE",
+            thinking: "Checking README.md and applying the fix.",
+            tool_calls: [
+              { name: "read_file", args: { Path: '"/project/README.md"' } },
+              {
+                name: "edit_file",
+                args: {
+                  Path: '"/project/README.md"',
+                  Target: '"old"',
+                  Replacement: '"new"',
+                },
+              },
+              {
+                name: "run_command",
+                args: { CommandLine: '"pnpm test"', toolSummary: '"Run tests"' },
+              },
+            ],
+          },
+          {
+            step_index: 2,
+            type: "GENERIC",
+            status: "DONE",
+            content: "Created At: 2026-11-26T02:00:00+01:00\n1: old line",
+          },
+          {
+            step_index: 3,
+            type: "GENERIC",
+            status: "DONE",
+            content: "Updated README.md",
+          },
+        ]);
+
+        const { usage, send, startTurn, until, throughPromptSettled } =
+          yield* openSessionWithRunningCommand({}, profile);
+        yield* startTurn(1, false);
+        const promptEvents = yield* throughPromptSettled;
+
+        const childThread = promptEvents.find((event) => event.type === "app_thread.created");
+        assert.isDefined(childThread);
+        const childThreadId =
+          childThread?.type === "app_thread.created" ? childThread.appThread.id : undefined;
+        assert.isDefined(childThreadId);
+
+        // Give the live transcript follower a poll tick while the subagent is still running.
+        yield* TestClock.adjust("1 second");
+
+        // Now the child completes its command, writes its final assistant reply, and reports back to parent.
+        yield* writeTranscript([
+          { step_index: 0, type: "SYSTEM_MESSAGE", status: "DONE", content: "Read README.md" },
+          {
+            step_index: 1,
+            type: "PLANNER_RESPONSE",
+            status: "DONE",
+            thinking: "Checking README.md and applying the fix.",
+            tool_calls: [
+              { name: "read_file", args: { Path: '"/project/README.md"' } },
+              {
+                name: "edit_file",
+                args: {
+                  Path: '"/project/README.md"',
+                  Target: '"old"',
+                  Replacement: '"new"',
+                },
+              },
+              {
+                name: "run_command",
+                args: { CommandLine: '"pnpm test"', toolSummary: '"Run tests"' },
+              },
+            ],
+          },
+          {
+            step_index: 2,
+            type: "GENERIC",
+            status: "DONE",
+            content: "Created At: 2026-11-26T02:00:00+01:00\n1: old line",
+          },
+          {
+            step_index: 3,
+            type: "GENERIC",
+            status: "DONE",
+            content: "Updated README.md",
+          },
+          {
+            step_index: 4,
+            type: "GENERIC",
+            status: "DONE",
+            content: "All tests passed.",
+          },
+          {
+            step_index: 5,
+            type: "PLANNER_RESPONSE",
+            status: "DONE",
+            content: "Updated README.md and verified all tests pass.",
+          },
+        ]);
+        yield* writeJson(records("mock-session-1", "messages"), "report.json", {
+          sender: "child-1",
+        });
+        yield* send({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "The researcher finished." },
+        });
+        yield* send(usage);
+        yield* TestClock.adjust("3 seconds");
+        const tailEvents = yield* until((event) => event.type === "turn.terminal");
+        const allEvents = [...promptEvents, ...tailEvents];
+
+        const childItemsById = new Map<
+          string,
+          Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "turn_item.updated" }>["turnItem"]
+        >();
+        for (const event of allEvents) {
+          if (event.type === "turn_item.updated" && event.turnItem.threadId === childThreadId) {
+            childItemsById.set(String(event.turnItem.id), event.turnItem);
+          }
+        }
+        const childItems = [...childItemsById.values()].toSorted((a, b) => a.ordinal - b.ordinal);
+        assert.deepEqual(
+          childItems.map((item) => item.type),
+          [
+            "user_message",
+            "reasoning",
+            "dynamic_tool",
+            "file_change",
+            "command_execution",
+            "assistant_message",
+          ],
+        );
+        const reasoning = childItems[1];
+        assert.equal(
+          reasoning?.type === "reasoning" ? reasoning.text : null,
+          "Checking README.md and applying the fix.",
+        );
+        const readItem = childItems[2];
+        assert.equal(readItem?.type === "dynamic_tool" ? readItem.toolName : null, "Read");
+        assert.equal(readItem?.type === "dynamic_tool" ? readItem.output : null, "1: old line");
+        const fileChange = childItems[3];
+        assert.equal(
+          fileChange?.type === "file_change" ? fileChange.fileName : null,
+          "/project/README.md",
+        );
+        assert.include(
+          fileChange?.type === "file_change" ? (fileChange.diffStr ?? "") : "",
+          "-old",
+        );
+        assert.include(
+          fileChange?.type === "file_change" ? (fileChange.diffStr ?? "") : "",
+          "+new",
+        );
+        const command = childItems[4];
+        assert.equal(command?.type === "command_execution" ? command.input : null, "pnpm test");
+        assert.equal(
+          command?.type === "command_execution" ? command.output : null,
+          "All tests passed.",
+        );
+        assert.equal(command?.status, "completed");
+        const assistant = childItems[5];
+        assert.equal(
+          assistant?.type === "assistant_message" ? assistant.text : null,
+          "Updated README.md and verified all tests pass.",
+        );
+
+        const lastSubagent = allEvents.findLast((event) => event.type === "subagent.updated");
+        assert.equal(
+          lastSubagent?.type === "subagent.updated" ? lastSubagent.subagent.status : null,
+          "idle",
+        );
+        assert.equal(
+          lastSubagent?.type === "subagent.updated" ? lastSubagent.subagent.result : null,
+          "Updated README.md and verified all tests pass.",
+        );
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect(
+    "captures a subagent's closing assistant reply written shortly after send_message marks it Idle",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const profile = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-antigravity-subagent-trailing-",
+        });
+        const records = (conversationId: string, kind: string) =>
+          path.join(profile, "antigravity-acp", "brain", conversationId, ".system_generated", kind);
+        const writeJson = (directory: string, name: string, value: unknown) =>
+          fileSystem
+            .makeDirectory(directory, { recursive: true })
+            .pipe(
+              Effect.andThen(
+                fileSystem.writeFileString(path.join(directory, name), JSON.stringify(value)),
+              ),
+            );
+        const writeTranscript = (lines: ReadonlyArray<unknown>) => {
+          const directory = records("child-1", "logs");
+          return fileSystem
+            .makeDirectory(directory, { recursive: true })
+            .pipe(
+              Effect.andThen(
+                fileSystem.writeFileString(
+                  path.join(directory, "transcript.jsonl"),
+                  `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`,
+                ),
+              ),
+            );
+        };
+
+        yield* writeJson(records("mock-session-1", "subagents"), "child-1.json", {
+          conversationId: "child-1",
+          subagentDescriptor: { role: "Rich Format Tester" },
+        });
+        yield* writeJson(records("child-1", "messages"), "launch.json", {
+          sender: "mock-session-1",
+          content: "Format a markdown summary",
+          sourceMetadata: {
+            tool: { toolCall: { id: "call_research", name: "invoke_subagent" } },
+          },
+        });
+        const preReplySteps = [
+          {
+            step_index: 0,
+            type: "SYSTEM_MESSAGE",
+            status: "DONE",
+            content: "Format a markdown summary",
+          },
+          {
+            step_index: 1,
+            type: "PLANNER_RESPONSE",
+            status: "DONE",
+            tool_calls: [{ name: "send_message", args: { Message: '"Done!"' } }],
+          },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "Message sent." },
+        ];
+        yield* writeTranscript(preReplySteps);
+        yield* writeJson(records("mock-session-1", "messages"), "report.json", {
+          sender: "child-1",
+        });
+
+        const { startTurn, until, throughPromptSettled, session, providerThread } =
+          yield* openSessionWithRunningCommand({}, profile);
+        const runKeepsIngesting = session.hasPendingBackgroundWorkForThread!(providerThread);
+        yield* startTurn(1, false);
+        const promptEvents = yield* throughPromptSettled;
+        const childThread = promptEvents.find((event) => event.type === "app_thread.created");
+        const childThreadId =
+          childThread?.type === "app_thread.created" ? childThread.appThread.id : undefined;
+        assert.isDefined(childThreadId);
+
+        // Child became Idle as soon as report.json landed, before its closing PLANNER_RESPONSE flushed.
+        const idleSubagent = promptEvents.findLast((event) => event.type === "subagent.updated");
+        assert.equal(
+          idleSubagent?.type === "subagent.updated" ? idleSubagent.subagent.status : null,
+          "idle",
+        );
+        // The run reads this probe once the root ends; it must already hold the drain at Idle.
+        assert.isTrue(yield* runKeepsIngesting);
+
+        // Closing reply lands in transcript.jsonl after Idle.
+        yield* writeTranscript([
+          ...preReplySteps,
+          {
+            step_index: 3,
+            type: "PLANNER_RESPONSE",
+            status: "DONE",
+            content: "## Summary\n\n| Check | Status |\n| --- | --- |\n| Diff | Passed |",
+          },
+        ]);
+        yield* TestClock.adjust("2 seconds");
+        const trailingEvents = yield* until(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.threadId === childThreadId &&
+            event.turnItem.type === "assistant_message",
+        );
+        const assistantItem = trailingEvents.findLast(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.threadId === childThreadId &&
+            event.turnItem.type === "assistant_message",
+        );
+        assert.equal(
+          assistantItem?.type === "turn_item.updated" &&
+            assistantItem.turnItem.type === "assistant_message"
+            ? assistantItem.turnItem.text
+            : null,
+          "## Summary\n\n| Check | Status |\n| --- | --- |\n| Diff | Passed |",
+        );
+        // The drain ends with a subagent event, so the run re-checks and stops ingesting.
+        let pending = true;
+        for (let attempt = 0; attempt < 2 && pending; attempt += 1) {
+          yield* until((event) => event.type === "subagent.updated");
+          pending = yield* runKeepsIngesting;
+        }
+        assert.isFalse(pending);
+      }).pipe(Effect.provide(layerSession)),
+  );
+
   it.effect("ends a continuation run whose replayed reply launched a subagent", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2870,134 +3188,6 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
 });
 
 describe("AntigravityAdapterV2 subagent reads", () => {
-  it.live("delivers child reports from database changes after the parent stops streaming", () =>
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const crypto = yield* SecureRandom.SecureRandom;
-      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const mockAgentPath = yield* path.fromFileUrl(
-        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
-      );
-      const { profile } = yield* makeProfile({
-        sessionId: "mock-session-1",
-        steps: (logUri) => [
-          [1, 15, plannerStep(["call-reader"])],
-          [
-            2,
-            132,
-            invokeStep({
-              stepType: 132,
-              callId: "call-reader",
-              launches: [LAUNCH],
-              children: [{ id: CHILD, logUri }],
-            }),
-          ],
-        ],
-      });
-      let send:
-        | Parameters<AcpSessionRuntime.AcpSessionRuntime["Service"]["handleSessionUpdate"]>[0]
-        | undefined;
-      const runtime = yield* makeAntigravityAcpAdapterFlavor({
-        instanceId: ProviderInstanceId.make("antigravity-db-report"),
-        random: crypto,
-        fileSystem,
-        path,
-        host: yield* ProviderHost.ProviderHost,
-        profileDirectory: profile,
-        selfInvocation: yield* resolveSelfInvocation(),
-        withProcess: (_stop, task) => task,
-        defaultModel: Effect.undefined,
-        makeRuntime: (input) =>
-          makeAntigravityAcpRuntime({
-            ...input,
-            childProcessSpawner,
-            spawn: {
-              command: process.execPath,
-              args: [mockAgentPath],
-              cwd: input.cwd,
-              env: { T3_ACP_ANTIGRAVITY: "1" },
-            },
-          }).pipe(
-            Effect.provideService(SecureRandom.SecureRandom, crypto),
-            Effect.map((base) => ({
-              ...base,
-              handleSessionUpdate: (handler) =>
-                Effect.sync(() => {
-                  send = handler;
-                }).pipe(Effect.andThen(base.handleSessionUpdate(handler))),
-            })),
-          ),
-      }).makeRuntime({
-        cwd: profile,
-        runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-          runtimeMode: "full-access",
-          interactionMode: "default",
-          cwd: profile,
-        }),
-        mcpServers: [],
-        clientCapabilities: {},
-        clientInfo: { name: "t3-test", version: "1" },
-        protocolLogging: {},
-        onTermination: () => Effect.void,
-      });
-      const refreshed = yield* Deferred.make<void>();
-      const notifications: Array<EffectAcpSchema.SessionNotification> = [];
-      let reportWritten = false;
-      yield* runtime.handleSessionUpdate((notification) =>
-        Effect.sync(() => {
-          notifications.push(notification);
-          if (reportWritten && notification.update.sessionUpdate === "session_info_update")
-            Deferred.doneUnsafe(refreshed, Exit.void);
-        }),
-      );
-      yield* runtime.start();
-      if (send === undefined) return yield* Effect.die("the adapter must handle updates");
-      yield* send({
-        sessionId: "mock-session-1",
-        update: {
-          sessionUpdate: "tool_call",
-          toolCallId: "call-reader",
-          title: "Running invoke_subagent",
-          kind: "other",
-          status: "in_progress",
-          rawInput: { Role: LAUNCH.role, Prompt: LAUNCH.prompt },
-        },
-      });
-      const database = new NodeSqlite.DatabaseSync(
-        path.join(profile, "antigravity-acp", "conversations", "mock-session-1.db"),
-      );
-      reportWritten = true;
-      database.prepare("INSERT INTO steps (idx,step_type,step_payload) VALUES (3,101,?)").run(
-        agentReportStep({
-          recipientSessionId: "mock-session-1",
-          senderConversationId: CHILD,
-          text: "reader finished",
-        }),
-      );
-      database.close();
-      yield* Deferred.await(refreshed);
-      assert.includeDeepMembers(
-        notifications.map((notification) => notification.update),
-        [
-          {
-            sessionUpdate: "agent_message",
-            messageId: `antigravity-subagent-report:${CHILD}:3`,
-            content: [{ type: "text", text: "reader finished" }],
-          },
-        ],
-      );
-      assert.isTrue(
-        notifications.some(
-          ({ update }) =>
-            update.sessionUpdate === "tool_call_update" &&
-            update.toolCallId === "call-reader" &&
-            update.status === "completed",
-        ),
-      );
-    }).pipe(Effect.provide(layerSession), Effect.scoped),
-  );
-
   it.effect("completes a read T3 served when the agent later fails it with a step error", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -3354,346 +3544,17 @@ describe("AntigravityAdapterV2 subagent reads", () => {
     });
 
   it.effect(
-    "hydrates auto-approved subagent launches, routes child tool calls to the child thread, and completes on child report",
+    "preserves swarm child conversation_id and resolves invoke_subagent inherited and tier models",
     () =>
       Effect.gen(function* () {
         const { profile } = yield* makeProfile({
           sessionId: "mock-session-1",
-          steps: (logUri) => [
-            [1, 15, plannerStep([])],
-            [4, 15, plannerStep(["call-30"])],
-            [
-              5,
-              132,
-              invokeStep({
-                stepType: 132,
-                callId: "call-30",
-                launches: [LAUNCH],
-                children: [{ id: CHILD, logUri }],
-              }),
-            ],
-            [
-              6,
-              101,
-              agentReportStep({
-                recipientSessionId: "mock-session-1",
-                senderConversationId: CHILD,
-                text: "marker 4242 found in README.md",
-              }),
-            ],
-          ],
+          steps: () => [],
         });
-
-        const { events, threadId } = yield* runSubagentTurn({
-          slug: "timeline",
-          profile,
-          runPrompt: (update) =>
-            Effect.gen(function* () {
-              // StepUpdate.step_index for idx=5 with 2 silent planner steps (at 1, 4) is 3.
-              yield* update({
-                sessionUpdate: "tool_call",
-                toolCallId: "mock-session-1:3",
-                title: "Running invoke_subagent",
-                kind: "other",
-                status: "in_progress",
-                rawInput: {},
-              });
-              yield* update({
-                sessionUpdate: "tool_call",
-                toolCallId: `${CHILD}:1`,
-                title: "Running view_file",
-                kind: "read",
-                status: "in_progress",
-                rawInput: { AbsolutePath: "/project/README.md" },
-              });
-              yield* update({
-                sessionUpdate: "tool_call_update",
-                toolCallId: `${CHILD}:1`,
-                status: "completed",
-                rawOutput: "2: child read marker 4242",
-              });
-              yield* update({
-                sessionUpdate: "tool_call",
-                toolCallId: `${CHILD}:2`,
-                title: "Running command",
-                kind: "execute",
-                status: "in_progress",
-                rawInput: { command_line: "orc status" },
-              });
-              yield* update({
-                sessionUpdate: "tool_call_update",
-                toolCallId: `${CHILD}:2`,
-                title: "Ran command",
-                status: "completed",
-                rawOutput: { combinedOutput: "all green", exitCode: 0 },
-              });
-              yield* update({
-                sessionUpdate: "tool_call",
-                toolCallId: `${CHILD}:3`,
-                title: "Run mcp_t3-code_tool_call",
-                kind: "other",
-                status: "completed",
-                rawInput: { name: "t3_thread_read", arguments: { threadId: "target" } },
-              });
-              yield* update({
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: "Subagent finished." },
-              });
-            }),
-        });
-
-        const subagentUpdates = events.flatMap((event) =>
-          event.type === "subagent.updated" ? [event.subagent] : [],
-        );
-        assert.include(
-          subagentUpdates.map((entry) => entry.progress),
-          "Read file",
-        );
-        assert.include(
-          subagentUpdates.map((entry) => entry.progress),
-          "Ran command: orc status",
-        );
-        const lastSubagent = subagentUpdates.at(-1);
-        assert.isDefined(lastSubagent);
-        assert.equal(lastSubagent?.title, LAUNCH.role);
-        assert.equal(lastSubagent?.prompt, LAUNCH.prompt);
-        assert.equal(lastSubagent?.status, "completed");
-        assert.isUndefined(lastSubagent?.progress);
-        assert.equal(lastSubagent?.result, "marker 4242 found in README.md");
-
-        const childThreadId = lastSubagent?.childThreadId;
-        assert.isNotNull(childThreadId);
-        const childAppThreads = events.flatMap((event) =>
-          event.type === "app_thread.created" && event.appThread.id === childThreadId
-            ? [event.appThread]
-            : [],
-        );
-        assert.isNotEmpty(childAppThreads);
-        assert.equal(childAppThreads.at(-1)?.title, LAUNCH.role);
-
-        const childUserPrompts = events.flatMap((event) =>
-          event.type === "message.updated" &&
-          event.message.threadId === childThreadId &&
-          event.message.role === "user"
-            ? [event.message.text]
-            : [],
-        );
-        assert.equal(childUserPrompts.at(-1), LAUNCH.prompt);
-
-        const childToolItems = events.flatMap((event) =>
-          event.type === "turn_item.updated" &&
-          event.turnItem.threadId === childThreadId &&
-          event.turnItem.nativeItemRef?.nativeId === `mock-session-1:3:tool:${CHILD}:1`
-            ? [event.turnItem]
-            : [],
-        );
-        assert.isNotEmpty(childToolItems);
-        assert.equal(childToolItems.at(-1)?.status, "completed");
-
-        const childCommandItems = events.flatMap((event) =>
-          event.type === "turn_item.updated" &&
-          event.turnItem.threadId === childThreadId &&
-          event.turnItem.nativeItemRef?.nativeId === `mock-session-1:3:tool:${CHILD}:2`
-            ? [event.turnItem]
-            : [],
-        );
-        assert.isNotEmpty(childCommandItems);
-        const childCommand = childCommandItems.at(-1);
-        assert.equal(
-          childCommand?.type === "command_execution" ? childCommand.input : undefined,
-          "orc status",
-        );
-
-        assert.includeDeepMembers(
-          events.flatMap((event) =>
-            event.type === "turn_item.updated" &&
-            event.turnItem.threadId === childThreadId &&
-            event.turnItem.type === "dynamic_tool" &&
-            event.turnItem.toolName === "t3-code.t3_thread_read"
-              ? [event.turnItem.input]
-              : [],
-          ),
-          [{ threadId: "target" }],
-        );
-
-        const parentLeakedChildTools = events.flatMap((event) =>
-          event.type === "turn_item.updated" &&
-          event.turnItem.threadId === threadId &&
-          event.turnItem.nativeItemRef?.nativeId?.includes(CHILD) === true
-            ? [event.turnItem]
-            : [],
-        );
-        assert.deepEqual(parentLeakedChildTools, []);
-
-        const childAssistantMessages = events.flatMap((event) =>
-          event.type === "message.updated" &&
-          event.message.threadId === childThreadId &&
-          event.message.role === "assistant"
-            ? [event.message.text]
-            : [],
-        );
-        assert.deepEqual(childAssistantMessages, ["marker 4242 found in README.md"]);
-      }).pipe(Effect.provide(layerSession), Effect.scoped),
-  );
-
-  it.effect(
-    "refreshes child thread title and prompt when DB launch specs arrive after the initial tool_call",
-    () =>
-      Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const { profile } = yield* makeProfile({
-          steps: (logUri) => [
-            [1, 15, plannerStep(["call-1"])],
-            [
-              2,
-              132,
-              invokeStep({
-                stepType: 132,
-                callId: "call-1",
-                launches: [LAUNCH],
-                children: [{ id: CHILD, logUri }],
-              }),
-            ],
-            [
-              3,
-              101,
-              agentReportStep({
-                recipientSessionId: "mock-session-1",
-                senderConversationId: CHILD,
-                text: "late report",
-              }),
-            ],
-          ],
-        });
-        const conversationsDir = path.join(profile, "antigravity-acp", "conversations");
-
-        const { events } = yield* runSubagentTurn({
-          slug: "late",
-          profile,
-          runPrompt: (update) =>
-            Effect.gen(function* () {
-              // Initial tool_call arrives before mock-session-1.db exists on disk.
-              yield* update({
-                sessionUpdate: "tool_call",
-                toolCallId: "mock-session-1:1",
-                title: "Running invoke_subagent",
-                kind: "other",
-                status: "in_progress",
-                rawInput: {},
-              });
-              // Now the session DB is flushed to disk while the child runs.
-              yield* fileSystem
-                .copyFile(
-                  path.join(conversationsDir, `${ROOT}.db`),
-                  path.join(conversationsDir, "mock-session-1.db"),
-                )
-                .pipe(Effect.orDie);
-              yield* update({
-                sessionUpdate: "tool_call",
-                toolCallId: `${CHILD}:1`,
-                title: "Running view_file",
-                kind: "read",
-                status: "in_progress",
-                rawInput: { AbsolutePath: "/project/README.md" },
-              });
-              yield* update({
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: "Done." },
-              });
-            }),
-        });
-
-        const subagentUpdates = events.flatMap((event) =>
-          event.type === "subagent.updated" ? [event.subagent] : [],
-        );
-        const lastSubagent = subagentUpdates.at(-1);
-        assert.equal(lastSubagent?.title, LAUNCH.role);
-        assert.equal(lastSubagent?.prompt, LAUNCH.prompt);
-        assert.equal(lastSubagent?.status, "completed");
-
-        const childThreadId = lastSubagent?.childThreadId;
-        const childAppThreadTitles = events.flatMap((event) =>
-          event.type === "app_thread.created" && event.appThread.id === childThreadId
-            ? [event.appThread.title]
-            : [],
-        );
-        assert.include(childAppThreadTitles, LAUNCH.role);
-        assert.equal(childAppThreadTitles.at(-1), LAUNCH.role);
-
-        const childUserPrompts = events.flatMap((event) =>
-          event.type === "message.updated" &&
-          event.message.threadId === childThreadId &&
-          event.message.role === "user"
-            ? [event.message.text]
-            : [],
-        );
-        assert.equal(childUserPrompts.at(-1), LAUNCH.prompt);
-      }).pipe(Effect.provide(layerSession), Effect.scoped),
-  );
-
-  it.effect(
-    "populates inherited model + thinking_level and tier overrides on DB-hydrated subagents",
-    () =>
-      Effect.gen(function* () {
-        const inheritedLaunch = {
-          role: "Inherited Researcher",
-          prompt: "Inspect auth flow",
-          model: "inherit",
-        };
-        const flashLaunch = {
-          role: "Flash Scanner",
-          prompt: "Scan imports",
-          model: "flash",
-        };
-        const { profile } = yield* makeProfile({
-          sessionId: "mock-session-1",
-          steps: (logUri) => [
-            [1, 15, plannerStep(["call-inherit"])],
-            [
-              2,
-              132,
-              invokeStep({
-                stepType: 132,
-                callId: "call-inherit",
-                launches: [inheritedLaunch],
-                children: [{ id: CHILD, logUri }],
-              }),
-            ],
-            [3, 15, plannerStep(["call-flash"])],
-            [
-              4,
-              132,
-              invokeStep({
-                stepType: 132,
-                callId: "call-flash",
-                launches: [flashLaunch],
-                children: [{ id: "b468c0e1d2f34a5b6c7d8e9f0a1b2c3d", logUri }],
-              }),
-            ],
-            [
-              5,
-              101,
-              agentReportStep({
-                recipientSessionId: "mock-session-1",
-                senderConversationId: CHILD,
-                text: "inherited done",
-              }),
-            ],
-            [
-              6,
-              101,
-              agentReportStep({
-                recipientSessionId: "mock-session-1",
-                senderConversationId: "b468c0e1d2f34a5b6c7d8e9f0a1b2c3d",
-                text: "flash done",
-              }),
-            ],
-          ],
-        });
+        const swarmConversationId = "11111111-1111-4000-8000-111111111111";
 
         const { events, instanceId } = yield* runSubagentTurn({
-          slug: "model-metadata",
+          slug: "swarm-and-invoke",
           profile,
           defaultModel: "gemini-test-high",
           modelSelection: (id) => ({
@@ -3711,97 +3572,6 @@ describe("AntigravityAdapterV2 subagent reads", () => {
               options: [{ value: "high", name: "High" }],
             },
           ],
-          runPrompt: (update) =>
-            Effect.gen(function* () {
-              yield* update({
-                sessionUpdate: "tool_call",
-                toolCallId: "mock-session-1:1",
-                title: "Running invoke_subagent",
-                kind: "other",
-                status: "in_progress",
-                rawInput: {},
-              });
-              yield* update({
-                sessionUpdate: "tool_call",
-                toolCallId: "mock-session-1:3",
-                title: "Running invoke_subagent",
-                kind: "other",
-                status: "in_progress",
-                rawInput: {},
-              });
-              yield* update({
-                sessionUpdate: "tool_call_update",
-                toolCallId: "mock-session-1:1",
-                status: "completed",
-                rawOutput: {},
-              });
-              yield* update({
-                sessionUpdate: "tool_call_update",
-                toolCallId: "mock-session-1:3",
-                status: "completed",
-                rawOutput: {},
-              });
-              yield* update({
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: "Done." },
-              });
-            }),
-        });
-
-        const subagentUpdates = events.flatMap((event) =>
-          event.type === "subagent.updated" ? [event.subagent] : [],
-        );
-        const inheritedSubagent = subagentUpdates.findLast(
-          (entry) => entry.nativeTaskRef?.nativeId === "mock-session-1:1",
-        );
-        const flashSubagent = subagentUpdates.findLast(
-          (entry) => entry.nativeTaskRef?.nativeId === "mock-session-1:3",
-        );
-
-        assert.equal(inheritedSubagent?.model, "gemini-test-high");
-        assert.deepEqual(inheritedSubagent?.modelSelection, {
-          instanceId,
-          model: "gemini-test-high",
-          options: [{ id: "thinking_level", value: "high" }],
-        });
-
-        assert.equal(flashSubagent?.model, "Flash");
-        assert.deepEqual(flashSubagent?.modelSelection, {
-          instanceId,
-          model: "Flash",
-        });
-
-        const inheritedChildThread = events.findLast(
-          (event) =>
-            event.type === "app_thread.created" &&
-            event.appThread.id === inheritedSubagent?.childThreadId,
-        );
-        assert.deepEqual(
-          inheritedChildThread?.type === "app_thread.created"
-            ? inheritedChildThread.appThread.modelSelection
-            : undefined,
-          {
-            instanceId,
-            model: "gemini-test-high",
-            options: [{ id: "thinking_level", value: "high" }],
-          },
-        );
-      }).pipe(Effect.provide(layerSession), Effect.scoped),
-  );
-
-  it.effect(
-    "preserves swarm child conversation_id and explicit model while keeping antigravity-task ids for invoke_subagent",
-    () =>
-      Effect.gen(function* () {
-        const { profile } = yield* makeProfile({
-          sessionId: "mock-session-1",
-          steps: () => [],
-        });
-        const swarmConversationId = "11111111-1111-4000-8000-111111111111";
-
-        const { events, instanceId } = yield* runSubagentTurn({
-          slug: "swarm-and-invoke",
-          profile,
           runPrompt: (update) =>
             Effect.gen(function* () {
               yield* update({
@@ -3830,11 +3600,27 @@ describe("AntigravityAdapterV2 subagent reads", () => {
               });
               yield* update({
                 sessionUpdate: "tool_call",
-                toolCallId: "invoke-1",
+                toolCallId: "invoke-inherit",
                 title: "Running invoke_subagent",
                 kind: "other",
                 status: "in_progress",
-                rawInput: { Role: "Reviewer", Prompt: "Check diff" },
+                rawInput: {
+                  Role: "Inherited Researcher",
+                  Prompt: "Inspect auth flow",
+                  Model: "inherit",
+                },
+              });
+              yield* update({
+                sessionUpdate: "tool_call",
+                toolCallId: "invoke-flash",
+                title: "Running invoke_subagent",
+                kind: "other",
+                status: "in_progress",
+                rawInput: {
+                  Role: "Flash Scanner",
+                  Prompt: "Scan imports",
+                  Model: "flash",
+                },
               });
               yield* update({
                 sessionUpdate: "agent_message_chunk",
@@ -3852,17 +3638,17 @@ describe("AntigravityAdapterV2 subagent reads", () => {
         const swarmCompleted = subagentUpdates.findLast(
           (entry) => entry.nativeTaskRef?.nativeId === "swarm-add-1",
         );
-        const invokeSubagent = subagentUpdates.findLast(
-          (entry) => entry.nativeTaskRef?.nativeId === "invoke-1",
+        const inheritedSubagent = subagentUpdates.findLast(
+          (entry) => entry.nativeTaskRef?.nativeId === "invoke-inherit",
+        );
+        const flashSubagent = subagentUpdates.findLast(
+          (entry) => entry.nativeTaskRef?.nativeId === "invoke-flash",
         );
         const providerThreads = events.flatMap((event) =>
           event.type === "provider_thread.updated" ? [event.providerThread] : [],
         );
         const swarmProviderThread = providerThreads.find(
           (thread) => thread.id === swarmCompleted?.providerThreadId,
-        );
-        const invokeProviderThread = providerThreads.find(
-          (thread) => thread.id === invokeSubagent?.providerThreadId,
         );
 
         assert.equal(swarmInitial?.providerThreadId, null);
@@ -3873,10 +3659,21 @@ describe("AntigravityAdapterV2 subagent reads", () => {
           model: "gemini-flash",
         });
         assert.equal(swarmProviderThread?.nativeThreadRef?.nativeId, swarmConversationId);
-        assert.equal(
-          invokeProviderThread?.nativeThreadRef?.nativeId,
-          antigravitySubagentChildSessionId("invoke-1"),
-        );
+
+        assert.equal(inheritedSubagent?.providerThreadId, null);
+        assert.equal(inheritedSubagent?.model, "gemini-test-high");
+        assert.deepEqual(inheritedSubagent?.modelSelection, {
+          instanceId,
+          model: "gemini-test-high",
+          options: [{ id: "thinking_level", value: "high" }],
+        });
+
+        assert.equal(flashSubagent?.providerThreadId, null);
+        assert.equal(flashSubagent?.model, "Flash");
+        assert.deepEqual(flashSubagent?.modelSelection, {
+          instanceId,
+          model: "Flash",
+        });
       }).pipe(Effect.provide(layerSession), Effect.scoped),
   );
 });

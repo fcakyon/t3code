@@ -9,7 +9,9 @@ import type {
   OrchestrationV2NativeChildStep,
   OrchestrationV2NativeChildWork,
 } from "@t3tools/contracts";
-import * as Clock from "effect/Clock";
+import type { AcpSubagentTranscriptEntry } from "@t3tools/provider-acp/server/adapter";
+import type { AcpToolCallState } from "@t3tools/provider-acp/server/runtimeModel";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as FileSystem from "effect/FileSystem";
@@ -22,49 +24,26 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityProfilePaths.ts";
 import {
   boundAntigravityToolText,
-  isAntigravitySubagentToolUpdate,
   isCutAntigravityToolText,
-  normalizeAntigravitySessionUpdate,
+  sanitizeAntigravityToolPayload,
 } from "./AntigravityProtocol.ts";
 
 // Field numbers from the runtime's trajectory protos (exa.cortex_pb).
 const STEP_METADATA = 5;
 const METADATA_TOOL_CALL = 4;
 const STEP_PLANNER_RESPONSE = 20;
-const PLANNER_TEXT = 1;
-const PLANNER_THINKING = 3;
 const PLANNER_TOOL_CALLS = 7;
-const STEP_SYSTEM_MESSAGE = 114;
-const SYSTEM_MESSAGE_KIND = 3;
-const SYSTEM_MESSAGE_AGENT_REPORT = 4;
-const AGENT_REPORT_RECIPIENT_SESSION_ID = 2;
-const AGENT_REPORT_SENDER_CONVERSATION_ID = 3;
-const AGENT_REPORT_TEXT = 4;
 const STEP_INVOKE_SUBAGENT = 143;
-const STEP_GENERIC_TOOL = 140;
 const STEP_TASK_DETAILS = 148;
 const INVOKE_SPECS = 9;
-const INVOKE_SPEC_MODEL_TIER = 8;
 const INVOKE_RESULTS = 10;
-const PLANNER_RESPONSE_STEP_TYPE = 15;
-const SYSTEM_MESSAGE_STEP_TYPE = 101;
 const INVOKE_SUBAGENT_STEP_TYPE = 127;
 const RUN_COMMAND_STEP_TYPE = 21;
 const GENERIC_STEP_TYPE = 132;
-// Protobuf field 2 holds the tool name, preceded by its byte length.
-const INVOKE_SUBAGENT_TOOL_FIELD = Buffer.from("\x12\x0finvoke_subagent");
 const RUNNING_STEP_STATUS = 2;
 const encodeCommandTasks = Schema.encodeSync(
   Schema.fromJsonString(Schema.Array(OrchestrationV2PendingBackgroundTask)),
 );
-
-// exa.cortex_pb.ModelTier
-export const MODEL_TIER_NAMES: Readonly<Record<number, string>> = {
-  1: "inherit",
-  2: "flash_lite",
-  3: "flash",
-  4: "pro",
-};
 
 // One open reads at most this much; past any bound the batch view stays as it was.
 const MAX_STEP_BYTES = 1024 * 1024;
@@ -81,31 +60,10 @@ const MAX_DETACHED_CHILDREN = 64;
 /** T3's title for a batch whose launch text it never saw. */
 export const ANTIGRAVITY_SUBAGENT_BATCH_TITLE = "Antigravity subagent batch";
 
-export const antigravitySubagentChildSessionId = (nativeTaskId: string) =>
-  `antigravity-task:${nativeTaskId}`;
-
 export interface AntigravityChildLaunch {
   readonly role: string;
   readonly prompt: string;
   readonly model?: string;
-}
-
-export interface AntigravitySubagentBatchState {
-  readonly stepUpdateIndex: number;
-  readonly toolCallId: string | undefined;
-  readonly launches: ReadonlyArray<AntigravityChildLaunch>;
-  readonly children: ReadonlyArray<{ readonly conversationId: string; readonly role: string }>;
-}
-
-export interface AntigravitySubagentReportState {
-  readonly stepIndex: number;
-  readonly conversationId: string;
-  readonly text: string;
-}
-
-export interface AntigravitySessionSubagentState {
-  readonly batches: ReadonlyArray<AntigravitySubagentBatchState>;
-  readonly reports: ReadonlyArray<AntigravitySubagentReportState>;
 }
 
 const LaunchEntrySchema = Schema.Struct({
@@ -191,14 +149,6 @@ export function antigravitySubagentLaunches(
   return classic ?? swarmAddLaunches(input);
 }
 
-export const toAntigravitySubagentRawInput = (launches: ReadonlyArray<AntigravityChildLaunch>) => ({
-  Subagents: launches.map((launch) => ({
-    Role: launch.role,
-    Prompt: launch.prompt,
-    ...(launch.model ? { Model: launch.model } : {}),
-  })),
-});
-
 /** Batch title and prompt; reads match permission-prompt tool call ids against this exact text. */
 export function describeAntigravitySubagentLaunches(
   launches: ReadonlyArray<AntigravityChildLaunch>,
@@ -212,11 +162,9 @@ export function describeAntigravitySubagentLaunches(
       };
 }
 
-function walkProtoFields(
-  bytes: Uint8Array,
-  onDelimited: (field: number, value: Uint8Array) => void,
-  onVarint?: (field: number, value: number) => void,
-): void {
+/** Length-delimited fields only. Varints and fixed values are skipped. */
+export function protoFields(bytes: Uint8Array): ReadonlyArray<readonly [number, Uint8Array]> {
+  const fields: Array<readonly [number, Uint8Array]> = [];
   let offset = 0;
   const varint = () => {
     let value = 0;
@@ -232,29 +180,19 @@ function walkProtoFields(
     const key = varint();
     const wire = key % 8;
     const field = Math.floor(key / 8);
-    if (wire === 0) {
-      const value = varint();
-      onVarint?.(field, value);
-    } else if (wire === 1) offset += 8;
+    if (wire === 0) varint();
+    else if (wire === 1) offset += 8;
     else if (wire === 5) offset += 4;
     else if (wire === 2) {
       const length = varint();
       if (offset + length > bytes.length) throw new Error("Truncated field");
-      onDelimited(field, bytes.subarray(offset, offset + length));
+      fields.push([field, bytes.subarray(offset, offset + length)]);
       offset += length;
     } else throw new Error("Unsupported wire type");
   }
   if (offset > bytes.length) throw new Error("Truncated field");
-}
-
-/** Length-delimited fields only; varints and fixed values are skipped. */
-export const protoFields = (bytes: Uint8Array): ReadonlyArray<readonly [number, Uint8Array]> => {
-  const fields: Array<readonly [number, Uint8Array]> = [];
-  walkProtoFields(bytes, (field, value) => {
-    fields.push([field, value]);
-  });
   return fields;
-};
+}
 
 // Keep a leading byte order mark: T3 stores launch text with it.
 const textDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -291,175 +229,32 @@ const safely =
 
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 
-const decodeLaunchJson = (value: string | undefined): ReadonlyArray<AntigravityChildLaunch> =>
-  value === undefined
-    ? []
-    : Option.getOrElse(
-        Option.flatMap(decodeJson(value), (parsed) =>
-          Option.fromNullishOr(antigravitySubagentLaunches(parsed)),
-        ),
-        () => [],
-      );
-
-const mergeLaunchModels = (
-  primary: ReadonlyArray<AntigravityChildLaunch>,
-  fallback: ReadonlyArray<AntigravityChildLaunch>,
-): ReadonlyArray<AntigravityChildLaunch> => {
-  if (primary.length === 0) return fallback;
-  if (primary.length !== fallback.length) return primary;
-  let changed = false;
-  const merged = primary.map((launch, index) => {
-    if (launch.model !== undefined) return launch;
-    const fallbackModel = fallback[index]?.model;
-    if (fallbackModel === undefined) return launch;
-    changed = true;
-    return { ...launch, model: fallbackModel };
-  });
-  return changed ? merged : primary;
-};
-
-const decodeInvokeSpec = (spec: Uint8Array): AntigravityChildLaunch => {
-  let role: string | undefined;
-  let prompt: string | undefined;
-  let model: string | undefined;
-  walkProtoFields(
-    spec,
-    (field, value) => {
-      if (field === 2 && role === undefined) role = textDecoder.decode(value);
-      else if (field === 3 && prompt === undefined) prompt = textDecoder.decode(value);
-      else if (field === 12 && model === undefined) model = textDecoder.decode(value);
-    },
-    (field, value) => {
-      if (field === INVOKE_SPEC_MODEL_TIER && model === undefined) {
-        model = MODEL_TIER_NAMES[value];
-      }
-    },
-  );
-  return {
-    role: role ?? "",
-    prompt: prompt ?? "",
-    ...(model !== undefined ? { model } : {}),
-  };
-};
-
 const decodeInvokeRecord = safely((payload): InvokeRecord | undefined => {
-  const metadataCall = message(message(payload, STEP_METADATA), METADATA_TOOL_CALL);
-  if (text(metadataCall, 2) !== "invoke_subagent") return undefined;
-  const toolCallId = text(metadataCall, 1);
-  const legacy = message(payload, STEP_INVOKE_SUBAGENT);
-  const structured = message(message(message(payload, STEP_GENERIC_TOOL), 2), 6);
-  const invoke =
-    legacy ??
-    (text(structured, 1) === "type.googleapis.com/exa.cortex.core.tools.InvokeSubagent"
-      ? message(structured, 2)
-      : undefined);
-  const children =
-    invoke === undefined
-      ? []
-      : messages(invoke, legacy === undefined ? 2 : INVOKE_RESULTS).map((result) => ({
-          conversationId: text(result, 1) ?? "",
-          logUri: text(result, 2) ?? "",
-        }));
+  const invoke = message(payload, STEP_INVOKE_SUBAGENT);
+  if (invoke === undefined) return undefined;
+  const children = messages(invoke, INVOKE_RESULTS).map((result) => ({
+    conversationId: text(result, 1) ?? "",
+    logUri: text(result, 2) ?? "",
+  }));
   if (!children.every((child) => NATIVE_ID.test(child.conversationId))) return undefined;
-  const specLaunches =
-    invoke === undefined
-      ? []
-      : messages(invoke, legacy === undefined ? 1 : INVOKE_SPECS).map(decodeInvokeSpec);
-  const launches =
-    specLaunches.length === 0 || specLaunches.some((launch) => launch.model === undefined)
-      ? mergeLaunchModels(specLaunches, decodeLaunchJson(text(metadataCall, 3)))
-      : specLaunches;
-  if (invoke === undefined && launches.length === 0) return undefined;
   return {
-    toolCallId,
-    launches,
+    toolCallId: text(message(message(payload, STEP_METADATA), METADATA_TOOL_CALL), 1),
+    launches: messages(invoke, INVOKE_SPECS).map((spec) => ({
+      role: text(spec, 2) ?? "",
+      prompt: text(spec, 3) ?? "",
+    })),
     children,
   };
 });
 
-interface PlannerInvokeCall {
-  readonly id: string;
-  readonly launches: ReadonlyArray<AntigravityChildLaunch>;
-}
-
-const decodePlannerStep = safely(
-  (
-    payload,
-  ): {
-    readonly isSilent: boolean;
-    readonly invokeCalls: ReadonlyArray<PlannerInvokeCall>;
-  } => {
-    const planner = message(payload, STEP_PLANNER_RESPONSE);
-    if (planner === undefined) return { isSilent: false, invokeCalls: [] };
-    let hasText = false;
-    let hasThinking = false;
-    const invokeCalls: Array<PlannerInvokeCall> = [];
-    for (const [field, value] of protoFields(planner)) {
-      if (field === PLANNER_TEXT && value.length > 0) {
-        hasText = true;
-      } else if (field === PLANNER_THINKING && value.length > 0) {
-        hasThinking = true;
-      } else if (field === PLANNER_TOOL_CALLS) {
-        let id: string | undefined;
-        let name: string | undefined;
-        let argsJson: string | undefined;
-        for (const [callField, callValue] of protoFields(value)) {
-          if (callField === 1 && id === undefined) id = textDecoder.decode(callValue);
-          else if (callField === 2 && name === undefined) name = textDecoder.decode(callValue);
-          else if (callField === 3 && argsJson === undefined)
-            argsJson = textDecoder.decode(callValue);
-        }
-        if (name === "invoke_subagent" && id !== undefined) {
-          invokeCalls.push({
-            id,
-            launches: decodeLaunchJson(argsJson),
-          });
-        }
-      }
-    }
-    return {
-      isSilent: !hasText && !hasThinking,
-      invokeCalls,
-    };
-  },
-);
-
-const decodeAgentReport = safely(
-  (
-    payload,
-  ):
-    | {
-        readonly recipientSessionId: string | undefined;
-        readonly conversationId: string;
-        readonly text: string;
-      }
-    | undefined => {
-    const systemMessage = message(payload, STEP_SYSTEM_MESSAGE);
-    if (
-      systemMessage === undefined ||
-      text(systemMessage, SYSTEM_MESSAGE_KIND) !== "agent_message"
-    ) {
-      return undefined;
-    }
-    const report = message(systemMessage, SYSTEM_MESSAGE_AGENT_REPORT);
-    if (report === undefined) return undefined;
-    const conversationId = text(report, AGENT_REPORT_SENDER_CONVERSATION_ID);
-    const reportText = text(report, AGENT_REPORT_TEXT);
-    if (
-      conversationId === undefined ||
-      !NATIVE_ID.test(conversationId) ||
-      reportText === undefined ||
-      reportText.trim() === ""
-    ) {
-      return undefined;
-    }
-    return {
-      recipientSessionId: text(report, AGENT_REPORT_RECIPIENT_SESSION_ID),
-      conversationId,
-      text: reportText,
-    };
-  },
-);
+const plannerInvokeCallIds = safely((payload): ReadonlyArray<string> => {
+  const planner = message(payload, STEP_PLANNER_RESPONSE);
+  if (planner === undefined) return [];
+  return messages(planner, PLANNER_TOOL_CALLS).flatMap((call) => {
+    const id = text(call, 1);
+    return text(call, 2) === "invoke_subagent" && id !== undefined ? [id] : [];
+  });
+});
 
 const payloadOf = (row: unknown) =>
   row !== null &&
@@ -479,195 +274,21 @@ interface BatchLaunch {
   readonly prompt: string;
 }
 
-const matchesAntigravitySubagentLaunchDescription = (
-  expected: BatchLaunch,
-  launches: ReadonlyArray<AntigravityChildLaunch>,
-): boolean => {
-  if (launches.length === 0) return false;
-  const full = describeAntigravitySubagentLaunches(launches);
-  if (full.title === expected.title && full.prompt === expected.prompt) {
-    return true;
-  }
-  const bounded = describeAntigravitySubagentLaunches(
-    launches.map((launch) => ({
-      role: boundAntigravityToolText(launch.role),
-      prompt: boundAntigravityToolText(launch.prompt),
-    })),
+const plannerCallIdsAt = (database: NodeSqlite.DatabaseSync, plannerIdx: number) => {
+  const planner = payloadOf(
+    database
+      .prepare(
+        "SELECT step_payload FROM steps WHERE idx = ? AND step_format = 0 AND length(step_payload) <= ?",
+      )
+      .get(plannerIdx, MAX_STEP_BYTES),
   );
-  return bounded.title === expected.title && bounded.prompt === expected.prompt;
-};
-
-interface IndexedInvokeRecord {
-  readonly idx: number;
-  readonly stepUpdateIndex: number;
-  readonly record: InvokeRecord | undefined;
-  readonly plannerCalls: ReadonlyArray<PlannerInvokeCall> | undefined;
-}
-
-/**
- * Scans `PLANNER_RESPONSE` and `INVOKE_SUBAGENT` steps in order so each invoke record carries
- * the `StepUpdate.step_index` (`idx - silentPlannerSteps`) that `localharness_external` emits
- * in `<sessionId>:<stepUpdateIndex>` tool call ids.
- */
-function readIndexedInvokeRecords(
-  database: NodeSqlite.DatabaseSync,
-): ReadonlyArray<IndexedInvokeRecord> | undefined {
-  let invokeRows = 0;
-  let invokeBytes = 0;
-  let silentPlannerSteps = 0;
-  let lastPlannerStep:
-    | {
-        readonly idx: number;
-        readonly silentPlannerSteps: number;
-        readonly calls: ReadonlyArray<PlannerInvokeCall>;
-      }
-    | undefined;
-  const records: Array<IndexedInvokeRecord> = [];
-
-  for (const row of database
-    .prepare(
-      "SELECT idx, step_type, step_format, length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE (step_type = ? AND step_format = 0) OR step_type = ? OR (step_type = ? AND instr(step_payload, ?) > 0) ORDER BY idx",
-    )
-    .iterate(
-      MAX_STEP_BYTES,
-      PLANNER_RESPONSE_STEP_TYPE,
-      INVOKE_SUBAGENT_STEP_TYPE,
-      GENERIC_STEP_TYPE,
-      INVOKE_SUBAGENT_TOOL_FIELD,
-    )) {
-    const stepType = rowNumber(row, "step_type");
-    const idx = rowNumber(row, "idx");
-    const size = rowNumber(row, "size");
-    const payload = payloadOf(row);
-
-    if (stepType === PLANNER_RESPONSE_STEP_TYPE) {
-      const planner = payload === undefined ? undefined : decodePlannerStep(payload);
-      if (planner === undefined) {
-        lastPlannerStep = undefined;
-        continue;
-      }
-      if (planner.isSilent) {
-        silentPlannerSteps += 1;
-      }
-      lastPlannerStep =
-        planner.invokeCalls.length > 0
-          ? { idx, silentPlannerSteps, calls: planner.invokeCalls }
-          : undefined;
-      continue;
-    }
-
-    if (stepType === INVOKE_SUBAGENT_STEP_TYPE || stepType === GENERIC_STEP_TYPE) {
-      invokeRows += 1;
-      invokeBytes += size;
-      if (
-        invokeRows > MAX_INVOKE_ROWS ||
-        size > MAX_STEP_BYTES ||
-        invokeBytes > MAX_SCAN_BYTES ||
-        rowNumber(row, "step_format") !== 0
-      ) {
-        return undefined;
-      }
-      const decoded = payload === undefined ? undefined : decodeInvokeRecord(payload);
-      const plannerCalls = lastPlannerStep?.calls;
-      const plannerLaunches =
-        decoded?.toolCallId === undefined
-          ? undefined
-          : plannerCalls?.find((call) => call.id === decoded.toolCallId)?.launches;
-      const record =
-        decoded !== undefined && plannerLaunches !== undefined && plannerLaunches.length > 0
-          ? { ...decoded, launches: mergeLaunchModels(decoded.launches, plannerLaunches) }
-          : decoded;
-      records.push({
-        idx,
-        stepUpdateIndex: idx - silentPlannerSteps,
-        record,
-        plannerCalls,
-      });
-    }
-  }
-
-  if (lastPlannerStep !== undefined && lastPlannerStep.calls.length === 1) {
-    const [call] = lastPlannerStep.calls;
-    if (
-      call !== undefined &&
-      call.launches.length > 0 &&
-      !records.some((entry) => entry.record?.toolCallId === call.id)
-    ) {
-      const idx = lastPlannerStep.idx + 1;
-      records.push({
-        idx,
-        stepUpdateIndex: idx - lastPlannerStep.silentPlannerSteps,
-        record: {
-          toolCallId: call.id,
-          launches: call.launches,
-          children: [],
-        },
-        plannerCalls: lastPlannerStep.calls,
-      });
-    }
-  }
-
-  return records;
-}
-
-const provenAutoApprovedRecord = (
-  entries: ReadonlyArray<IndexedInvokeRecord>,
-  stepUpdateIndex: number,
-): InvokeRecord | undefined => {
-  const entry = entries.find((candidate) => candidate.stepUpdateIndex === stepUpdateIndex);
-  if (entry?.record === undefined || entry.plannerCalls?.length !== 1) return undefined;
-  const [call] = entry.plannerCalls;
-  return call !== undefined && entry.record.toolCallId === call.id ? entry.record : undefined;
-};
-
-const plannerIdxOfTask = (rootSessionId: string, nativeTaskId: string) => {
-  const stepId = /^(.+):(\d+)$/.exec(nativeTaskId);
-  return stepId === null ? undefined : stepId[1] === rootSessionId ? Number(stepId[2]) : -1;
-};
-
-const hasUniqueHydratedLaunchText = (input: {
-  readonly rootSessionId: string;
-  readonly launch: BatchLaunch;
-  readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
-}): boolean => {
-  const sameText = (launch: BatchLaunch) =>
-    launch.title === input.launch.title && launch.prompt === input.launch.prompt;
-  if (input.siblings.some(sameText)) {
-    return false;
-  }
-  for (const sibling of input.siblings) {
-    if (plannerIdxOfTask(input.rootSessionId, sibling.nativeTaskId) !== undefined) continue;
-    // A sibling whose launch text is missing or cut under the same roles cannot be ruled out.
-    if (
-      sibling.title === ANTIGRAVITY_SUBAGENT_BATCH_TITLE ||
-      (sibling.title !== null && isCutAntigravityToolText(sibling.title)) ||
-      (isCutAntigravityToolText(sibling.prompt) &&
-        (sibling.title === null || sibling.title === input.launch.title))
-    ) {
-      return false;
-    }
-  }
-  return true;
-};
-
-const canLookupInvokeRecord = (input: {
-  readonly rootSessionId: string;
-  readonly nativeTaskId: string;
-  readonly launch: BatchLaunch;
-  readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
-}): boolean => {
-  const plannerIdx = plannerIdxOfTask(input.rootSessionId, input.nativeTaskId);
-  if (plannerIdx !== undefined) {
-    return plannerIdx >= 0;
-  }
-  return hasUniqueHydratedLaunchText(input);
+  return planner === undefined ? undefined : plannerInvokeCallIds(planner);
 };
 
 /**
- * Auto-approved calls carry `<sessionId>:<stepUpdateIndex>`; the record at that step update
- * index with the preceding planner call's id is the proof. When compaction or cancelled turns
- * shift `stepUpdateIndex`, an already-hydrated auto-approved batch falls back to the same
- * bounded unique launch-text proof used for permission prompts.
+ * Auto-approved calls carry `<sessionId>:<plannerStep>`. The record with that planner call's id
+ * is the proof. Permission prompts carry a random id, so the launch text must match one record
+ * no auto-approved sibling claims, and no sibling may share the text.
  */
 function findInvokeRecord(
   database: NodeSqlite.DatabaseSync,
@@ -678,40 +299,91 @@ function findInvokeRecord(
     readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
   },
 ): InvokeRecord | undefined {
-  const entries = readIndexedInvokeRecords(database);
-  if (entries === undefined) return undefined;
-  const plannerIdx = plannerIdxOfTask(input.rootSessionId, input.nativeTaskId);
-  const launchIsHydrated =
-    input.launch.title !== null &&
-    input.launch.title !== ANTIGRAVITY_SUBAGENT_BATCH_TITLE &&
-    input.launch.prompt.trim() !== "";
+  const plannerIdxOf = (nativeTaskId: string) => {
+    const stepId = /^(.+):(\d+)$/.exec(nativeTaskId);
+    return stepId === null ? undefined : stepId[1] === input.rootSessionId ? Number(stepId[2]) : -1;
+  };
+  const plannerIdx = plannerIdxOf(input.nativeTaskId);
   if (plannerIdx !== undefined) {
-    const record = provenAutoApprovedRecord(entries, plannerIdx);
-    if (
-      record !== undefined &&
-      (!launchIsHydrated ||
-        matchesAntigravitySubagentLaunchDescription(input.launch, record.launches))
-    ) {
-      return complete(record);
+    if (plannerIdx < 0) return undefined;
+    const callIds = plannerCallIdsAt(database, plannerIdx) ?? [];
+    const [callId] = callIds;
+    if (callIds.length !== 1) return undefined;
+    // The record follows the planner step that issued the call.
+    let rows = 0;
+    let bytes = 0;
+    for (const row of database
+      .prepare(
+        // SQLite returns only in-bound payloads, so an oversized row never reaches this process.
+        "SELECT length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_type = ? AND step_format = 0 AND idx > ? ORDER BY idx",
+      )
+      .iterate(MAX_STEP_BYTES, INVOKE_SUBAGENT_STEP_TYPE, plannerIdx)) {
+      const size = row !== null && typeof row === "object" && "size" in row ? Number(row.size) : 0;
+      rows += 1;
+      bytes += size;
+      if (rows > MAX_INVOKE_ROWS || size > MAX_STEP_BYTES || bytes > MAX_SCAN_BYTES)
+        return undefined;
+      const payload = payloadOf(row);
+      const record = payload === undefined ? undefined : decodeInvokeRecord(payload);
+      if (record !== undefined && record.toolCallId === callId) return complete(record);
     }
-    if (!launchIsHydrated || !hasUniqueHydratedLaunchText(input)) {
-      return undefined;
-    }
+    return undefined;
+  }
+  const totals = database
+    .prepare(
+      "SELECT count(*) AS rows, coalesce(sum(length(step_payload)), 0) AS bytes, coalesce(max(length(step_payload)), 0) AS largest, sum(step_format != 0) AS other FROM steps WHERE step_type = ?",
+    )
+    .get(INVOKE_SUBAGENT_STEP_TYPE);
+  const total = (key: string) =>
+    totals !== undefined && key in totals ? Number(totals[key as keyof typeof totals] ?? 0) : 0;
+  const sameText = (launch: BatchLaunch) =>
+    launch.title === input.launch.title && launch.prompt === input.launch.prompt;
+  if (
+    input.siblings.some(sameText) ||
+    total("rows") > MAX_INVOKE_ROWS ||
+    total("bytes") > MAX_SCAN_BYTES ||
+    total("largest") > MAX_STEP_BYTES ||
+    total("other") > 0
+  ) {
+    return undefined;
   }
   const claimed = new Set<string>();
   for (const sibling of input.siblings) {
-    const idx = plannerIdxOfTask(input.rootSessionId, sibling.nativeTaskId);
-    if (idx === undefined || idx < 0) continue;
-    const claimedRecord = provenAutoApprovedRecord(entries, idx);
-    if (claimedRecord?.toolCallId === undefined) return undefined;
-    claimed.add(claimedRecord.toolCallId);
+    const idx = plannerIdxOf(sibling.nativeTaskId);
+    // A sibling whose launch text is missing, or cut under the same roles, or whose planner step
+    // is unreadable, cannot be ruled out.
+    if (idx === undefined) {
+      if (
+        sibling.title === ANTIGRAVITY_SUBAGENT_BATCH_TITLE ||
+        (sibling.title !== null && isCutAntigravityToolText(sibling.title)) ||
+        (isCutAntigravityToolText(sibling.prompt) &&
+          (sibling.title === null || sibling.title === input.launch.title))
+      )
+        return undefined;
+      continue;
+    }
+    if (idx < 0) continue;
+    const callIds = plannerCallIdsAt(database, idx);
+    if (callIds === undefined || callIds.length === 0) return undefined;
+    for (const callId of callIds) claimed.add(callId);
   }
   const matches: Array<InvokeRecord> = [];
-  for (const { record } of entries) {
+  for (const row of database
+    .prepare("SELECT step_payload FROM steps WHERE step_type = ? ORDER BY idx")
+    .iterate(INVOKE_SUBAGENT_STEP_TYPE)) {
+    const payload = payloadOf(row);
+    const record = payload === undefined ? undefined : decodeInvokeRecord(payload);
     // An unreadable record could be an identical launch, so uniqueness is unproven.
     if (record === undefined) return undefined;
     if (record.toolCallId !== undefined && claimed.has(record.toolCallId)) continue;
-    if (matchesAntigravitySubagentLaunchDescription(input.launch, record.launches)) {
+    // T3 stored the launch from the bounded tool payload, so bound the record the same way.
+    const described = describeAntigravitySubagentLaunches(
+      record.launches.map((launch) => ({
+        role: boundAntigravityToolText(launch.role),
+        prompt: boundAntigravityToolText(launch.prompt),
+      })),
+    );
+    if (sameText(described)) {
       matches.push(record);
     }
   }
@@ -726,15 +398,532 @@ const complete = (record: InvokeRecord) =>
 
 const TranscriptLine = Schema.Struct({
   step_index: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  source: Schema.optional(Schema.String),
   type: Schema.String,
   status: Schema.optional(Schema.String),
+  created_at: Schema.optional(Schema.String),
+  thinking: Schema.optional(Schema.String),
   content: Schema.optional(Schema.String),
   error: Schema.optional(Schema.String),
   tool_calls: Schema.optional(
     Schema.Array(Schema.Struct({ name: Schema.String, args: Schema.optional(Schema.Unknown) })),
   ),
 });
+type TranscriptStep = Schema.Schema.Type<typeof TranscriptLine>;
 const decodeTranscriptLine = Schema.decodeUnknownOption(Schema.fromJsonString(TranscriptLine));
+
+const REASONING_TEXT_CAP = 16_000;
+const ASSISTANT_TEXT_CAP = 32_000;
+const TOOL_OUTPUT_CAP = 8_000;
+
+const READ_TOOL_NAMES = new Set([
+  "read_file",
+  "view_file",
+  "view_file_outline",
+  "view_code_item",
+  "list_dir",
+]);
+const EDIT_TOOL_NAMES = new Set([
+  "edit_file",
+  "write_file",
+  "write_to_file",
+  "replace_file_content",
+  "multi_replace_file_content",
+]);
+const EXECUTE_TOOL_NAMES = new Set(["run_command", "bash", "shell"]);
+const FILE_SEARCH_TOOL_NAMES = new Set(["grep_search", "find_by_name", "glob", "ripgrep"]);
+const WEB_SEARCH_TOOL_NAMES = new Set(["search_web", "web_search"]);
+const WEB_FETCH_TOOL_NAMES = new Set(["read_url_content", "fetch_url"]);
+
+const NON_TOOL_RESULT_STEP_TYPES = new Set([
+  "PLANNER_RESPONSE",
+  "SYSTEM_MESSAGE",
+  "USER_INPUT",
+  "CHECKPOINT",
+  "ERROR_MESSAGE",
+]);
+
+function parseTranscriptTimestamp(value: string | undefined): DateTime.Utc | undefined {
+  return value === undefined ? undefined : Option.getOrUndefined(DateTime.make(value));
+}
+
+function stringField(
+  record: Record<string, unknown> | undefined,
+  keys: ReadonlyArray<string>,
+): string | undefined {
+  if (record === undefined) return undefined;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return undefined;
+}
+
+function rawStringField(
+  record: Record<string, unknown> | undefined,
+  keys: ReadonlyArray<string>,
+): string | undefined {
+  if (record === undefined) return undefined;
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string") return value;
+  }
+  return undefined;
+}
+
+// Linear scan: transcript content is untrusted and can be hundreds of KiB, so no backtracking regex.
+function deliveredSystemMessageBody(content: string): string | undefined {
+  const openTag = "<SYSTEM_MESSAGE>";
+  for (
+    let open = content.indexOf(openTag);
+    open !== -1;
+    open = content.indexOf(openTag, open + 1)
+  ) {
+    let start = open + openTag.length;
+    let sawNewline = false;
+    while (start < content.length && /\s/u.test(content[start]!)) {
+      if (content[start] === "\n") sawNewline = true;
+      start += 1;
+    }
+    if (!sawNewline || !content.startsWith("[Message]", start)) continue;
+    const close = content.indexOf("</SYSTEM_MESSAGE>", start);
+    return content.slice(start, close === -1 ? undefined : close).trim();
+  }
+  return undefined;
+}
+
+/** Extracts the delivered body from an inter-agent `<SYSTEM_MESSAGE>[Message] ... content=...</SYSTEM_MESSAGE>`. */
+function extractDeliveredSystemMessage(content: string | undefined): string | undefined {
+  if (content === undefined) return undefined;
+  const inner =
+    deliveredSystemMessageBody(content) ??
+    (content.trimStart().startsWith("[Message]") ? content.trim() : undefined);
+  if (inner === undefined) return undefined;
+  const contentMarker = " content=";
+  const contentIndex = inner.indexOf(contentMarker);
+  if (contentIndex === -1) return undefined;
+  const text = inner.slice(contentIndex + contentMarker.length).trim();
+  return text.length > 0 ? text : undefined;
+}
+
+/** Strips Antigravity's repeated `Created At:` / `Completed At:` header lines from `GENERIC` outputs. */
+function cleanToolResultContent(content: string | undefined): string | undefined {
+  if (content === undefined) return undefined;
+  const lines = content.split(/\r?\n/u);
+  let index = 0;
+  while (index < lines.length && /^(?:Created At|Completed At):\s+/u.test(lines[index] ?? "")) {
+    index += 1;
+  }
+  const cleaned = lines.slice(index).join("\n").trim();
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+function transcriptStepToolStatus(
+  resultStep: TranscriptStep | undefined,
+  finalize: boolean,
+): {
+  readonly status: NonNullable<AcpToolCallState["status"]>;
+  readonly projectedStatus?: "interrupted" | undefined;
+} {
+  if (resultStep === undefined) {
+    return finalize
+      ? { status: "failed", projectedStatus: "interrupted" }
+      : { status: "inProgress" };
+  }
+  const normalized = resultStep.status?.trim().toUpperCase();
+  if (
+    normalized === "ERROR" ||
+    normalized === "FAILED" ||
+    normalized === "CANCELED" ||
+    normalized === "CANCELLED"
+  ) {
+    return { status: "failed" };
+  }
+  if (normalized === "RUNNING" || normalized === "PENDING" || normalized === "IN_PROGRESS") {
+    return finalize
+      ? { status: "failed", projectedStatus: "interrupted" }
+      : { status: "inProgress" };
+  }
+  return { status: "completed" };
+}
+
+function transcriptToolCallToAcpState(input: {
+  readonly toolCallId: string;
+  readonly call: NonNullable<TranscriptStep["tool_calls"]>[number];
+  readonly resultStep: TranscriptStep | undefined;
+  readonly finalize: boolean;
+}): {
+  readonly toolCall: AcpToolCallState;
+  readonly projectedStatus?: "interrupted" | undefined;
+} {
+  const decodedArgs = toolArguments(input.call.args);
+  const rawInput = Predicate.isObject(decodedArgs)
+    ? (decodedArgs as Record<string, unknown>)
+    : undefined;
+  const { status, projectedStatus } = transcriptStepToolStatus(input.resultStep, input.finalize);
+  const errorText = input.resultStep?.error?.trim();
+  const contentText = cleanToolResultContent(input.resultStep?.content);
+  const outputText =
+    status === "failed" ? errorText || contentText : (contentText ?? (errorText || undefined));
+  const boundedOutput =
+    outputText === undefined ? undefined : boundAntigravityToolText(outputText, TOOL_OUTPUT_CAP);
+  const sanitizedInput = sanitizeAntigravityToolPayload(rawInput ?? decodedArgs);
+  const sanitizedInputRecord = Predicate.isObject(sanitizedInput)
+    ? (sanitizedInput as Record<string, unknown>)
+    : undefined;
+  const toolSummary = stringField(rawInput, ["toolSummary"]);
+  const name = input.call.name.trim();
+  const lower = name.toLowerCase();
+
+  if (READ_TOOL_NAMES.has(lower)) {
+    const targetPath = stringField(rawInput, [
+      "Path",
+      "AbsolutePath",
+      "File",
+      "DirectoryPath",
+      "path",
+      "file_path",
+      "filePath",
+    ]);
+    return {
+      projectedStatus,
+      toolCall: {
+        toolCallId: input.toolCallId,
+        kind: "read",
+        status,
+        ...(targetPath === undefined ? { title: toolSummary ?? name } : {}),
+        data: {
+          ...(sanitizedInput === undefined ? {} : { rawInput: sanitizedInput }),
+          ...(boundedOutput === undefined ? {} : { rawOutput: boundedOutput }),
+          ...(targetPath === undefined ? {} : { locations: [{ path: targetPath }] }),
+        },
+      },
+    };
+  }
+
+  if (EDIT_TOOL_NAMES.has(lower)) {
+    const targetPath = stringField(rawInput, [
+      "Path",
+      "TargetFile",
+      "AbsolutePath",
+      "path",
+      "file_path",
+      "filePath",
+    ]);
+    const oldText = rawStringField(rawInput, ["Target", "TargetContent", "old_str", "oldText"]);
+    const newText = rawStringField(rawInput, [
+      "Replacement",
+      "ReplacementContent",
+      "Content",
+      "CodeContent",
+      "new_str",
+      "newText",
+    ]);
+    const diffContent =
+      targetPath !== undefined && newText !== undefined
+        ? [
+            {
+              type: "diff",
+              path: targetPath,
+              ...(oldText === undefined
+                ? {}
+                : { oldText: boundAntigravityToolText(oldText, TOOL_OUTPUT_CAP) }),
+              newText: boundAntigravityToolText(newText, TOOL_OUTPUT_CAP),
+            },
+          ]
+        : undefined;
+    return {
+      projectedStatus,
+      toolCall: {
+        toolCallId: input.toolCallId,
+        kind: "edit",
+        status,
+        ...(targetPath === undefined ? { title: toolSummary ?? name } : {}),
+        data: {
+          ...(sanitizedInput === undefined ? {} : { rawInput: sanitizedInput }),
+          ...(boundedOutput === undefined ? {} : { rawOutput: boundedOutput }),
+          ...(targetPath === undefined ? {} : { locations: [{ path: targetPath }] }),
+          ...(diffContent === undefined ? {} : { content: diffContent }),
+        },
+      },
+    };
+  }
+
+  if (EXECUTE_TOOL_NAMES.has(lower)) {
+    const command = stringField(rawInput, [
+      "CommandLine",
+      "command_line",
+      "commandLine",
+      "command",
+    ]);
+    const cwd = stringField(rawInput, [
+      "Cwd",
+      "WorkingDirectory",
+      "working_dir",
+      "workingDir",
+      "cwd",
+    ]);
+    return {
+      projectedStatus,
+      toolCall: {
+        toolCallId: input.toolCallId,
+        kind: "execute",
+        status,
+        title: toolSummary ?? command ?? name,
+        ...(command === undefined ? {} : { command }),
+        data: {
+          ...(sanitizedInput === undefined ? {} : { rawInput: sanitizedInput }),
+          ...(boundedOutput === undefined ? {} : { rawOutput: boundedOutput }),
+          ...(command === undefined ? {} : { command }),
+          ...(cwd === undefined ? {} : { cwd }),
+        },
+      },
+    };
+  }
+
+  if (FILE_SEARCH_TOOL_NAMES.has(lower)) {
+    const query = stringField(rawInput, ["Query", "Pattern", "query", "pattern"]);
+    const searchPath = stringField(rawInput, [
+      "SearchPath",
+      "SearchDirectory",
+      "DirectoryPath",
+      "path",
+      "Path",
+    ]);
+    const normalizedInput = {
+      ...sanitizedInputRecord,
+      ...(query === undefined ? {} : { query, pattern: query }),
+      ...(searchPath === undefined ? {} : { path: searchPath }),
+    };
+    return {
+      projectedStatus,
+      toolCall: {
+        toolCallId: input.toolCallId,
+        kind: "search",
+        status,
+        ...(toolSummary === undefined ? {} : { title: toolSummary }),
+        data: {
+          rawInput: normalizedInput,
+          ...(boundedOutput === undefined ? {} : { rawOutput: boundedOutput }),
+          ...(searchPath === undefined ? {} : { locations: [{ path: searchPath }] }),
+        },
+      },
+    };
+  }
+
+  if (WEB_SEARCH_TOOL_NAMES.has(lower)) {
+    const query = stringField(rawInput, ["query", "Query", "search_query", "q"]);
+    return {
+      projectedStatus,
+      toolCall: {
+        toolCallId: input.toolCallId,
+        kind: "search",
+        status,
+        title: "Web search",
+        data: {
+          title: "Web search",
+          rawInput: {
+            ...sanitizedInputRecord,
+            ...(query === undefined ? {} : { query }),
+          },
+          ...(boundedOutput === undefined ? {} : { rawOutput: boundedOutput }),
+        },
+      },
+    };
+  }
+
+  if (WEB_FETCH_TOOL_NAMES.has(lower)) {
+    const url = stringField(rawInput, ["Url", "url", "URL"]);
+    return {
+      projectedStatus,
+      toolCall: {
+        toolCallId: input.toolCallId,
+        kind: "fetch",
+        status,
+        title: toolSummary ?? name,
+        data: {
+          ...(sanitizedInput === undefined ? {} : { rawInput: sanitizedInput }),
+          ...(boundedOutput === undefined ? {} : { rawOutput: boundedOutput }),
+          ...(url === undefined ? {} : { locations: [{ path: url }] }),
+        },
+      },
+    };
+  }
+
+  const title = name.startsWith("mcp_") ? `Run ${name}` : (toolSummary ?? name);
+  return {
+    projectedStatus,
+    toolCall: {
+      toolCallId: input.toolCallId,
+      kind: "other",
+      status,
+      title,
+      data: {
+        ...(sanitizedInput === undefined ? {} : { rawInput: sanitizedInput }),
+        ...(boundedOutput === undefined ? {} : { rawOutput: boundedOutput }),
+      },
+    },
+  };
+}
+
+/**
+ * Projects an Antigravity child conversation's `transcript.jsonl` into standard ACP subagent
+ * timeline entries (thinking, typed tool calls paired with their results, follow-up user messages,
+ * assistant messages, and errors).
+ */
+export function transcriptToSubagentEntries(
+  contents: string,
+  options: {
+    readonly prompt: string;
+    readonly childPrefix?: string | undefined;
+    readonly childLabel?: string | undefined;
+    readonly finalize?: boolean | undefined;
+  },
+): ReadonlyArray<AcpSubagentTranscriptEntry> {
+  const steps = contents.split("\n").flatMap((line) => {
+    const decoded = decodeTranscriptLine(line);
+    return Option.isSome(decoded) ? [decoded.value] : [];
+  });
+  const prefix = options.childPrefix ?? "";
+  const label = options.childLabel?.trim() || undefined;
+  const finalize = options.finalize === true;
+  const launchPrompt = options.prompt.trim();
+  const entries: Array<AcpSubagentTranscriptEntry> = [];
+
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index]!;
+    const createdAt = parseTranscriptTimestamp(step.created_at);
+
+    if (step.type === "CHECKPOINT") continue;
+
+    if (step.type === "SYSTEM_MESSAGE") {
+      if (
+        step.step_index === 0 &&
+        (launchPrompt === "" || step.content?.includes(launchPrompt) === true)
+      ) {
+        continue;
+      }
+      const delivered = extractDeliveredSystemMessage(step.content);
+      if (delivered !== undefined) {
+        entries.push({
+          kind: "user_message",
+          itemId: `${prefix}step:${step.step_index}:user`,
+          text: capText(delivered, ASSISTANT_TEXT_CAP),
+          createdAt,
+        });
+      }
+      continue;
+    }
+
+    if (step.type === "USER_INPUT") {
+      const text = step.content?.trim();
+      if (text) {
+        entries.push({
+          kind: "user_message",
+          itemId: `${prefix}step:${step.step_index}:user`,
+          text: capText(text, ASSISTANT_TEXT_CAP),
+          createdAt,
+        });
+      }
+      continue;
+    }
+
+    if (step.type === "ERROR_MESSAGE") {
+      const message = (step.error ?? step.content ?? "").trim();
+      if (message) {
+        entries.push({
+          kind: "error",
+          itemId: `${prefix}step:${step.step_index}:error`,
+          message: capText(message, STEP_TEXT_CAP),
+          createdAt,
+        });
+      }
+      continue;
+    }
+
+    if (step.type === "PLANNER_RESPONSE") {
+      const thinking = step.thinking?.trim();
+      if (thinking) {
+        const stepStatus = step.status?.trim().toUpperCase();
+        const running =
+          !finalize &&
+          (stepStatus === "RUNNING" || stepStatus === "PENDING" || stepStatus === "IN_PROGRESS");
+        entries.push({
+          kind: "reasoning",
+          itemId: `${prefix}step:${step.step_index}:thinking`,
+          title: label ? `${label} · Thinking` : "Thinking",
+          text: capText(thinking, REASONING_TEXT_CAP),
+          status: running ? "running" : "completed",
+          createdAt,
+        });
+      }
+
+      const content = step.content?.trim();
+      if (content) {
+        const capped = capText(content, ASSISTANT_TEXT_CAP);
+        entries.push({
+          kind: "assistant_message",
+          itemId: `${prefix}step:${step.step_index}:assistant`,
+          text: label ? `**${label}**\n\n${capped}` : capped,
+          createdAt,
+        });
+      }
+
+      const calls = step.tool_calls ?? [];
+      if (calls.length > 0) {
+        // Pair each tool call 1-to-1 with the following tool-result steps until the next turn boundary.
+        const resultSteps: Array<TranscriptStep> = [];
+        let cursor = index + 1;
+        while (cursor < steps.length && resultSteps.length < calls.length) {
+          const candidate = steps[cursor]!;
+          if (candidate.type === "CHECKPOINT") {
+            cursor += 1;
+            continue;
+          }
+          if (NON_TOOL_RESULT_STEP_TYPES.has(candidate.type)) break;
+          resultSteps.push(candidate);
+          cursor += 1;
+        }
+        index = cursor - 1;
+
+        for (let callIndex = 0; callIndex < calls.length; callIndex += 1) {
+          const call = calls[callIndex]!;
+          const resultStep = resultSteps[callIndex];
+          const itemId = `${prefix}step:${step.step_index}:tool:${callIndex}`;
+          const { toolCall, projectedStatus } = transcriptToolCallToAcpState({
+            toolCallId: itemId,
+            call,
+            resultStep,
+            finalize,
+          });
+          entries.push({
+            kind: "tool",
+            itemId,
+            toolCall,
+            ...(projectedStatus === undefined ? {} : { projectedStatus }),
+            createdAt: parseTranscriptTimestamp(resultStep?.created_at) ?? createdAt,
+          });
+        }
+      }
+      continue;
+    }
+
+    // Any standalone error step outside a planner response still surfaces visibly.
+    if (step.status?.trim().toUpperCase() === "ERROR") {
+      const message = (step.error ?? cleanToolResultContent(step.content) ?? "").trim();
+      if (message) {
+        entries.push({
+          kind: "error",
+          itemId: `${prefix}step:${step.step_index}:error`,
+          message: capText(message, STEP_TEXT_CAP),
+          createdAt,
+        });
+      }
+    }
+  }
+
+  return entries;
+}
 
 // The runtime records each tool argument value as JSON text.
 const toolArguments = (args: unknown) =>
@@ -785,10 +974,9 @@ function transcriptSteps(
 }
 
 /** Reads the tail of the transcript at the named child's own unlinked profile path. */
-async function readChildTranscript(
+async function readChildTranscriptRaw(
   profileRoot: string,
   child: InvokeRecord["children"][number],
-  prompt: string,
   byteCap: number,
 ) {
   const expected = (
@@ -831,11 +1019,11 @@ async function readChildTranscript(
     let lineStart = 0;
     if (tailStart > 0) {
       const newline = bytes.indexOf(0x0a);
-      if (newline === -1) return { steps: [], truncated: true };
+      if (newline === -1) return { contents: "", truncated: true };
       lineStart = newline + 1;
     }
     const contents = bytes.toString("utf8", lineStart);
-    return { steps: transcriptSteps(contents, prompt), truncated: tailStart > 0 };
+    return { contents, truncated: tailStart > 0 };
   } finally {
     await handle.close();
   }
@@ -861,6 +1049,20 @@ async function resolveSessionDatabase(
   return databasePath === undefined ? undefined : { profileRoot, databasePath };
 }
 
+async function readChildTranscript(
+  profileRoot: string,
+  child: InvokeRecord["children"][number],
+  prompt: string,
+  byteCap: number,
+) {
+  const raw = await readChildTranscriptRaw(profileRoot, child, byteCap);
+  if (raw === undefined) return undefined;
+  return {
+    steps: raw.contents.length === 0 ? [] : transcriptSteps(raw.contents, prompt),
+    truncated: raw.truncated,
+  };
+}
+
 class AntigravityChildWorkReadError extends Schema.TaggedError<AntigravityChildWorkReadError>()(
   "AntigravityChildWorkReadError",
   { cause: Schema.Defect() },
@@ -869,6 +1071,109 @@ class AntigravityChildWorkReadError extends Schema.TaggedError<AntigravityChildW
     return "Could not read Antigravity subagent records.";
   }
 }
+
+async function resolveAntigravityInvokeRecord(
+  profileRoot: string,
+  input: {
+    readonly rootSessionId: string;
+    readonly nativeTaskId: string;
+    readonly childSessionId?: string | null | undefined;
+    readonly launch: BatchLaunch;
+    readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
+  },
+): Promise<InvokeRecord | undefined> {
+  const detached = await findDetachedInvokeRecord(
+    profileRoot,
+    input.rootSessionId,
+    input.nativeTaskId,
+  );
+  if (detached !== undefined) return detached;
+  if (input.childSessionId != null && NATIVE_ID.test(input.childSessionId)) {
+    return {
+      toolCallId: input.nativeTaskId,
+      launches: [{ role: input.launch.title ?? "", prompt: input.launch.prompt }],
+      children: [{ conversationId: input.childSessionId }],
+    };
+  }
+  const databasePath = (
+    await antigravityManagedPath(
+      profileRoot,
+      ["antigravity-acp", "conversations", `${input.rootSessionId}.db`],
+      "file",
+    )
+  )?.path;
+  if (databasePath === undefined) return undefined;
+  const database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
+  try {
+    return findInvokeRecord(database, input);
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * Reads standard timeline entries (thinking, typed tool calls, messages, errors) from the native
+ * Antigravity child transcript(s) launched by a subagent call. Fails closed to an empty array.
+ */
+export const readAntigravitySubagentTranscript = Effect.fn("readAntigravitySubagentTranscript")(
+  function* (input: {
+    readonly profileDirectory: string;
+    readonly rootSessionId: string;
+    readonly nativeTaskId: string;
+    readonly childSessionId?: string | null | undefined;
+    readonly launch: BatchLaunch;
+    readonly siblings: ReadonlyArray<BatchLaunch & { readonly nativeTaskId: string }>;
+    readonly finalize?: boolean | undefined;
+  }): Effect.fn.Return<ReadonlyArray<AcpSubagentTranscriptEntry>> {
+    if (!NATIVE_ID.test(input.rootSessionId)) return [];
+    const read = async (): Promise<ReadonlyArray<AcpSubagentTranscriptEntry>> => {
+      const profileRoot = await antigravityProfileRoot(input.profileDirectory);
+      if (profileRoot === undefined) return [];
+      const record = await resolveAntigravityInvokeRecord(profileRoot, input);
+      if (record === undefined) return [];
+      const { launches, children } = record;
+      const byteCap = Math.min(
+        TRANSCRIPT_BYTE_CAP,
+        Math.floor(BATCH_TRANSCRIPT_BYTES / Math.max(1, children.length)),
+      );
+      const multiChild = children.length > 1;
+      const perChild = await Promise.all(
+        children.map(async (child, index) => {
+          const raw = await readChildTranscriptRaw(profileRoot, child, byteCap).catch(
+            () => undefined,
+          );
+          if (raw === undefined || raw.contents.length === 0) return [];
+          const launch = launches[index];
+          // Prefix even a lone child, so its item ids hold when a sibling appears later.
+          return transcriptToSubagentEntries(raw.contents, {
+            prompt: launch?.prompt ?? input.launch.prompt,
+            childPrefix: `${child.conversationId}:`,
+            childLabel: multiChild ? launch?.role || child.conversationId : undefined,
+            finalize: input.finalize,
+          }).map((entry) => ({ ...entry, childKey: child.conversationId }));
+        }),
+      );
+      if (!multiChild) return perChild.flat();
+      // Undated entries inherit their child's previous timestamp so the comparator stays total.
+      return perChild
+        .flatMap((entries) => {
+          let lastMs = 0;
+          return entries.map((entry) => {
+            lastMs =
+              entry.createdAt === undefined ? lastMs : DateTime.toEpochMillis(entry.createdAt);
+            return { entry, ms: lastMs };
+          });
+        })
+        .map((keyed, position) => ({ ...keyed, position }))
+        .sort((left, right) => left.ms - right.ms || left.position - right.position)
+        .map(({ entry }) => entry);
+    };
+    return yield* Effect.tryPromise({
+      try: read,
+      catch: (cause) => new AntigravityChildWorkReadError({ cause }),
+    }).pipe(Effect.orElseSucceed((): ReadonlyArray<AcpSubagentTranscriptEntry> => []));
+  },
+);
 
 /** Children a subagent tool call launched, proven by the parent's own session record. */
 export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(function* (input: {
@@ -884,21 +1189,7 @@ export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(fu
     try: async (): Promise<ReadonlyArray<OrchestrationV2NativeChildWork>> => {
       const profileRoot = await antigravityProfileRoot(input.profileDirectory);
       if (profileRoot === undefined) return [];
-      let record = await findDetachedInvokeRecord(
-        profileRoot,
-        input.rootSessionId,
-        input.nativeTaskId,
-      );
-      if (record === undefined && canLookupInvokeRecord(input)) {
-        const databasePath = await sessionDatabasePath(profileRoot, input.rootSessionId);
-        if (databasePath === undefined) return [];
-        const database = new NodeSqlite.DatabaseSync(databasePath, { readOnly: true });
-        try {
-          record = findInvokeRecord(database, input);
-        } finally {
-          database.close();
-        }
-      }
+      const record = await resolveAntigravityInvokeRecord(profileRoot, input);
       if (record === undefined) return [];
       const { launches, children } = record;
       // One budget for the whole batch, so the response stays small however many children ran.
@@ -927,99 +1218,6 @@ export const readAntigravityChildWork = Effect.fn("readAntigravityChildWork")(fu
     catch: (cause) => new AntigravityChildWorkReadError({ cause }),
   });
 });
-
-/**
- * Reads subagent batch records and child `agent_message` reports from the parent's session
- * database so live child tool calls and completion reports route to the subagent thread.
- */
-export const readAntigravitySessionSubagentState = Effect.fn("readAntigravitySessionSubagentState")(
-  function* (input: {
-    readonly profileDirectory: string;
-    readonly rootSessionId: string;
-    readonly includeBatches?: boolean;
-    readonly includeReports?: boolean;
-    readonly afterReportStepIndex?: number;
-  }) {
-    if (!NATIVE_ID.test(input.rootSessionId)) return undefined;
-    return yield* Effect.tryPromise({
-      try: async (): Promise<AntigravitySessionSubagentState | undefined> => {
-        const resolved = await resolveSessionDatabase(input.profileDirectory, input.rootSessionId);
-        if (resolved === undefined) return undefined;
-        const database = new NodeSqlite.DatabaseSync(resolved.databasePath, { readOnly: true });
-        try {
-          database.exec("PRAGMA busy_timeout = 100");
-          const batches: Array<AntigravitySubagentBatchState> = [];
-          if (input.includeBatches !== false) {
-            const entries = readIndexedInvokeRecords(database);
-            if (entries === undefined) return undefined;
-            for (const entry of entries) {
-              const record = entry.record;
-              if (
-                record === undefined ||
-                record.launches.length === 0 ||
-                record.launches.length > MAX_CHILDREN ||
-                record.children.length > MAX_CHILDREN ||
-                (record.children.length > 0 && record.children.length !== record.launches.length)
-              ) {
-                continue;
-              }
-              batches.push({
-                stepUpdateIndex: entry.stepUpdateIndex,
-                toolCallId: record.toolCallId,
-                launches: record.launches,
-                children: record.children.map((child, index) => ({
-                  conversationId: child.conversationId,
-                  role: record.launches[index]?.role ?? "",
-                })),
-              });
-            }
-          }
-          const reports: Array<AntigravitySubagentReportState> = [];
-          if (input.includeReports !== false) {
-            let reportRows = 0;
-            let reportBytes = 0;
-            for (const row of database
-              .prepare(
-                "SELECT idx, length(step_payload) AS size, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE step_type = ? AND step_format = 0 AND idx > ? ORDER BY idx",
-              )
-              .iterate(
-                MAX_STEP_BYTES,
-                SYSTEM_MESSAGE_STEP_TYPE,
-                input.afterReportStepIndex ?? -1,
-              )) {
-              const idx = rowNumber(row, "idx");
-              const size = rowNumber(row, "size");
-              reportRows += 1;
-              reportBytes += size;
-              if (reportRows > MAX_INVOKE_ROWS * MAX_CHILDREN || reportBytes > MAX_SCAN_BYTES) {
-                break;
-              }
-              const payload = payloadOf(row);
-              if (payload === undefined) continue;
-              const report = decodeAgentReport(payload);
-              if (report === undefined) continue;
-              if (
-                report.recipientSessionId !== undefined &&
-                report.recipientSessionId !== input.rootSessionId
-              ) {
-                continue;
-              }
-              reports.push({
-                stepIndex: idx,
-                conversationId: report.conversationId,
-                text: report.text,
-              });
-            }
-          }
-          return { batches, reports };
-        } finally {
-          database.close();
-        }
-      },
-      catch: (cause) => new AntigravityChildWorkReadError({ cause }),
-    });
-  },
-);
 
 const decodeCommandTask = safely((payload) => {
   const toolCall = message(message(payload, STEP_METADATA), METADATA_TOOL_CALL);
@@ -1189,398 +1387,6 @@ export function makeAntigravityCommandTaskTracker(profileDirectory: string | und
   };
 }
 
-interface TrackedSubagentBatch {
-  readonly rootSessionId: string;
-  readonly nativeTaskId: string;
-  readonly childSessionId: string;
-  launches: ReadonlyArray<AntigravityChildLaunch>;
-  launchesHydrated: boolean;
-  children: ReadonlyArray<{ readonly conversationId: string; readonly role: string }>;
-  matchedDbStepUpdateIndex: number | undefined;
-  completed: boolean;
-}
-
-const batchNeedsDbSync = (batch: TrackedSubagentBatch) =>
-  batch.matchedDbStepUpdateIndex === undefined ||
-  batch.children.length === 0 ||
-  batch.launches.length === 0;
-
-const formatChildReport = (role: string | undefined, text: string, multiChild: boolean) =>
-  multiChild && role ? `### ${role}\n\n${text}` : text;
-
-/**
- * Tracks active Antigravity subagent batches for a runtime instance, routing child tool updates
- * to their subagent session and emitting child `agent_message` reports + batch completion updates.
- */
-export function makeAntigravitySubagentTracker(profileDirectory: string | undefined) {
-  const trackedBatches = new Map<string, TrackedSubagentBatch>();
-  const childConversationToBatch = new Map<string, TrackedSubagentBatch>();
-  const reportsByConversationId = new Map<string, string>();
-  const lastReportStepIndexBySession = new Map<string, number>();
-  const pendingSyntheticNotifications: Array<EffectAcpSchema.SessionNotification> = [];
-  let lastChunkSyncAt: number | undefined;
-
-  const ensureTrackedBatch = (rootSessionId: string, nativeTaskId: string) => {
-    let batch = trackedBatches.get(nativeTaskId);
-    if (batch === undefined) {
-      batch = {
-        rootSessionId,
-        nativeTaskId,
-        childSessionId: antigravitySubagentChildSessionId(nativeTaskId),
-        launches: [],
-        launchesHydrated: false,
-        children: [],
-        matchedDbStepUpdateIndex: undefined,
-        completed: false,
-      };
-      trackedBatches.set(nativeTaskId, batch);
-    }
-    return batch;
-  };
-
-  const bindDbBatch = (
-    batch: TrackedSubagentBatch,
-    dbBatch: AntigravitySubagentBatchState,
-    emitHydrationIfNeeded: boolean,
-  ) => {
-    batch.matchedDbStepUpdateIndex = dbBatch.stepUpdateIndex;
-    const prevLaunches = batch.launches;
-    if (dbBatch.launches.length > 0) {
-      batch.launches = mergeLaunchModels(prevLaunches, dbBatch.launches);
-    }
-    const modelAdded = prevLaunches.length > 0 && batch.launches !== prevLaunches;
-    if (
-      emitHydrationIfNeeded &&
-      (!batch.launchesHydrated || modelAdded) &&
-      !batch.completed &&
-      batch.launches.length > 0
-    ) {
-      batch.launchesHydrated = true;
-      pendingSyntheticNotifications.push(
-        normalizeAntigravitySessionUpdate({
-          sessionId: batch.rootSessionId,
-          update: {
-            sessionUpdate: "tool_call_update",
-            toolCallId: batch.nativeTaskId,
-            title: "Running invoke_subagent",
-            kind: "other",
-            status: "in_progress",
-            rawInput: toAntigravitySubagentRawInput(batch.launches),
-          },
-        }),
-      );
-    }
-    if (dbBatch.children.length > 0) {
-      batch.children = dbBatch.children;
-      for (const child of dbBatch.children) {
-        childConversationToBatch.set(child.conversationId, batch);
-      }
-    }
-  };
-
-  const syncSubagentsFromDb = (
-    rootSessionId: string,
-    options: {
-      readonly includeBatches: boolean;
-      readonly includeReports: boolean;
-      readonly updatingTaskId?: string;
-      readonly inferChildConversationId?: string;
-    },
-  ) => {
-    if (profileDirectory === undefined) return Effect.void;
-    const afterReportStepIndex = lastReportStepIndexBySession.get(rootSessionId) ?? -1;
-    return readAntigravitySessionSubagentState({
-      profileDirectory,
-      rootSessionId,
-      includeBatches: options.includeBatches,
-      includeReports: options.includeReports,
-      afterReportStepIndex,
-    }).pipe(
-      Effect.orElseSucceed(() => undefined),
-      Effect.tap((state) =>
-        Effect.sync(() => {
-          if (state === undefined) return;
-          if (options.includeBatches) {
-            const sessionBatches = [...trackedBatches.values()].filter(
-              (candidate) => candidate.rootSessionId === rootSessionId,
-            );
-            const claimedStepIndices = new Set<number>();
-            for (const candidate of sessionBatches) {
-              if (candidate.matchedDbStepUpdateIndex === undefined) continue;
-              claimedStepIndices.add(candidate.matchedDbStepUpdateIndex);
-              const matchedDbBatch = state.batches.find(
-                (dbBatch) => dbBatch.stepUpdateIndex === candidate.matchedDbStepUpdateIndex,
-              );
-              if (matchedDbBatch !== undefined) {
-                bindDbBatch(
-                  candidate,
-                  matchedDbBatch,
-                  candidate.nativeTaskId !== options.updatingTaskId,
-                );
-              }
-            }
-
-            for (const dbBatch of state.batches) {
-              if (claimedStepIndices.has(dbBatch.stepUpdateIndex)) continue;
-              const autoTaskId = `${rootSessionId}:${dbBatch.stepUpdateIndex}`;
-              const byAutoId = trackedBatches.get(autoTaskId);
-              if (byAutoId !== undefined && byAutoId.matchedDbStepUpdateIndex === undefined) {
-                claimedStepIndices.add(dbBatch.stepUpdateIndex);
-                bindDbBatch(byAutoId, dbBatch, byAutoId.nativeTaskId !== options.updatingTaskId);
-                continue;
-              }
-              const byToolCallId =
-                dbBatch.toolCallId === undefined
-                  ? undefined
-                  : trackedBatches.get(dbBatch.toolCallId);
-              if (
-                byToolCallId !== undefined &&
-                byToolCallId.matchedDbStepUpdateIndex === undefined
-              ) {
-                claimedStepIndices.add(dbBatch.stepUpdateIndex);
-                bindDbBatch(
-                  byToolCallId,
-                  dbBatch,
-                  byToolCallId.nativeTaskId !== options.updatingTaskId,
-                );
-                continue;
-              }
-              const byLaunch = sessionBatches.find(
-                (candidate) =>
-                  candidate.matchedDbStepUpdateIndex === undefined &&
-                  candidate.launches.length > 0 &&
-                  matchesAntigravitySubagentLaunchDescription(
-                    describeAntigravitySubagentLaunches(candidate.launches),
-                    dbBatch.launches,
-                  ),
-              );
-              if (byLaunch !== undefined) {
-                claimedStepIndices.add(dbBatch.stepUpdateIndex);
-                bindDbBatch(byLaunch, dbBatch, byLaunch.nativeTaskId !== options.updatingTaskId);
-                continue;
-              }
-            }
-
-            // After trajectory compaction or cancelled turns, Antigravity's emitted
-            // `<sessionId>:<stepIndex>` can drift from `idx - silentPlannerSteps`. Bind
-            // unmatched auto-approved batches to the newest unclaimed DB batches rather
-            // than synthesizing historical DB rows as duplicate active subagents.
-            const unmatchedAutoBatches = sessionBatches.filter(
-              (candidate) =>
-                candidate.matchedDbStepUpdateIndex === undefined &&
-                candidate.nativeTaskId.startsWith(`${rootSessionId}:`) &&
-                candidate.launches.length === 0,
-            );
-            if (unmatchedAutoBatches.length > 0) {
-              const maxClaimedStepIndex =
-                claimedStepIndices.size === 0 ? -1 : Math.max(...claimedStepIndices);
-              const candidateDbBatches = state.batches
-                .filter(
-                  (dbBatch) =>
-                    !claimedStepIndices.has(dbBatch.stepUpdateIndex) &&
-                    dbBatch.stepUpdateIndex > maxClaimedStepIndex,
-                )
-                .slice(-unmatchedAutoBatches.length);
-              for (const [index, dbBatch] of candidateDbBatches.entries()) {
-                const targetBatch = unmatchedAutoBatches[index];
-                if (targetBatch === undefined) break;
-                claimedStepIndices.add(dbBatch.stepUpdateIndex);
-                bindDbBatch(
-                  targetBatch,
-                  dbBatch,
-                  targetBatch.nativeTaskId !== options.updatingTaskId,
-                );
-              }
-            }
-
-            if (
-              options.inferChildConversationId !== undefined &&
-              !childConversationToBatch.has(options.inferChildConversationId)
-            ) {
-              const hasUnmatchedBatch = sessionBatches.some(
-                (candidate) => candidate.matchedDbStepUpdateIndex === undefined,
-              );
-              const owningDbBatch = state.batches.findLast(
-                (dbBatch) =>
-                  !claimedStepIndices.has(dbBatch.stepUpdateIndex) &&
-                  dbBatch.children.some(
-                    (child) => child.conversationId === options.inferChildConversationId,
-                  ),
-              );
-              if (!hasUnmatchedBatch && owningDbBatch !== undefined) {
-                const autoTaskId = `${rootSessionId}:${owningDbBatch.stepUpdateIndex}`;
-                const inferred = ensureTrackedBatch(rootSessionId, autoTaskId);
-                claimedStepIndices.add(owningDbBatch.stepUpdateIndex);
-                bindDbBatch(inferred, owningDbBatch, false);
-              }
-            }
-          }
-
-          if (!options.includeReports) return;
-
-          let maxReportStepIndex = afterReportStepIndex;
-          for (const report of state.reports) {
-            if (report.stepIndex > maxReportStepIndex) {
-              maxReportStepIndex = report.stepIndex;
-            }
-            const batch = childConversationToBatch.get(report.conversationId);
-            if (batch === undefined || batch.completed) continue;
-            reportsByConversationId.set(report.conversationId, report.text);
-            const reportKey = `${report.conversationId}:${report.stepIndex}`;
-            const role = batch.children.find(
-              (child) => child.conversationId === report.conversationId,
-            )?.role;
-            const text = formatChildReport(role, report.text, batch.children.length > 1);
-            pendingSyntheticNotifications.push({
-              sessionId: batch.childSessionId,
-              update: {
-                sessionUpdate: "agent_message",
-                messageId: `antigravity-subagent-report:${reportKey}`,
-                content: [{ type: "text", text }],
-              },
-            });
-          }
-          if (maxReportStepIndex > afterReportStepIndex) {
-            lastReportStepIndexBySession.set(rootSessionId, maxReportStepIndex);
-          }
-
-          for (const batch of trackedBatches.values()) {
-            if (
-              batch.rootSessionId !== rootSessionId ||
-              batch.completed ||
-              batch.children.length === 0 ||
-              !batch.children.every((child) => reportsByConversationId.has(child.conversationId))
-            ) {
-              continue;
-            }
-            batch.completed = true;
-            batch.launchesHydrated = true;
-            const multiChild = batch.children.length > 1;
-            const combinedReport = batch.children
-              .map((child) =>
-                formatChildReport(
-                  child.role,
-                  reportsByConversationId.get(child.conversationId) ?? "",
-                  multiChild,
-                ),
-              )
-              .join("\n\n");
-            for (const child of batch.children) {
-              reportsByConversationId.delete(child.conversationId);
-            }
-            pendingSyntheticNotifications.push(
-              normalizeAntigravitySessionUpdate({
-                sessionId: batch.rootSessionId,
-                update: {
-                  sessionUpdate: "tool_call_update",
-                  toolCallId: batch.nativeTaskId,
-                  title: "Running invoke_subagent",
-                  kind: "other",
-                  status: "completed",
-                  ...(batch.launches.length > 0
-                    ? { rawInput: toAntigravitySubagentRawInput(batch.launches) }
-                    : {}),
-                  rawOutput: combinedReport,
-                  _meta: { antigravitySubagentCompleted: true },
-                },
-              }),
-            );
-          }
-        }),
-      ),
-      Effect.asVoid,
-    );
-  };
-
-  return {
-    rewriteAndDrain: Effect.fn("AntigravitySubagentTracker.rewriteAndDrain")(function* (
-      rawNotification: EffectAcpSchema.SessionNotification,
-    ) {
-      let notification = rawNotification;
-      const rootSessionId = notification.sessionId;
-      const update = notification.update;
-      let isSubagentLaunchOrUpdate = false;
-      let isChildToolUpdate = false;
-
-      if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
-        if (isAntigravitySubagentToolUpdate(update) || trackedBatches.has(update.toolCallId)) {
-          isSubagentLaunchOrUpdate = true;
-          const batch = ensureTrackedBatch(rootSessionId, update.toolCallId);
-          const inputLaunches = antigravitySubagentLaunches(update.rawInput);
-          if (inputLaunches !== undefined && inputLaunches.length > 0) {
-            batch.launches = mergeLaunchModels(inputLaunches, batch.launches);
-            batch.launchesHydrated = true;
-          }
-          const launchesBeforeSync = batch.launches;
-          if (batchNeedsDbSync(batch)) {
-            yield* syncSubagentsFromDb(rootSessionId, {
-              includeBatches: true,
-              includeReports: false,
-              updatingTaskId: batch.nativeTaskId,
-            });
-          }
-          if (batch.launches.length > 0) {
-            batch.launchesHydrated = true;
-            if (inputLaunches === undefined || batch.launches !== launchesBeforeSync) {
-              notification = normalizeAntigravitySessionUpdate({
-                ...notification,
-                update: {
-                  ...update,
-                  rawInput: toAntigravitySubagentRawInput(batch.launches),
-                },
-              });
-            }
-          }
-        } else {
-          const childPrefix = /^([A-Za-z0-9-]+):\d+$/.exec(update.toolCallId)?.[1];
-          if (childPrefix !== undefined && childPrefix !== rootSessionId) {
-            if (!childConversationToBatch.has(childPrefix)) {
-              yield* syncSubagentsFromDb(rootSessionId, {
-                includeBatches: true,
-                includeReports: false,
-                inferChildConversationId: childPrefix,
-              });
-            }
-            const childBatch = childConversationToBatch.get(childPrefix);
-            if (childBatch !== undefined) {
-              isChildToolUpdate = true;
-              notification = {
-                ...notification,
-                sessionId: childBatch.childSessionId,
-              };
-            }
-          }
-        }
-      }
-
-      if (trackedBatches.size > 0 && !isSubagentLaunchOrUpdate && !isChildToolUpdate) {
-        const activeBatches = [...trackedBatches.values()].filter(
-          (batch) => batch.rootSessionId === rootSessionId && !batch.completed,
-        );
-        if (activeBatches.length > 0) {
-          const isImmediateSync =
-            update.sessionUpdate === "tool_call" ||
-            update.sessionUpdate === "tool_call_update" ||
-            update.sessionUpdate === "session_info_update";
-          const now = yield* Clock.currentTimeMillis;
-          if (isImmediateSync || lastChunkSyncAt === undefined || now - lastChunkSyncAt >= 200) {
-            lastChunkSyncAt = now;
-            yield* syncSubagentsFromDb(rootSessionId, {
-              includeBatches: activeBatches.some(batchNeedsDbSync),
-              includeReports: true,
-            });
-          }
-        }
-      }
-
-      const synthetic = pendingSyntheticNotifications.splice(
-        0,
-        pendingSyntheticNotifications.length,
-      );
-      return isSubagentLaunchOrUpdate ? [notification, ...synthetic] : [...synthetic, notification];
-    }),
-  };
-}
 const decodeChildMessage = Schema.decodeUnknownOption(
   Schema.fromJsonString(
     Schema.Struct({
