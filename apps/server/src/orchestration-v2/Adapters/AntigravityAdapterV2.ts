@@ -15,7 +15,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
-import * as Predicate from "effect/Predicate";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as EffectAcpErrors from "effect-acp/errors";
@@ -37,13 +36,12 @@ import {
 import {
   ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
   type AntigravityChildLaunch,
-  antigravitySubagentChildSessionId,
   antigravitySubagentLaunches,
   describeAntigravitySubagentLaunches,
-  makeAntigravitySubagentTracker,
   makeAntigravityCommandTaskTracker,
   readAntigravityChildrenAtWork,
   readAntigravityPendingReply,
+  readAntigravitySubagentTranscript,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import {
   readAntigravityClientTextFile,
@@ -79,11 +77,6 @@ import {
 } from "@t3tools/provider-acp/server/adapter";
 
 const ANTIGRAVITY_PROVIDER = ProviderDriverKind.make("antigravity");
-
-const isCompletedAntigravitySubagentMeta = (meta: unknown): boolean =>
-  Predicate.isObject(meta) &&
-  "antigravitySubagentCompleted" in meta &&
-  meta.antigravitySubagentCompleted === true;
 
 const AntigravityProviderCapabilitiesV2 = {
   ...AcpProviderCapabilitiesV2,
@@ -195,9 +188,8 @@ function resolveAntigravitySubagentModel(
 }
 
 /**
- * Each subagent batch gets a synthetic `antigravity-task:<nativeTaskId>` child session id so
- * child tool calls and `agent_message` reports from the session database route to the subagent
- * thread while keeping the child thread read-only.
+ * Native subagent tools report no child session ids, so children stay read-only.
+ * Only permission prompts carry the launch. NativeChildWorkQuery matches their ids by this text.
  */
 const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractSubagentUpdate"]> = (
   toolCall,
@@ -206,16 +198,8 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
   if (classifyAntigravitySubagentToolCall(toolCall) !== "subagent") {
     return undefined;
   }
-  const completedByReport =
-    toolCall.status === "completed" && isCompletedAntigravitySubagentMeta(toolCall.data.meta);
   const status =
-    toolCall.status === "failed"
-      ? "failed"
-      : toolCall.status === "pending"
-        ? "pending"
-        : completedByReport
-          ? "completed"
-          : "running";
+    toolCall.status === "failed" ? "failed" : toolCall.status === "pending" ? "pending" : "running";
   const launches = antigravitySubagentLaunches(toolCall.data.rawInput);
   const launch = launches === undefined ? undefined : describeAntigravitySubagentLaunches(launches);
   const isSwarm = isAntigravitySwarmSubagentToolCall(toolCall);
@@ -238,7 +222,7 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
     nativeTaskId: toolCall.toolCallId,
     prompt:
       launch?.prompt ??
-      (completedByReport ? undefined : antigravitySubagentOutput(toolCall)) ??
+      antigravitySubagentOutput(toolCall) ??
       toolCall.detail ??
       toolCall.title ??
       ANTIGRAVITY_SUBAGENT_BATCH_TITLE,
@@ -248,13 +232,8 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
       ? {}
       : { modelSelection: resolvedModel.modelSelection }),
     status,
-    childSessionId: isSwarm
-      ? antigravitySwarmAddChildSessionId(toolCall)
-      : antigravitySubagentChildSessionId(toolCall.toolCallId),
-    result:
-      status === "failed" || status === "completed"
-        ? (antigravitySubagentOutput(toolCall) ?? null)
-        : null,
+    childSessionId: antigravitySwarmAddChildSessionId(toolCall),
+    result: status === "failed" ? (antigravitySubagentOutput(toolCall) ?? null) : null,
     ...(launch === undefined ? { provisional: true } : {}),
   };
 };
@@ -297,7 +276,6 @@ export function makeAntigravityAcpAdapterFlavor(
       // Repair keeps state across updates, so each runtime must have one session-update handler.
       const reads = makeAntigravityReadRepair();
       const plans = makeAntigravityUpdateStepsPlans();
-      const subagents = makeAntigravitySubagentTracker(profileDirectory);
       // Served reads are reported from the read handler, so they take turns with agent updates.
       const updates = yield* Semaphore.make(1);
       let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
@@ -360,20 +338,12 @@ export function makeAntigravityAcpAdapterFlavor(
         prompt: (payload, promptOptions) =>
           Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
         handleSessionUpdate: (handler) => {
-          const project = (notification: Parameters<typeof handler>[0]) =>
-            subagents
-              .rewriteAndDrain(notification)
-              .pipe(
-                Effect.flatMap((notifications) =>
-                  Effect.forEach(notifications, handler, { discard: true }),
-                ),
-              );
-          projectUpdate = (notification) => updates.withPermit(project(notification));
+          projectUpdate = (notification) => updates.withPermit(handler(notification));
           return runtime.handleSessionUpdate((notification) =>
             updates.withPermit(
               Effect.suspend(() => {
                 const update = plans(reads.repair(notification));
-                return update === undefined ? Effect.void : project(update);
+                return update === undefined ? Effect.void : handler(update);
               }),
             ),
           );
@@ -513,6 +483,23 @@ export function makeAntigravityAcpAdapterFlavor(
               profileDirectory,
               rootSessionId: sessionId,
               toolCallIds: nativeTaskIds,
+            }),
+          readSubagentTranscript: ({
+            sessionId,
+            nativeTaskId,
+            childSessionId,
+            launch,
+            siblings,
+            finalize,
+          }) =>
+            readAntigravitySubagentTranscript({
+              profileDirectory,
+              rootSessionId: sessionId,
+              nativeTaskId,
+              childSessionId,
+              launch,
+              siblings,
+              finalize,
             }),
           hasPendingReply: (sessionId: string) =>
             readAntigravityPendingReply({

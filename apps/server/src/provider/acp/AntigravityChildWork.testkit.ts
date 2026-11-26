@@ -6,22 +6,14 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
-import {
-  type AntigravityChildLaunch,
-  MODEL_TIER_NAMES,
-  toAntigravitySubagentRawInput,
-} from "./AntigravityChildWork.ts";
+import { type AntigravityChildLaunch } from "./AntigravityChildWork.ts";
 
 export const ROOT = "7d40e54d-5977-4239-940b-246cdd81a12b";
 export const CHILD = "a357bf2720914589dd1ec49f7a816115";
 export const LAUNCH = { role: "Readme Reader", prompt: "Read README.md and report the marker" };
 
-const MODEL_TIER_VALUES: Readonly<Record<string, number>> = Object.fromEntries(
-  Object.entries(MODEL_TIER_NAMES).map(([id, name]) => [name, Number(id)]),
-);
-
 // Mirrors the 1.4.5 runtime: Step{5: metadata{4: tool call{1 id, 2 name}}, 20: planner{7: calls},
-// 143: invoke_subagent{9: specs{2 role, 3 prompt, 8 model_tier}, 10: results{1 conversation, 2 log uri}}}.
+// 143: invoke_subagent{9: specs{2 role, 3 prompt}, 10: results{1 conversation, 2 log uri}}}.
 const varint = (value: number): number[] => {
   const bytes: number[] = [];
   while (value >= 0x80) {
@@ -35,12 +27,7 @@ const field = (number: number, value: string | Uint8Array) => {
   return [...varint(number * 8 + 2), ...varint(bytes.length), ...bytes];
 };
 const proto = (...parts: number[][]) => Uint8Array.from(parts.flat());
-const toolCall = (id: string, argsJson?: string) =>
-  proto(
-    field(1, id),
-    field(2, "invoke_subagent"),
-    ...(argsJson !== undefined ? [field(3, argsJson)] : []),
-  );
+const toolCall = (id: string) => proto(field(1, id), field(2, "invoke_subagent"));
 
 export const commandTaskStep = (input: {
   readonly stepType?: 21 | 132;
@@ -60,117 +47,27 @@ export const commandTaskStep = (input: {
   );
 
 export const invokeStep = (input: {
-  readonly stepType?: 127 | 132;
   readonly callId: string;
   readonly launches: ReadonlyArray<AntigravityChildLaunch>;
   readonly children: ReadonlyArray<{ readonly id: string; readonly logUri: string }>;
-  readonly metadataArgsJson?: string;
-  readonly omitInvokePayload?: boolean;
-}) => {
-  const generic = input.stepType === 132;
-  const invoke = proto(
-    ...input.launches.map((launch) => {
-      const tier = launch.model === undefined ? undefined : MODEL_TIER_VALUES[launch.model];
-      return field(
-        generic ? 1 : 9,
-        proto(
-          field(1, "research"),
-          field(2, launch.role),
-          field(3, launch.prompt),
-          ...(generic && launch.model !== undefined
-            ? [field(12, launch.model)]
-            : tier === undefined
-              ? []
-              : [[...varint(8 * 8), ...varint(tier)]]),
-        ),
-      );
-    }),
-    ...input.children.map((child) =>
-      field(generic ? 2 : 10, proto(field(1, child.id), field(2, child.logUri))),
-    ),
-  );
-  return proto(
-    [...varint(1 * 8), ...varint(input.stepType ?? 127)],
-    field(5, proto(field(4, toolCall(input.callId, input.metadataArgsJson)))),
-    ...(input.omitInvokePayload
-      ? []
-      : [
-          generic
-            ? field(
-                140,
-                proto(
-                  field(
-                    2,
-                    proto(
-                      field(
-                        1,
-                        "Created the following subagent: {}\nThe subagent will send you a message when it has completed its task or requires guidance. There is no need to poll for its response.",
-                      ),
-                      field(
-                        6,
-                        proto(
-                          field(1, "type.googleapis.com/exa.cortex.core.tools.InvokeSubagent"),
-                          field(2, invoke),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              )
-            : field(143, invoke),
-        ]),
-  );
-};
-export const plannerStep = (
-  callIds: ReadonlyArray<
-    string | { readonly id: string; readonly launches?: ReadonlyArray<AntigravityChildLaunch> }
-  >,
-  options?: { readonly thought?: string },
-) =>
-  proto(
-    field(
-      20,
-      proto(
-        ...(options?.thought ? [field(3, options.thought)] : []),
-        ...callIds.map((entry) => {
-          const id = typeof entry === "string" ? entry : entry.id;
-          const launches = typeof entry === "string" ? undefined : entry.launches;
-          return field(
-            7,
-            toolCall(
-              id,
-              launches === undefined
-                ? undefined
-                : JSON.stringify(toAntigravitySubagentRawInput(launches)),
-            ),
-          );
-        }),
-      ),
-    ),
-  );
-
-export const agentReportStep = (input: {
-  readonly recipientSessionId?: string;
-  readonly senderConversationId: string;
-  readonly text: string;
 }) =>
   proto(
-    [...varint(1 * 8), ...varint(101)],
+    [...varint(1 * 8), ...varint(127)],
+    field(5, proto(field(4, toolCall(input.callId)))),
     field(
-      114,
+      143,
       proto(
-        field(3, "agent_message"),
-        field(
-          4,
-          proto(
-            ...(input.recipientSessionId ? [field(2, input.recipientSessionId)] : []),
-            field(3, input.senderConversationId),
-            field(4, input.text),
-          ),
+        ...input.launches.map((launch) =>
+          field(9, proto(field(1, "research"), field(2, launch.role), field(3, launch.prompt))),
+        ),
+        ...input.children.map((child) =>
+          field(10, proto(field(1, child.id), field(2, child.logUri))),
         ),
       ),
     ),
   );
+export const plannerStep = (callIds: ReadonlyArray<string>) =>
+  proto(field(20, proto(...callIds.map((id) => field(7, toolCall(id))))));
 
 export const transcriptLines = [
   // Trimmed from 1.4.5: the launch envelope around the prompt the parent record already holds.
