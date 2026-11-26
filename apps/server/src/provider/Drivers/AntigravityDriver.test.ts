@@ -327,7 +327,11 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         const plugin = h.path.join(h.userHome, ".gemini", "config", "plugins", "broken");
         yield* h.fs.makeDirectory(plugin, { recursive: true });
         yield* h.fs.writeFileString(h.path.join(plugin, "plugin.json"), "x".repeat(1_000_001));
+        const signIn = h.path.join(h.profileDirectory, "antigravity-acp");
+        yield* h.fs.makeDirectory(signIn, { recursive: true });
+        yield* h.fs.writeFileString(h.path.join(signIn, "antigravity-oauth-token"), "fixture");
         yield* h.refresh();
+        yield* h.instance.snapshot.refresh;
         const snapshot = yield* h.instance.snapshot.getSnapshot;
         expect(snapshot.status).toBe("ready");
         expect(snapshot.auth.status).toBe("authenticated");
@@ -342,6 +346,8 @@ it.layer(layerTest)("AntigravityDriver", (it) => {
         // Limits come from the official CLI's own `/usage` answer.
         expect(snapshot.usageLimits?.windows.map((window) => window.id)).toEqual(["gemini-weekly"]);
         expect(h.usageReads[0]?.args.slice(0, 2)).toEqual(["-p", "/usage"]);
+        // Print mode reads its login from HOME, so the read gets a home holding only this sign-in.
+        expect(h.usageReads[0]?.environment.HOME).toBe(h.usageReads[0]?.cwd);
         h.controls.selected = h.second;
         yield* h.refresh();
 

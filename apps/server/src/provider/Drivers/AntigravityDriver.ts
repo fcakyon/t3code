@@ -578,14 +578,17 @@ export const AntigravityDriver: ProviderDriver<
       // API keys carry no subscription quota, and agy refuses `/usage` for them.
       ...(auth.authMethod === "oauth-personal"
         ? {
-            probeUsage: readAntigravityUsageLimits(
-              fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-usage-" }).pipe(
-                Effect.flatMap((cwd) =>
-                  prepareSpawn(cwd, processEnvironment, installation.resolve),
+            probeUsage: readAntigravityUsageLimits({
+              signInFile: path.join(profileDirectory, "antigravity-acp", "antigravity-oauth-token"),
+              prepareSpawn: (home) =>
+                prepareSpawn(home, processEnvironment, installation.resolve).pipe(
+                  Effect.map(({ spawn }) => spawn),
                 ),
-                Effect.map(({ spawn }) => spawn),
-              ),
-            ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+            }).pipe(
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, path),
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            ),
           }
         : {}),
       auth: { type: auth.authMethod, label: antigravityAuthLabel(auth.authMethod) },

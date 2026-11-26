@@ -199,7 +199,8 @@ interface AntigravityProviderOptions {
     EffectAcpErrors.AcpError | ProviderSetupError
   >;
   readonly supportsTextGeneration: Effect.Effect<boolean>;
-  readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits>;
+  /** Reads nothing while the instance holds no sign-in. */
+  readonly probeUsage?: Effect.Effect<ServerProviderUsageLimits | undefined>;
   readonly maintenanceCapabilities?: ProviderMaintenanceCapabilities;
   readonly auth?: { readonly type: string; readonly label: string };
   /** Modes the last session advertised, saved because initialize alone does not report them. */
@@ -328,11 +329,8 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
               : `Antigravity did not respond to its local health check within ${timeoutMs / 1_000} seconds.`;
     const supportsTextGeneration =
       initialized !== undefined ? yield* options.supportsTextGeneration : false;
-    // A signed-out agy only waits for a sign-in, so it is not asked.
     const usageLimits =
-      options.probeUsage !== undefined &&
-      initialized !== undefined &&
-      before.draft.auth.status !== "unauthenticated"
+      options.probeUsage !== undefined && initialized !== undefined
         ? yield* options.probeUsage
         : undefined;
     const updatedAt = DateTime.formatIso(yield* DateTime.now);

@@ -8,12 +8,15 @@ import {
 } from "@t3tools/provider-core/server/usageLimits";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as ChildProcess from "effect/process/ChildProcess";
 
-// A signed-out agy waits for a sign-in until this passes, and a stalled request can outlast it.
+// agy 1.5.18 waits 60 seconds for a new sign-in whatever `--print-timeout` says, so only the hard
+// timeout ends the wait on a sign-in Google no longer accepts.
 const PRINT_TIMEOUT_SECONDS = 10;
 const HARD_TIMEOUT_MS = 20_000;
 const WINDOW_MINS: Record<string, number> = { "5h": 300, weekly: 10_080 };
@@ -73,35 +76,48 @@ export const antigravityUsageWindows = Effect.fn("antigravityUsageWindows")(func
 });
 
 /**
- * Read limits by asking the official CLI, the only reader Google allows: `/usage` in print mode
- * answers without a model turn. T3 never reads the sign-in or calls Google itself.
+ * Read limits from the official CLI: `/usage` in print mode answers without a model turn.
+ * Print mode ignores GEMINI_HOME and reads the login in `~/.gemini/antigravity-cli`, so a
+ * throwaway home linking only this instance's sign-in file makes agy answer for its account.
  */
-export const readAntigravityUsageLimits = Effect.fn("readAntigravityUsageLimits")(function* <E>(
-  prepareSpawn: Effect.Effect<
-    Pick<AcpSessionRuntime.AcpSpawnInput, "command" | "cwd" | "env">,
-    E,
-    Scope.Scope
-  >,
-) {
+export const readAntigravityUsageLimits = Effect.fn("readAntigravityUsageLimits")(function* <
+  E,
+>(input: {
+  readonly signInFile: string;
+  readonly prepareSpawn: (
+    home: string,
+  ) => Effect.Effect<Pick<AcpSessionRuntime.AcpSpawnInput, "command" | "env">, E, Scope.Scope>;
+}) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  // Without a sign-in agy only waits for one, so it is not asked.
+  if (!(yield* fileSystem.exists(input.signInFile).pipe(Effect.orElseSucceed(() => false)))) {
+    return undefined;
+  }
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
-  return yield* prepareSpawn.pipe(
-    Effect.flatMap((spawn) =>
-      spawnAndCollect(
+  return yield* Effect.gen(function* () {
+    const home = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-antigravity-usage-" });
+    const cliDirectory = path.join(home, ".gemini", "antigravity-cli");
+    yield* fileSystem.makeDirectory(cliDirectory, { recursive: true });
+    yield* fileSystem.symlink(
+      input.signInFile,
+      path.join(cliDirectory, path.basename(input.signInFile)),
+    );
+    const spawn = yield* input.prepareSpawn(home);
+    return yield* spawnAndCollect(
+      spawn.command,
+      ChildProcess.make(
         spawn.command,
-        ChildProcess.make(
-          spawn.command,
-          [
-            "-p",
-            "/usage",
-            "--output-format",
-            "json",
-            "--print-timeout",
-            `${PRINT_TIMEOUT_SECONDS}s`,
-          ],
-          { cwd: spawn.cwd, env: spawn.env, extendEnv: false, stdin: "ignore" },
-        ),
+        ["-p", "/usage", "--output-format", "json", "--print-timeout", `${PRINT_TIMEOUT_SECONDS}s`],
+        {
+          cwd: home,
+          env: { ...spawn.env, HOME: home, USERPROFILE: home },
+          extendEnv: false,
+          stdin: "ignore",
+        },
       ),
-    ),
+    );
+  }).pipe(
     Effect.scoped,
     Effect.timeout(HARD_TIMEOUT_MS),
     Effect.flatMap((result) => antigravityUsageWindows(result.stdout)),
