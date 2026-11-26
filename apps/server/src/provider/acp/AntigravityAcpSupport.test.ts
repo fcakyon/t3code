@@ -174,6 +174,9 @@ describe("Antigravity Auto", () => {
       });
       for (const t3Call of [
         request("Run mcp_t3-code_t3_thread_list?"),
+        // Deferred tools reach agy only through these two.
+        request("Run mcp_t3-code_tool_search"),
+        request("Run mcp_t3-code_tool_call"),
         request("MCP Tool delegate_task", { ServerName: "t3-code", ToolName: "delegate_task" }),
       ]) {
         expect(antigravityPermissionDisposition(policy, t3Call)).toBe("allow");
@@ -191,6 +194,7 @@ describe("Antigravity Auto", () => {
         // Names no server, so another MCP server's tool of the same name looks identical.
         request("Running preview_status"),
         request("Run mcp_github_create_issue"),
+        request("Run mcp_t3-code_not_a_t3_tool"),
         request("MCP Tool preview_status", { ServerName: "other", ToolName: "preview_status" }),
         request("Run mcp_t3-code_preview_status", {
           CommandLine: "Run mcp_t3-code_preview_status",
