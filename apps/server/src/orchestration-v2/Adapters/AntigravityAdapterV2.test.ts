@@ -755,7 +755,7 @@ describe("AntigravityAdapterV2 client file system", () => {
         readTextFile: true,
         writeTextFile: false,
       });
-      assert.equal(initialize?.params?.clientInfo?.name, "zed");
+      assert.equal(initialize?.params?.clientInfo?.name, "t3-code");
       assert.isUndefined(writeTextFile);
       if (readTextFile === undefined) {
         return yield* Effect.die("Antigravity sessions must serve client file reads");
@@ -3428,7 +3428,6 @@ describe("AntigravityAdapterV2 subagent reads", () => {
         makeRuntime: (runtimeInput) =>
           makeAntigravityAcpRuntime({
             ...runtimeInput,
-            runtimeVersion: "1.5.9",
             childProcessSpawner,
             spawn: {
               command: process.execPath,
@@ -3839,7 +3838,7 @@ describe("AntigravityAdapterV2 runtime mode ceiling", () => {
 });
 
 describe("AntigravityAdapterV2 session system prompt", () => {
-  it.effect.each(["1.5.0"])(
+  it.effect.each(["1.5.1"])(
     "carries PR linking once per turn on %s, which does not advertise a system prompt append",
     (agentVersion) =>
       Effect.gen(function* () {

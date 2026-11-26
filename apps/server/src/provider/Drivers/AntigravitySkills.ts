@@ -59,6 +59,26 @@ const decodeSkillsConfig = Schema.decodeUnknownOption(
     }),
   ),
 );
+// agy reads only the first manifest present, and skips the plugin when that one does not parse.
+const PLUGIN_MANIFEST_PATHS = [
+  [".antigravity-plugin", "plugin.json"],
+  [".gemini-plugin", "plugin.json"],
+  ["plugin.json"],
+] as const;
+// agy ignores `skills` in an Agent Plugins manifest while its enable-agent-plugins-spec flag is on.
+const AGENT_PLUGINS_SCHEMA_PREFIX = "https://agent-plugins.org/schemas/";
+const decodePluginManifest = Schema.decodeUnknownOption(
+  // agy decodes like Go's encoding/json, so null leaves the default and a string is invalid.
+  Schema.fromJsonString(
+    Schema.Struct({
+      disabled: Schema.optional(Schema.NullOr(Schema.Boolean)),
+      $schema: Schema.optional(Schema.Unknown),
+      skills: Schema.optional(
+        Schema.NullOr(Schema.Union([Schema.String, Schema.Array(Schema.String)])),
+      ),
+    }),
+  ),
+);
 const decodePluginPreferences = Schema.decodeUnknownOption(
   // agy decodes like Go's encoding/json, so a null entry leaves that plugin's default.
   Schema.fromJsonString(
@@ -70,12 +90,6 @@ const decodePluginPreferences = Schema.decodeUnknownOption(
         ),
       ),
     }),
-  ),
-);
-const decodePluginManifest = Schema.decodeUnknownOption(
-  // agy decodes like Go's encoding/json, so null leaves the default and a string is invalid.
-  Schema.fromJsonString(
-    Schema.Struct({ disabled: Schema.optional(Schema.NullOr(Schema.Boolean)) }),
   ),
 );
 
@@ -150,30 +164,47 @@ const readAntigravityPluginPreferences = Effect.fn("readAntigravityPluginPrefere
   );
 });
 
-/** agy skips a plugin folder without one of these manifests, or whose manifest is not valid JSON. */
-const ANTIGRAVITY_PLUGIN_MANIFESTS = [
-  "plugin.json",
-  ".antigravity-plugin/plugin.json",
-  ".gemini-plugin/plugin.json",
-] as const;
-
-const readAntigravityPluginManifest = Effect.fn("readAntigravityPluginManifest")(
-  function* (pluginDirectory: string) {
-    const path = yield* Path.Path;
-    for (const manifest of ANTIGRAVITY_PLUGIN_MANIFESTS) {
-      const text = yield* readAntigravityBoundedFile(path.join(pluginDirectory, manifest));
-      if (text === undefined) continue;
-      const decoded = decodePluginManifest(text);
-      return decoded._tag === "Some" ? { disabled: decoded.value.disabled === true } : undefined;
+const readAntigravityPluginManifest = Effect.fn("readAntigravityPluginManifest")(function* (
+  pluginDirectory: string,
+  budget?: ScanBudget,
+): Effect.fn.Return<
+  { readonly disabled: boolean; readonly skillPaths: ReadonlyArray<string> } | undefined,
+  AntigravitySkillsProbeError,
+  FileSystem.FileSystem | Path.Path
+> {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  // agy reads only the first manifest present, and skips the plugin when that one does not parse.
+  for (const segments of PLUGIN_MANIFEST_PATHS) {
+    const manifestPath = path.join(pluginDirectory, ...segments);
+    const info = yield* readIfPresent(fileSystem.stat(manifestPath), manifestPath);
+    if (info?.type !== "File") continue;
+    // An oversized manifest cannot be valid JSON for agy either, so only that plugin is skipped.
+    if (info.size > BigInt(MAX_SKILL_BYTES)) return undefined;
+    if (budget !== undefined && info.size > BigInt(budget.remainingBytes)) {
+      return yield* new AntigravitySkillsProbeError({
+        reason: "scan-budget-exhausted",
+        path: manifestPath,
+      });
     }
-    return undefined;
-  },
-  // An oversized manifest cannot be valid JSON for agy either, so only that plugin is skipped.
-  Effect.catchIf(
-    (error) => error.reason === "scan-budget-exhausted",
-    () => Effect.undefined,
-  ),
-);
+    const raw = yield* readIfPresent(fileSystem.readFileString(manifestPath), manifestPath);
+    if (raw === undefined) return undefined;
+    if (budget !== undefined) {
+      budget.remainingBytes -= Buffer.byteLength(raw, "utf8");
+    }
+    const decoded = decodePluginManifest(raw.replace(/^\uFEFF/, ""));
+    if (decoded._tag === "None") return undefined;
+    const { $schema, skills, disabled } = decoded.value;
+    const skillPaths =
+      typeof $schema === "string" && $schema.startsWith(AGENT_PLUGINS_SCHEMA_PREFIX)
+        ? []
+        : (typeof skills === "string" ? [skills] : (skills ?? [])).map((entry) =>
+            path.resolve(pluginDirectory, entry),
+          );
+    return { disabled: disabled === true, skillPaths };
+  }
+  return undefined;
+});
 
 /**
  * A plugin shipping `"disabled": true` loads only when config.json enables it by folder name, and
@@ -190,22 +221,31 @@ const isAntigravityPluginEnabled = (
 /** Enabled plugins in the user's ~/.gemini, by name, that a profile links and agy then loads. */
 export const readAntigravityUserPlugins = Effect.fn("readAntigravityUserPlugins")(function* (
   userHome: string,
+  budget?: ScanBudget,
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const pluginsDirectory = path.join(userHome, ".gemini", "config", "plugins");
   const plugins = new Map<
     string,
-    { readonly directory: string; readonly disabledByDefault: boolean }
+    {
+      readonly directory: string;
+      readonly disabledByDefault: boolean;
+      readonly skillPaths: ReadonlyArray<string>;
+    }
   >();
   const names = yield* readIfPresent(fileSystem.readDirectory(pluginsDirectory), pluginsDirectory);
   for (const name of names?.toSorted() ?? []) {
     const directory = path.join(pluginsDirectory, name);
     const info = yield* readIfPresent(fileSystem.stat(directory), directory);
     if (info?.type !== "Directory") continue;
-    const manifest = yield* readAntigravityPluginManifest(directory);
+    const manifest = yield* readAntigravityPluginManifest(directory, budget);
     if (manifest === undefined) continue;
-    plugins.set(name, { directory, disabledByDefault: manifest.disabled });
+    plugins.set(name, {
+      directory,
+      disabledByDefault: manifest.disabled,
+      skillPaths: manifest.skillPaths,
+    });
   }
   if (plugins.size === 0) return plugins;
   const preferences = yield* readAntigravityPluginPreferences(
@@ -220,23 +260,26 @@ export const readAntigravityUserPlugins = Effect.fn("readAntigravityUserPlugins"
 });
 
 /** Plugins agy loads from the profile once its next launch relinks the enabled user plugins. */
-export const readAntigravityPlugins = Effect.fn("readAntigravityPlugins")(function* (input: {
-  readonly profileDirectory: string;
-  readonly userHome: string;
-}) {
+export const readAntigravityPlugins = Effect.fn("readAntigravityPlugins")(function* (
+  input: {
+    readonly profileDirectory: string;
+    readonly userHome: string;
+  },
+  budget?: ScanBudget,
+) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const pluginsDirectory = path.join(input.profileDirectory, "config", "plugins");
   const userPluginsDirectory = path.join(input.userHome, ".gemini", "config", "plugins");
   // The profile linker carries a user's enabled override for a plugin that ships disabled.
   const plugins = new Map(
-    [...(yield* readAntigravityUserPlugins(input.userHome))].map(([name, plugin]) => [
+    [...(yield* readAntigravityUserPlugins(input.userHome, budget))].map(([name, plugin]) => [
       name,
-      { directory: plugin.directory, disabledByDefault: false },
+      { directory: plugin.directory, disabledByDefault: false, skillPaths: plugin.skillPaths },
     ]),
   );
   const names = yield* readIfPresent(fileSystem.readDirectory(pluginsDirectory), pluginsDirectory);
-  for (const name of names ?? []) {
+  for (const name of names?.toSorted() ?? []) {
     const pluginDirectory = path.join(pluginsDirectory, name);
     const target = yield* fileSystem.readLink(pluginDirectory).pipe(
       Effect.map((value) => path.resolve(pluginsDirectory, value)),
@@ -245,12 +288,19 @@ export const readAntigravityPlugins = Effect.fn("readAntigravityPlugins")(functi
     // Profile preparation replaces its links into the user's plugins, so those come from above.
     if (target !== undefined && path.dirname(target) === userPluginsDirectory) continue;
     const info = yield* readIfPresent(fileSystem.stat(pluginDirectory), pluginDirectory);
-    if (info?.type !== "Directory") continue;
-    // Profile folders count without a manifest, as they did before user plugins were linked.
-    const manifest = yield* readAntigravityPluginManifest(pluginDirectory);
+    if (info?.type !== "Directory") {
+      plugins.delete(name);
+      continue;
+    }
+    const manifest = yield* readAntigravityPluginManifest(pluginDirectory, budget);
+    if (manifest === undefined) {
+      plugins.delete(name);
+      continue;
+    }
     plugins.set(name, {
       directory: pluginDirectory,
-      disabledByDefault: manifest?.disabled === true,
+      disabledByDefault: manifest.disabled,
+      skillPaths: manifest.skillPaths,
     });
   }
   if (plugins.size === 0) return [];
@@ -262,7 +312,11 @@ export const readAntigravityPlugins = Effect.fn("readAntigravityPlugins")(functi
       isAntigravityPluginEnabled(plugin.disabledByDefault, preferences, name),
     )
     .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-    .map(([, plugin]) => plugin.directory);
+    .map(([name, plugin]) => ({
+      name,
+      directory: plugin.directory,
+      skillPaths: plugin.skillPaths,
+    }));
 });
 
 function parseSkillFrontmatter(contents: string, fileName: string) {
@@ -579,14 +633,17 @@ export const discoverAntigravitySkills = Effect.fn("discoverAntigravitySkills")(
     );
   }
 
-  for (const pluginDirectory of yield* readAntigravityPlugins(input)) {
+  for (const plugin of yield* readAntigravityPlugins(input, budget)) {
     yield* scanDirectory(
-      path.join(pluginDirectory, "skills"),
+      path.join(plugin.directory, "skills"),
       "user",
       "directory",
       EMPTY_SKILL_FILTER,
-      path.basename(pluginDirectory),
+      plugin.name,
     );
+    for (const skillPath of plugin.skillPaths) {
+      yield* scanDirectory(skillPath, "user", "manifest", EMPTY_SKILL_FILTER, plugin.name);
+    }
   }
   return [...skillsByName.values()].sort((left, right) => left.name.localeCompare(right.name));
 });

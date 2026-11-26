@@ -684,7 +684,7 @@ it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
         });
         // agy links the user's plugins into the profile after this check, so both must pass.
         for (const [config, manifest] of [
-          [path.join(fixture.profileDirectory, "config"), undefined],
+          [path.join(fixture.profileDirectory, "config"), '{"name":"p"}'],
           [path.join(fixture.userHome, ".gemini", "config"), '{"name":"p"}'],
         ] as const) {
           const plugin = path.join(config, "plugins", "p");

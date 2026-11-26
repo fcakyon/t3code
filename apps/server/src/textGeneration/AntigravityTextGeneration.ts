@@ -79,7 +79,7 @@ export const isAntigravityTextGenerationAvailable = Effect.fn(
   // agy 1.5.12 reads plugin hooks and MCP servers only from these files at the plugin root.
   const directories = [
     path.join(input.profileDirectory, "config"),
-    ...(yield* readAntigravityPlugins(input)),
+    ...(yield* readAntigravityPlugins(input)).map((plugin) => plugin.directory),
   ];
   for (const directory of directories) {
     for (const name of ["hooks.json", "mcp_config.json"]) {
