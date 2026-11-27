@@ -53,6 +53,7 @@ import {
 } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
+  antigravityApprovalPrompt,
   antigravitySwarmAddChildSessionId,
   antigravitySwarmAddModel,
   antigravityToolOutlivesPrompt,
@@ -454,6 +455,7 @@ export function makeAntigravityAcpAdapterFlavor(
     },
     permissionDisposition: antigravityPermissionDisposition,
     approvalOptions: antigravityApprovalOptions,
+    approvalPrompt: antigravityApprovalPrompt,
     extractPermissionQuestion: (request) => {
       const question = extractAntigravityUserInputQuestion(request);
       if (question === undefined) return undefined;

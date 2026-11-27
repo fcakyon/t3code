@@ -9,6 +9,7 @@ Active fork-only features, fixes, and release infrastructure on `nightly` (relat
 - fix: Let Antigravity sessions read a linked git worktree's backing gitdir, also from subdirectories, after checking its backlink ([pingdotgg/t3code#39078](https://github.com/pingdotgg/t3code/pull/39078))
 - fix: Link enabled global Antigravity plugins from `~/.gemini/config/plugins` into each instance profile, so their skills, hooks and MCP servers load in T3 threads, replacing the earlier skills-only catalog ([pingdotgg/t3code#39082](https://github.com/pingdotgg/t3code/pull/39082))
 - fix: Keep delegation available in Antigravity and let it find and call other T3 tools in the same turn, without asking in Auto and Auto-accept edits for the `tool_search` and `tool_call` calls that carry them ([pingdotgg/t3code#39362](https://github.com/pingdotgg/t3code/pull/39362))
+- fix: Show the shell command and working directory in Antigravity approval requests.
 - fix: Allow read-only Antigravity requests without prompting in Auto ([pingdotgg/t3code#40127](https://github.com/pingdotgg/t3code/issues/40127))
 - fix: Show managed Antigravity updates beside the provider version in Settings ([`53de663bb1`](https://github.com/fcakyon/t3code/commit/53de663bb1))
 - fix: Resolve and propagate Antigravity subagent model selection (inherited parent model/options and tier overrides) ([`3d2bb2a109`](https://github.com/fcakyon/t3code/commit/3d2bb2a109))

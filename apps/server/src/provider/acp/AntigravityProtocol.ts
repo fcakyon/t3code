@@ -32,7 +32,7 @@ import {
 
 const TOOL_TEXT_LIMIT = 8_000;
 const TOOL_TEXT_TRUNCATED = "[Earlier output truncated]\n\n";
-const COMMAND_LINE_TRUNCATED = "\n\n[Command truncated]";
+const COMMAND_LINE_TRUNCATED = "\n\n[Command truncated]\n\n";
 const QUESTION_LABEL_LIMIT = 512;
 
 const NativeToolFields = Schema.Struct({
@@ -242,16 +242,13 @@ function boundCommandText(text: string, limit = TOOL_TEXT_LIMIT): string {
   return copyBoundedText(`${TOOL_TEXT_TRUNCATED}${tail}`);
 }
 
-// A command line's program and target are at its start, so it keeps its head.
+// An ID-only approval uses this copy. Keep the program and the final shell clause.
 function boundCommandLine(text: string, limit = TOOL_TEXT_LIMIT): string {
-  if (
-    text.length <= limit ||
-    (text.length <= limit + COMMAND_LINE_TRUNCATED.length && text.endsWith(COMMAND_LINE_TRUNCATED))
-  ) {
-    return text;
-  }
-  const head = text.slice(0, limit).replace(/[\uD800-\uDBFF]$/u, "");
-  return copyBoundedText(`${head}${COMMAND_LINE_TRUNCATED}`);
+  if (text.length <= limit) return text;
+  const keep = Math.max(0, limit - COMMAND_LINE_TRUNCATED.length);
+  const head = text.slice(0, Math.ceil(keep / 2)).replace(/[\uD800-\uDBFF]$/u, "");
+  const tail = text.slice(text.length - Math.floor(keep / 2)).replace(/^[\uDC00-\uDFFF]/u, "");
+  return copyBoundedText(`${head}${COMMAND_LINE_TRUNCATED}${tail}`);
 }
 
 const COMMAND_LINE_FIELDS = new Set(["CommandLine", "command_line", "commandLine", "command"]);
@@ -799,29 +796,36 @@ function announcedEditDiff(
   };
 }
 
+function antigravityCommandInput(rawInput: unknown) {
+  const input = Option.getOrUndefined(decodeNativeToolFields(rawInput));
+  return {
+    command: input?.CommandLine ?? input?.command_line ?? input?.commandLine ?? input?.command,
+    cwd:
+      input?.Cwd ??
+      input?.WorkingDirectory ??
+      input?.working_dir ??
+      input?.workingDir ??
+      input?.cwd,
+  };
+}
+
+export function antigravityApprovalPrompt({ toolCall }: EffectAcpSchema.RequestPermissionRequest) {
+  if (toolCall.kind !== "execute") return undefined;
+  const { command, cwd } = antigravityCommandInput(toolCall.rawInput);
+  if (!command?.trim()) return undefined;
+  return cwd?.trim() ? `${cwd}\n$ ${command}` : command;
+}
+
 export function normalizeAntigravityToolCall(
   toolCall: AcpToolCallState,
   readPreEditFile = readAntigravityPreEditFile,
 ): AcpToolCallState {
-  const input = Option.getOrUndefined(decodeNativeToolFields(toolCall.data.rawInput));
+  const input = antigravityCommandInput(toolCall.data.rawInput);
   const output = Option.getOrUndefined(decodeNativeToolFields(toolCall.data.rawOutput));
   const nativeCommand =
-    input?.CommandLine ??
-    input?.command_line ??
-    input?.commandLine ??
-    input?.command ??
-    output?.commandLine ??
-    output?.command_line ??
-    toolCall.command;
+    input.command ?? output?.commandLine ?? output?.command_line ?? toolCall.command;
   const command = nativeCommand?.trim() ? boundCommandLine(nativeCommand.trim()) : undefined;
-  const nativeCwd =
-    input?.Cwd ??
-    input?.WorkingDirectory ??
-    input?.working_dir ??
-    input?.workingDir ??
-    input?.cwd ??
-    output?.workingDir ??
-    output?.working_dir;
+  const nativeCwd = input.cwd ?? output?.workingDir ?? output?.working_dir;
   const cwd = nativeCwd?.trim() ? boundText(nativeCwd.trim()) : undefined;
   const nativeOutput = output?.combinedOutput ?? output?.combined_output;
   const aggregatedOutput = nativeOutput === undefined ? undefined : boundCommandText(nativeOutput);

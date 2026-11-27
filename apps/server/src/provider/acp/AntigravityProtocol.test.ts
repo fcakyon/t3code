@@ -761,14 +761,15 @@ describe("Antigravity tool results", () => {
     const tail = `${"x".repeat(7_982)}build completed\r\n`;
     const output = `Command output:\nprefix\r\n🚀${tail}`;
     const expected = `[Earlier output truncated]\n\n${tail}`;
-    const head = "x".repeat(7_999);
-    const expectedCommand = `${head}\n\n[Command truncated]`;
+    const head = "x".repeat(3_988);
+    const commandTail = "y".repeat(3_986) + "!";
+    const expectedCommand = `${head}\n\n[Command truncated]\n\n${commandTail}`;
     const toolCall = normalizeAntigravityToolCall(
       parseToolUpdate({
         ...commandCompleted,
         update: {
           ...commandCompleted.update,
-          rawInput: { CommandLine: `${head}🚀 --flag` },
+          rawInput: { CommandLine: `${head}🚀 omitted command arguments 🚀${commandTail}` },
           rawOutput: { output, exit_code: 0 },
           content: [{ type: "content", content: { type: "text", text: output } }],
         },

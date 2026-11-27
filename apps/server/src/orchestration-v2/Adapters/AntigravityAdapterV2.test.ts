@@ -1705,6 +1705,7 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
   steering?: { readonly agentVersion: string; readonly holdsFirstPrompt: boolean },
   options?: {
     readonly profileDirectory?: string;
+    readonly runtimeMode?: ProviderAdapter.ProviderAdapterV2RuntimePolicy["runtimeMode"];
     readonly initialToolCalls?: ReadonlyArray<EffectAcpSchema.SessionUpdate>;
   },
 ) {
@@ -1840,7 +1841,7 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
           },
         });
   const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
-    runtimeMode: "full-access",
+    runtimeMode: options?.runtimeMode ?? "full-access",
     interactionMode: "default",
     cwd: process.cwd(),
   });
@@ -1881,7 +1882,7 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
         title: "Antigravity wake",
         providerInstanceId: instanceId,
         modelSelection,
-        runtimeMode: "full-access",
+        runtimeMode: runtimePolicy.runtimeMode,
         interactionMode: "default",
         branch: null,
         worktreePath: process.cwd(),
@@ -1950,6 +1951,40 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
 });
 
 describe("AntigravityAdapterV2 work after the prompt ends", () => {
+  it.effect("shows the tracked command and directory on a native approval", () =>
+    Effect.gen(function* () {
+      const line = "openship domain add -p project quiz.example.com";
+      const { command, startTurn, throughPromptSettled, requestPermission, until } =
+        yield* openSessionWithRunningCommand(
+          { CommandLine: line, Cwd: "/repo" },
+          undefined,
+          undefined,
+          {
+            runtimeMode: "approval-required",
+          },
+        );
+      yield* startTurn(1, false);
+      yield* throughPromptSettled;
+      yield* requestPermission(
+        {
+          sessionId: "mock-session-1",
+          toolCall: { toolCallId: command.toolCallId, title: "Ran command" },
+          options: [{ optionId: "allow", name: "Allow once", kind: "allow_once" }],
+        },
+        { requestId: "approve-command", method: "session/request_permission" },
+      ).pipe(Effect.forkScoped);
+      const event = (yield* until(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "approval_request",
+      )).at(-1);
+      assert.equal(
+        event?.type === "turn_item.updated" &&
+          event.turnItem.type === "approval_request" &&
+          event.turnItem.prompt,
+        `/repo\n$ ${line}`,
+      );
+    }).pipe(Effect.provide(layerSession)),
+  );
+
   // agy sets `IsDaemon` on a command it does not wait for. When it exits, the agent replies
   // with no prompt open.
   it.effect("continues in one run when a finished daemon wakes the agent", () =>

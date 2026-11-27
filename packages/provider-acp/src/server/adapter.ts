@@ -595,6 +595,9 @@ export interface AcpAdapterV2Flavor {
     policy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
     request: EffectAcpSchema.RequestPermissionRequest,
   ) => AcpPermissionDisposition;
+  readonly approvalPrompt?: (
+    request: EffectAcpSchema.RequestPermissionRequest,
+  ) => string | undefined;
   readonly approvalOptions?: (
     request: EffectAcpSchema.RequestPermissionRequest,
   ) => ReadonlyArray<ProviderApprovalOption>;
@@ -7452,6 +7455,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         ) {
           yield* closeTextStreams(context);
           const parsed = parsePermissionRequest(params);
+          const prompt = flavor.approvalPrompt?.(params) ?? parsed.detail;
           const approvalOptions = flavor.approvalOptions?.(params);
           const nativeRequestId = params.toolCall.toolCallId;
           const requestId = yield* idAllocator.allocate.runtimeRequest({
@@ -7526,7 +7530,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             type: "approval_request",
             requestId,
             requestKind,
-            ...(parsed.detail === undefined ? {} : { prompt: parsed.detail }),
+            ...(prompt === undefined ? {} : { prompt }),
             ...(approvalOptions === undefined ? {} : { options: approvalOptions }),
           };
           yield* Ref.update(pendingRuntimeRequests, (current) => {
