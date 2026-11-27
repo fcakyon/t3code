@@ -701,8 +701,11 @@ describe("AntigravityAdapterV2 client file system", () => {
       const outside = yield* fileSystem.makeTempDirectoryScoped({
         prefix: "t3-antigravity-outside-",
       });
-      const gitDir = path.join(outside, "worktrees", "linked");
+      const sharedGitDir = path.join(outside, "repo", ".git");
+      const gitDir = path.join(sharedGitDir, "worktrees", "linked");
       yield* fileSystem.makeDirectory(gitDir, { recursive: true });
+      yield* fileSystem.writeFileString(path.join(sharedGitDir, "config"), "[core]\n");
+      yield* fileSystem.writeFileString(path.join(gitDir, "commondir"), "../..\n");
       yield* fileSystem.writeFileString(
         path.join(workspace, ".git"),
         `gitdir: ${path.relative(workspace, gitDir)}\n`,
@@ -767,6 +770,11 @@ describe("AntigravityAdapterV2 client file system", () => {
         context("fs/read_text_file"),
       );
       assert.equal(linkedHead.content, "ref: refs/heads/linked\n");
+      const sharedConfig = yield* readTextFile(
+        { sessionId: "mock-session-1", path: path.join(sharedGitDir, "config") },
+        context("fs/read_text_file"),
+      ).pipe(Effect.flip);
+      assert.match(sharedConfig.message, /outside the session workspace/);
 
       const insidePath = path.join(workspace, "src", "inside.ts");
       yield* fileSystem.makeDirectory(path.dirname(insidePath), { recursive: true });

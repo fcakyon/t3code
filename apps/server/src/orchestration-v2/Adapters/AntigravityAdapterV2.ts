@@ -44,6 +44,7 @@ import {
   readAntigravitySubagentTranscript,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import {
+  type ClientFileRoot,
   readAntigravityClientTextFile,
   resolveGitWorktreeDirectory,
 } from "../../provider/acp/AntigravityClientFiles.ts";
@@ -252,7 +253,7 @@ export function makeAntigravityAcpAdapterFlavor(
   const { fileSystem, path, profileDirectory } = options;
   const commandTasks = makeAntigravityCommandTaskTracker(profileDirectory);
   const antigravityClientFileRoots = Effect.fn("AntigravityAdapterV2.antigravityClientFileRoots")(
-    function* (cwd: string | null) {
+    function* (cwd: string | null): Effect.fn.Return<ReadonlyArray<ClientFileRoot>> {
       const { attachmentsDir } = options.host.paths;
       if (cwd === null) return [attachmentsDir];
       const worktreeGitDir = yield* resolveGitWorktreeDirectory({ fileSystem, path, cwd });
