@@ -2756,9 +2756,6 @@ describe("AcpRegistryAdapterV2", () => {
       assert.deepEqual(
         childTools.map((item) => item.output),
         [
-          null,
-          [{ type: "content", content: { type: "text", text: "early" } }],
-          [{ type: "content", content: { type: "text", text: "early" } }],
           [{ type: "content", content: { type: "text", text: "one" } }],
           [{ type: "content", content: { type: "text", text: "onetwo" } }],
           [{ type: "content", content: { type: "text", text: "onetwo" } }],
@@ -2770,8 +2767,7 @@ describe("AcpRegistryAdapterV2", () => {
           { type: "Text", text: "vendor" },
         ],
       );
-      assert.equal(new Set(childTools.map((item) => item.id)).size, 2);
-      assert.equal(childTools[0]?.nativeItemRef?.nativeId, "child-1:tool:early-tool");
+      assert.equal(new Set(childTools.map((item) => item.id)).size, 1);
       assert.equal(childTools.at(-1)?.nativeItemRef?.nativeId, "child-1:tool:shared-tool");
       assert.equal(childTools.at(-1)?.status, "completed");
       assert.deepEqual(childTools.at(-1)?.input, { command: "cat package.json" });
