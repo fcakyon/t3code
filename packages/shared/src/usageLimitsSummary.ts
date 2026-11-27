@@ -40,8 +40,9 @@ export function collectUsageLimitsSummary(
         windows: account.limits.windows,
       })),
       windows: displayLimitWindows(pool).map(
-        ({ members: _members, columns: _columns, resets, ...window }) => ({
+        ({ members: _members, columns: _columns, paceRemainingPercent, resets, ...window }) => ({
           ...window,
+          evenPaceRemainingPercent: paceRemainingPercent,
           resets: resets.map(({ at, restoresPercent }) => ({
             at: DateTime.formatIso(DateTime.makeUnsafe(at)),
             restoresPercent,

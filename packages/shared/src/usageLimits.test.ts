@@ -1097,7 +1097,7 @@ describe("pools", () => {
       usedPercent: 60,
       pace: "under",
       paceMarginPoints: 10,
-      evenPaceRemainingPercent: 30,
+      paceRemainingPercent: 30,
     });
     expect(
       session?.resets.map((reset) => [reset.member.account.key, reset.restoresPercent]),
@@ -1212,6 +1212,7 @@ describe("usage summary", () => {
       evenPaceRemainingPercent: 40,
       pace: "under",
     });
+    expect(summary.pools[0]?.windows[0]).not.toHaveProperty("paceRemainingPercent");
     expect(summary.notices).toEqual([]);
     const hubSummary = collectUsageLimitsSummary(
       environmentId,
@@ -1410,7 +1411,7 @@ describe("pooled account columns", () => {
         remainingPercent: 0,
         pace: null,
         paceMarginPoints: null,
-        evenPaceRemainingPercent: null,
+        paceRemainingPercent: null,
         resets: [],
       });
       expect(pool!.windows[0]!.columns.map((column) => column.window?.resetsAt)).toEqual([

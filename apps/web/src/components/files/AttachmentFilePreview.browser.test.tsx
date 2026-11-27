@@ -73,6 +73,8 @@ vi.mock(import("./office/WordDocument"), async () => {
 });
 
 import { __setClientSettingsForTests, getClientSettings } from "~/hooks/useSettings";
+import { refreshTheme, setAppearanceMode } from "~/hooks/useTheme";
+import { THEME_APPEARANCE_MODE_STORAGE_KEY } from "~/themePalette";
 import { AttachmentFilePreview } from "./AttachmentFilePreview";
 import LargeTextViewer from "./LargeTextViewer";
 import VirtualTablePreview from "./VirtualTablePreview";
@@ -567,6 +569,35 @@ describe("bounded binary previews", () => {
       expect(buttons.map((button) => button.textContent)).toEqual(["foo.txt", "foo.txt"]);
       await act(() => buttons[1]!.click());
       await vi.waitFor(() => expect(screen.container.textContent).toContain("root file"), 10_000);
+    } finally {
+      URL.revokeObjectURL(src);
+    }
+  });
+
+  it("opens extensionless UTF-8 text archive entries while rejecting binary ones", async () => {
+    const bytes = await new JSZip()
+      .file("CHANGELOG", "Release 1.2.3 notes")
+      .file("firmware", new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x01]))
+      .generateAsync({ type: "arraybuffer" });
+    const src = URL.createObjectURL(new Blob([bytes]));
+    try {
+      await using screen = await render(<BinaryViewer src={src} name="pkg.zip" kind="archive" />);
+      await vi.waitFor(
+        () => expect(screen.container.querySelectorAll("tbody button")).toHaveLength(2),
+        10_000,
+      );
+      await screen.getByRole("button", { name: "CHANGELOG" }).click();
+      await vi.waitFor(
+        () => expect(screen.container.textContent).toContain("Release 1.2.3 notes"),
+        10_000,
+      );
+      await screen.getByRole("button", { name: "Back to archive" }).click();
+      await screen.getByRole("button", { name: "firmware" }).click();
+      await vi.waitFor(() =>
+        expect(screen.container.querySelector('[role="alert"]')?.textContent).toContain(
+          "Only UTF-8 text and images can be opened inside an archive.",
+        ),
+      );
     } finally {
       URL.revokeObjectURL(src);
     }
@@ -1696,6 +1727,18 @@ it.each(["archive", "sqlite"] as const)(
 );
 
 it("loads a font attachment through the lazy preview", async () => {
+  const previousAppearanceMode = window.localStorage.getItem(THEME_APPEARANCE_MODE_STORAGE_KEY);
+  using _theme = {
+    [Symbol.dispose]() {
+      if (previousAppearanceMode === null) {
+        window.localStorage.removeItem(THEME_APPEARANCE_MODE_STORAGE_KEY);
+      } else {
+        window.localStorage.setItem(THEME_APPEARANCE_MODE_STORAGE_KEY, previousAppearanceMode);
+      }
+      refreshTheme();
+    },
+  };
+  setAppearanceMode("light");
   const { loadBundledFontBytes, resolveBundledFamilyFace } = await import("@betteroffice/fonts");
   const bytes = await loadBundledFontBytes(resolveBundledFamilyFace("Carlito", false, false)!);
   const file = new Blob([bytes], { type: "font/ttf" });
@@ -1717,6 +1760,18 @@ it("loads a font attachment through the lazy preview", async () => {
     },
     { timeout: 10_000 },
   );
+  const rootBackground = () =>
+    getComputedStyle(document.documentElement).getPropertyValue("--background");
+  const frameBackground = () =>
+    screen.container.querySelector("iframe")?.srcdoc.match(/background:([^;}]+)/)?.[1];
+  const lightBackground = rootBackground();
+  expect(frameBackground()).toBe(lightBackground);
+  await act(() => {
+    setAppearanceMode("dark");
+  });
+  const darkBackground = rootBackground();
+  expect(darkBackground).not.toBe(lightBackground);
+  await vi.waitFor(() => expect(frameBackground()).toBe(darkBackground));
   expect(screen.container.querySelector('[role="alert"]')).toBeNull();
 });
 
@@ -2132,12 +2187,15 @@ it.each([
   expect(new DOMParser().parseFromString(html, "text/html").body.textContent).toBe(expected);
 });
 
-it.each(["odt", "odp"] as const)("preserves rendered %s spaces and tabs", async (kind) => {
+it.each(["odt", "odp", "rtf"] as const)("preserves rendered %s spaces and tabs", async (kind) => {
   const archive = new JSZip().file(
     "content.xml",
     `<office:document>${kind === "odt" ? "<office:text>" : "<draw:page>"}<text:p>A<text:s text:c="3"/>B<text:tab/>C</text:p>${kind === "odt" ? "</office:text>" : "</draw:page>"}</office:document>`,
   );
-  const bytes = await archive.generateAsync({ type: "arraybuffer" });
+  const bytes =
+    kind === "rtf"
+      ? new TextEncoder().encode(String.raw`{\rtf1\ansi A\tab B  C}`).buffer
+      : await archive.generateAsync({ type: "arraybuffer" });
   const worker = new Worker(new URL("./officePreview.worker.ts", import.meta.url), {
     type: "module",
   });
@@ -2152,18 +2210,23 @@ it.each(["odt", "odp"] as const)("preserves rendered %s spaces and tabs", async 
     });
     if (result.type !== "document") throw new Error("Expected document");
     await using screen = await render(
-      <DocumentPages html={result.pages[0]!.html} name="spacing" output />,
+      <DocumentPages html={result.pages[0]!.html + "<p>A\tB  C</p>"} name="spacing" output />,
     );
     await vi.waitFor(() => {
       const doc = screen.container.querySelector("iframe")?.contentDocument;
-      const spans = doc?.querySelectorAll<HTMLElement>("span[data-odf-whitespace]");
-      expect(doc?.querySelector("p")?.textContent).toBe("A   B\tC");
-      expect(spans).toHaveLength(2);
+      const spans = doc?.querySelectorAll<HTMLElement>(
+        kind === "rtf" ? "p[data-rtf-whitespace]" : "span[data-odf-whitespace]",
+      );
+      expect(doc?.querySelector("p")?.innerText).toBe(kind === "rtf" ? "A\tB  C" : "A   B\tC");
+      expect(spans).toHaveLength(kind === "rtf" ? 1 : 2);
       for (const span of spans!) {
         expect(doc!.defaultView!.getComputedStyle(span).whiteSpace).toBe("pre-wrap");
         expect(span.getBoundingClientRect().width).toBeGreaterThan(0);
       }
       expect(spans![0]!.getBoundingClientRect().width).toBeGreaterThan(10);
+      const plain = doc!.querySelector<HTMLElement>("p:last-child")!;
+      expect(plain.innerText).toBe("A B C");
+      expect(doc!.defaultView!.getComputedStyle(plain).whiteSpace).toBe("normal");
     });
   } finally {
     worker.terminate();
@@ -2336,11 +2399,11 @@ it("renders EPUB publisher styles and follows an anchored link to a fixed-layout
     .file(
       "OPS/illustration.svg",
       `<?xml-stylesheet href="styles/poster.css" type="text/css"?>
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100">
+        <svg xmlns="http://www.w3.org/2000/svg" xmlns:epub="http://www.idpf.org/2007/ops" epub:type="figure" viewBox="0 0 200 100">
           <defs><marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" orient="auto">
             <path d="M 0 0 L 10 5 L 0 10 z" />
           </marker></defs>
-          <rect id="poster" width="200" height="100"/>
+          <rect id="poster" epub:type="cover-image" width="200" height="100"/>
           <line x1="10" y1="10" x2="100" y2="10" stroke="black" marker-end="url(#arrow)"/>
         </svg>`,
     )
