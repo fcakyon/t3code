@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import type * as FileSystem from "effect/FileSystem";
 import type * as Path from "effect/Path";
 import * as EffectAcpErrors from "effect-acp/errors";
@@ -7,7 +8,15 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 
 const CLIENT_FILE_MAX_BYTES = 8 * 1024 * 1024;
 const GIT_POINTER_MAX_BYTES = 4096;
-const GITDIR_POINTER = /^gitdir:[ \t]*(.+?)[ \t]*(?:\r?\n)?$/u;
+const READ_CHUNK_MAX_BYTES = 64 * 1024;
+const GITDIR_PREFIX = /^gitdir:[ \t]*/u;
+// Git strips only the line terminator, so pathname spaces are part of the path.
+const decodeGitfilePointer = Schema.decodeUnknownOption(
+  Schema.String.check(Schema.isPattern(/^gitdir:[ \t]*[^\r\n]+(?:\r?\n)?$/u)),
+);
+const decodeMetadataLine = Schema.decodeUnknownOption(
+  Schema.String.check(Schema.isPattern(/^[^\r\n]+(?:\r?\n)?$/u)),
+);
 
 export interface VerifiedFileIdentity {
   readonly dev: bigint;
@@ -38,18 +47,27 @@ const openNoFollow = (fileSystem: FileSystem.FileSystem, filePath: string) =>
     ),
   );
 
-/** Read at most `maxBytes + 1` bytes, so an oversized or growing file is never buffered whole. */
+/**
+ * Read at most `maxBytes + 1` bytes in chunks sized to the observed file size, so a growing file is
+ * never buffered whole and a small file never allocates a buffer sized for the limit.
+ */
 const readBoundedBytes = Effect.fn("AntigravityClientFiles.readBoundedBytes")(function* (
   file: FileSystem.File,
   maxBytes: number,
+  expectedSize: number,
 ) {
   const chunks: Array<Uint8Array> = [];
   let total = 0;
+  let chunkSize = Math.min(expectedSize + 1, READ_CHUNK_MAX_BYTES);
   while (total <= maxBytes) {
-    const chunk = yield* file.readAlloc(maxBytes + 1 - total);
+    const chunk = yield* file.readAlloc(Math.min(chunkSize, maxBytes + 1 - total));
     if (Option.isNone(chunk)) break;
     chunks.push(chunk.value);
     total += chunk.value.length;
+    chunkSize = Math.min(
+      expectedSize > total ? expectedSize - total + 1 : chunkSize * 2,
+      READ_CHUNK_MAX_BYTES,
+    );
   }
   return total > maxBytes ? undefined : Buffer.concat(chunks, total);
 });
@@ -78,7 +96,7 @@ const readGitPointer = Effect.fn("AntigravityClientFiles.readGitPointer")(functi
       ) {
         return undefined;
       }
-      const bytes = yield* readBoundedBytes(file, GIT_POINTER_MAX_BYTES);
+      const bytes = yield* readBoundedBytes(file, GIT_POINTER_MAX_BYTES, Number(fdInfo.size));
       if (bytes === undefined) return undefined;
       const contents = yield* Effect.try({
         try: () => new TextDecoder("utf-8", { fatal: true }).decode(bytes),
@@ -89,10 +107,19 @@ const readGitPointer = Effect.fn("AntigravityClientFiles.readGitPointer")(functi
   );
 });
 
-function singleLineValue(contents: string | undefined): string | undefined {
-  const value = contents?.trim();
-  return value && !/[\r\n]/u.test(value) ? value : undefined;
+function lineValue(line: Option.Option<string>, prefix = /^/u): string | undefined {
+  return (
+    Option.getOrUndefined(line)
+      ?.replace(prefix, "")
+      .replace(/\r?\n$/u, "") || undefined
+  );
 }
+
+const readMetadataLine = (fileSystem: FileSystem.FileSystem, filePath: string) =>
+  fileSystem.lstat(filePath).pipe(
+    Effect.flatMap((info) => readGitPointer(fileSystem, filePath, info)),
+    Effect.map((pointer) => lineValue(decodeMetadataLine(pointer?.contents))),
+  );
 
 const isVerifiedRootIntact = Effect.fn("AntigravityClientFiles.isVerifiedRootIntact")(
   function* (fileSystem: FileSystem.FileSystem, root: VerifiedClientFileRoot) {
@@ -117,9 +144,10 @@ export const resolveGitWorktreeDirectory = Effect.fn(
     readonly cwd: string | null | undefined;
   }) {
     const { fileSystem, path } = input;
-    const cwd = input.cwd?.trim();
-    if (!cwd) return undefined;
-    let dir = path.resolve(cwd);
+    const cwd = input.cwd;
+    if (!cwd?.trim()) return undefined;
+    // Walk the canonical parents, so a workspace symlinked into a worktree still finds its `.git`.
+    let dir = yield* fileSystem.realPath(path.resolve(cwd));
     while (true) {
       const dotGit = path.join(dir, ".git");
       const info = yield* fileSystem.lstat(dotGit).pipe(
@@ -135,12 +163,11 @@ export const resolveGitWorktreeDirectory = Effect.fn(
         continue;
       }
       const pointer = yield* readGitPointer(fileSystem, dotGit, info);
-      const gitdir = pointer?.contents.match(GITDIR_POINTER)?.[1]?.trim();
+      const gitdir = lineValue(decodeGitfilePointer(pointer?.contents), GITDIR_PREFIX);
       if (pointer === undefined || !gitdir) return undefined;
 
-      const realDir = yield* fileSystem.realPath(dir);
       const realDotGit = yield* fileSystem.realPath(dotGit);
-      if (realDotGit !== path.join(realDir, ".git")) return undefined;
+      if (realDotGit !== dotGit) return undefined;
       const realDotGitInfo = yield* fileSystem.lstat(realDotGit);
       if (
         realDotGitInfo.type !== "File" ||
@@ -149,16 +176,12 @@ export const resolveGitWorktreeDirectory = Effect.fn(
         return undefined;
       }
 
-      const gitDirectory = yield* fileSystem.realPath(path.resolve(realDir, gitdir));
+      const gitDirectory = yield* fileSystem.realPath(path.resolve(dir, gitdir));
       const gitDirInfo = yield* fileSystem.lstat(gitDirectory);
       const gitDirIdentity = extractFileIdentity(gitDirInfo);
       if (gitDirInfo.type !== "Directory" || gitDirIdentity === undefined) return undefined;
 
-      const commonDirPath = path.join(gitDirectory, "commondir");
-      const commonDir = singleLineValue(
-        (yield* readGitPointer(fileSystem, commonDirPath, yield* fileSystem.lstat(commonDirPath)))
-          ?.contents,
-      );
+      const commonDir = yield* readMetadataLine(fileSystem, path.join(gitDirectory, "commondir"));
       if (!commonDir) return undefined;
       const realCommonDir = yield* fileSystem.realPath(path.resolve(gitDirectory, commonDir));
       if (
@@ -168,11 +191,7 @@ export const resolveGitWorktreeDirectory = Effect.fn(
         return undefined;
       }
 
-      const backlinkPath = path.join(gitDirectory, "gitdir");
-      const backlink = singleLineValue(
-        (yield* readGitPointer(fileSystem, backlinkPath, yield* fileSystem.lstat(backlinkPath)))
-          ?.contents,
-      );
+      const backlink = yield* readMetadataLine(fileSystem, path.join(gitDirectory, "gitdir"));
       if (!backlink) return undefined;
       const realTarget = yield* fileSystem.realPath(path.resolve(gitDirectory, backlink));
       const targetInfo = yield* fileSystem.lstat(realTarget);
@@ -302,7 +321,7 @@ export const readAntigravityClientTextFile = Effect.fn("AntigravityClientFiles.r
         if (fdInfo.type !== "File" || Number(fdInfo.size) > CLIENT_FILE_MAX_BYTES) {
           return yield* notText;
         }
-        const read = yield* readBoundedBytes(file, CLIENT_FILE_MAX_BYTES).pipe(
+        const read = yield* readBoundedBytes(file, CLIENT_FILE_MAX_BYTES, Number(fdInfo.size)).pipe(
           Effect.mapError(() => unreadable),
         );
         if (read === undefined) return yield* notText;

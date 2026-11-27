@@ -999,7 +999,7 @@ describe("AntigravityAdapterV2 workspace changes", () => {
       ).pipe(Effect.exit);
       assert.isTrue(
         Exit.isFailure(fromA),
-        "a mismatched backlink cannot add the previous workspace's Git directory",
+        "a workspace switch must not expose the previous workspace's Git directory",
       );
     }).pipe(Effect.provide(layerSession)),
   );

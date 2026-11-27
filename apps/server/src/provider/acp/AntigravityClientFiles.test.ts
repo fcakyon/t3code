@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
@@ -100,6 +101,33 @@ const swapOnce = (target: string, swap: Effect.Effect<void, PlatformError.Platfo
   return { state, fire };
 };
 
+/** Record every `readAlloc` size, running `beforeRead` with the opened path first. */
+const recordReads = (
+  fileSystem: FileSystem.FileSystem,
+  beforeRead: (target: string) => Effect.Effect<void> = () => Effect.void,
+) => {
+  const sizes: Array<number> = [];
+  const recording: FileSystem.FileSystem = {
+    ...fileSystem,
+    open: (target, options) =>
+      fileSystem.open(target, options).pipe(
+        Effect.map(
+          (file) =>
+            new Proxy(file, {
+              get: (file, key, receiver) =>
+                key === "readAlloc"
+                  ? (...args: Parameters<FileSystem.File["readAlloc"]>) => {
+                      sizes.push(args[0]);
+                      return beforeRead(target).pipe(Effect.andThen(file.readAlloc(...args)));
+                    }
+                  : Reflect.get(file, key, receiver),
+            }),
+        ),
+      ),
+  };
+  return { sizes, recording };
+};
+
 it.layer(NodeServices.layer)("AntigravityClientFiles", (it) => {
   it.effect("reads a linked worktree HEAD from its root and subdirectories", () =>
     Effect.gen(function* () {
@@ -176,7 +204,7 @@ it.layer(NodeServices.layer)("AntigravityClientFiles", (it) => {
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
         const path = yield* Path.Path;
-        const root = yield* fileSystem.makeTempDirectoryScoped();
+        const root = yield* fileSystem.realPath(yield* fileSystem.makeTempDirectoryScoped());
         const {
           worktrees: [linked],
         } = yield* makeRepoWithWorktrees(root, "linked");
@@ -274,6 +302,111 @@ it.layer(NodeServices.layer)("AntigravityClientFiles", (it) => {
     }),
   );
 
+  it.effect("sizes reads to the file and still caps files that grow while read", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.realPath(yield* fileSystem.makeTempDirectoryScoped());
+      const {
+        worktrees: [linked],
+      } = yield* makeRepoWithWorktrees(root, "linked");
+      const attachments = path.join(root, "attachments");
+      yield* fileSystem.makeDirectory(attachments);
+      const small = recordReads(fileSystem);
+      const { roots } = yield* rootsFor(small.recording, linked!.path, attachments);
+      const head = yield* readWith(small.recording, path, roots, path.join(linked!.gitDir, "HEAD"));
+      assert.equal(head.content, "ref: refs/heads/linked\n");
+      assert.isAbove(small.sizes.length, 0);
+      assert.isTrue(
+        small.sizes.every((size) => size <= 1024),
+        `small reads: ${small.sizes}`,
+      );
+
+      const grown = path.join(linked!.path, "grown.txt");
+      yield* fileSystem.writeFileString(grown, "small\n");
+      const growth = swapOnce(
+        grown,
+        fileSystem.writeFileString(grown, "a".repeat(9 * 1024 * 1024)),
+      );
+      const growing = recordReads(fileSystem, growth.fire);
+      const error = yield* Effect.flip(readWith(growing.recording, path, roots, grown));
+      assert.isTrue(growth.state.fired);
+      assert.match(error.message, /not a readable text file/);
+      assert.isTrue(
+        growing.sizes.every((size) => size <= 64 * 1024),
+        `growing reads: ${Math.max(...growing.sizes)}`,
+      );
+    }),
+  );
+
+  it.effect("follows a workspace symlinked into a linked worktree subdirectory", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fileSystem.makeTempDirectoryScoped();
+      const {
+        repo,
+        worktrees: [linked],
+      } = yield* makeRepoWithWorktrees(root, "linked");
+      const attachments = path.join(root, "attachments");
+      yield* fileSystem.makeDirectory(attachments);
+      const web = path.join(linked!.path, "apps", "web");
+      const workspaceLink = path.join(root, "workspace-link");
+      yield* fileSystem.makeDirectory(web, { recursive: true });
+      yield* fileSystem.symlink(web, workspaceLink);
+      const { worktreeGitDir, roots } = yield* rootsFor(fileSystem, workspaceLink, attachments);
+      assert.equal(worktreeGitDir?.path, linked!.gitDir);
+      const head = yield* readWith(fileSystem, path, roots, path.join(linked!.gitDir, "HEAD"));
+      assert.equal(head.content, "ref: refs/heads/linked\n");
+      yield* assertOutside(fileSystem, path, roots, path.join(repo, ".git", "config"));
+
+      const forged = path.join(root, "forged");
+      const forgedLink = path.join(root, "forged-link");
+      yield* fileSystem.makeDirectory(path.join(forged, "src"), { recursive: true });
+      yield* fileSystem.symlink(path.join(linked!.path, ".git"), path.join(forged, ".git"));
+      yield* fileSystem.symlink(path.join(forged, "src"), forgedLink);
+      assert.isUndefined(yield* resolveGitWorktreeDirectory({ fileSystem, path, cwd: forgedLink }));
+    }),
+  );
+
+  // Windows drops trailing spaces from file names.
+  it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
+    "keeps trailing pathname spaces in the workspace, gitfile and commondir paths",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.realPath(yield* fileSystem.makeTempDirectoryScoped());
+        const {
+          repo,
+          worktrees: [linked],
+        } = yield* makeRepoWithWorktrees(root, "linked");
+        const attachments = path.join(root, "attachments");
+        yield* fileSystem.makeDirectory(attachments);
+        const checkout = path.join(root, "linked ");
+        const subdirectory = path.join(checkout, "src ");
+        yield* runGit("-C", repo, "worktree", "move", linked!.path, checkout);
+        // Git keeps these spaces, but `worktree add` sanitizes ids, so rename into place.
+        const commonDir = path.join(root, "common ");
+        const gitDir = path.join(commonDir, "worktrees", "linked ");
+        yield* fileSystem.rename(path.join(repo, ".git"), commonDir);
+        yield* fileSystem.writeFileString(path.join(repo, ".git"), `gitdir: ${commonDir}\n`);
+        yield* fileSystem.rename(path.join(commonDir, "worktrees", "linked"), gitDir);
+        yield* fileSystem.writeFileString(path.join(checkout, ".git"), `gitdir: ${gitDir}\n`);
+        yield* fileSystem.writeFileString(path.join(gitDir, "commondir"), `${commonDir}\n`);
+        yield* fileSystem.makeDirectory(subdirectory);
+        yield* runGit("-C", subdirectory, "rev-parse", "--verify", "HEAD");
+
+        for (const cwd of [checkout, subdirectory]) {
+          const { worktreeGitDir, roots } = yield* rootsFor(fileSystem, cwd, attachments);
+          assert.equal(worktreeGitDir?.path, gitDir, cwd);
+          const head = yield* readWith(fileSystem, path, roots, path.join(gitDir, "HEAD"));
+          assert.equal(head.content, "ref: refs/heads/linked\n");
+          yield* assertOutside(fileSystem, path, roots, path.join(commonDir, "config"));
+        }
+      }),
+  );
+
   const syntheticBreaks = {
     "a normal .git directory": ({ fileSystem, dotGit }) =>
       fileSystem.remove(dotGit).pipe(Effect.andThen(fileSystem.makeDirectory(dotGit))),
@@ -334,6 +467,21 @@ it.layer(NodeServices.layer)("AntigravityClientFiles", (it) => {
         path: gitDir,
         identity: { dev: info.dev, ino: Option.getOrThrow(info.ino) },
       });
+    }),
+  );
+
+  it.effect("rejects a .git file that grows past the pointer limit while it is read", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeSyntheticWorktree;
+      const { fileSystem, path, cwd, dotGit, gitDir } = fixture;
+      // `/.` segments resolve away, so only the size limit can reject the grown pointer.
+      const growth = swapOnce(
+        dotGit,
+        fileSystem.writeFileString(dotGit, `gitdir: ${gitDir}${"/.".repeat(2100)}\n`),
+      );
+      const { recording } = recordReads(fileSystem, growth.fire);
+      assert.isUndefined(yield* resolveGitWorktreeDirectory({ fileSystem: recording, path, cwd }));
+      assert.isTrue(growth.state.fired);
     }),
   );
 
