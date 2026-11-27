@@ -77,6 +77,7 @@ export const TimelinePendingApprovalRow = memo(function TimelinePendingApprovalR
           </span>
         ) : (
           <ApprovalText
+            summary={approval.commandSummary}
             text={approval.detail || m(presentation.label)}
             label={m(presentation.detailLabel)}
           />

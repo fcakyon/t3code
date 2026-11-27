@@ -33,7 +33,7 @@ import {
 const TOOL_TEXT_LIMIT = 8_000;
 const TOOL_TEXT_TRUNCATED = "[Earlier output truncated]\n\n";
 const COMMAND_LINE_TRUNCATED = "\n\n[Command truncated]\n\n";
-const QUESTION_LABEL_LIMIT = 512;
+const NATIVE_LABEL_LIMIT = 512;
 
 const NativeToolFields = Schema.Struct({
   command: Schema.optional(Schema.String),
@@ -143,7 +143,7 @@ function boundQuestionText(text: string, limit: number): string {
 }
 
 function questionLabel(option: EffectAcpSchema.PermissionOption): string {
-  return boundQuestionText(option.name.trim() || option.optionId, QUESTION_LABEL_LIMIT);
+  return boundQuestionText(option.name.trim() || option.optionId, NATIVE_LABEL_LIMIT);
 }
 
 export function extractAntigravityUserInputQuestion(
@@ -448,17 +448,38 @@ function wholeFilePatchBeforeCut(
   return patch;
 }
 
+const omitToolSummary = (record: Record<string, unknown>): Record<string, unknown> => {
+  if (!("toolSummary" in record)) return record;
+  const { toolSummary: _toolSummary, ...rest } = record;
+  return rest;
+};
+
+const stripProxyArgumentsToolSummary = (
+  record: Record<string, unknown>,
+): Record<string, unknown> => {
+  let next = omitToolSummary(record);
+  if (
+    typeof next.name === "string" &&
+    Predicate.isObject(next.arguments) &&
+    !Array.isArray(next.arguments) &&
+    "toolSummary" in next.arguments
+  ) {
+    next = {
+      ...next,
+      arguments: omitToolSummary(next.arguments as Record<string, unknown>),
+    };
+  }
+  return next;
+};
+
 function stripAntigravityToolSummary(value: unknown): unknown {
   if (!Predicate.isObject(value) || Array.isArray(value)) return value;
-  const record = value as Record<string, unknown>;
-  let next: Record<string, unknown> = record;
-  if ("toolSummary" in next) {
-    const { toolSummary: _toolSummary, ...rest } = next;
-    next = rest;
-  }
-  if (Predicate.isObject(next.Arguments) && "toolSummary" in next.Arguments) {
-    const { toolSummary: _toolSummary, ...args } = next.Arguments;
-    next = { ...next, Arguments: args };
+  let next = stripProxyArgumentsToolSummary(value as Record<string, unknown>);
+  if (Predicate.isObject(next.Arguments) && !Array.isArray(next.Arguments)) {
+    const strippedArgs = stripProxyArgumentsToolSummary(next.Arguments as Record<string, unknown>);
+    if (strippedArgs !== next.Arguments) {
+      next = { ...next, Arguments: strippedArgs };
+    }
   }
   return next;
 }
@@ -809,11 +830,23 @@ function antigravityCommandInput(rawInput: unknown) {
   };
 }
 
-export function antigravityApprovalPrompt({ toolCall }: EffectAcpSchema.RequestPermissionRequest) {
+export function antigravityCommandApproval({ toolCall }: EffectAcpSchema.RequestPermissionRequest) {
   if (toolCall.kind !== "execute") return undefined;
   const { command, cwd } = antigravityCommandInput(toolCall.rawInput);
   if (!command?.trim()) return undefined;
-  return cwd?.trim() ? `${cwd}\n$ ${command}` : command;
+  const rawSummary = Predicate.isObject(toolCall.rawInput)
+    ? toolCall.rawInput.toolSummary
+    : undefined;
+  const summary =
+    typeof rawSummary === "string" && rawSummary.length <= NATIVE_LABEL_LIMIT
+      ? rawSummary.trim()
+      : "";
+  return {
+    prompt: cwd?.trim() ? `${cwd}\n$ ${command}` : command,
+    ...(/[\p{L}\p{N}]/u.test(summary) && !/[\p{Cc}\p{Bidi_Control}\p{Zl}\p{Zp}]/u.test(summary)
+      ? { commandSummary: summary }
+      : {}),
+  };
 }
 
 export function normalizeAntigravityToolCall(

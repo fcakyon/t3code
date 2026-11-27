@@ -42,7 +42,10 @@ function ChildApproval({ entry }: { entry: ChildThreadApproval }) {
           <PushHooksApprovalDetails pushHooks={approval.pushHooks} />
         </>
       ) : (
-        <ApprovalText text={approval.detail || approval.requestKind} />
+        <ApprovalText
+          summary={approval.commandSummary}
+          text={approval.detail || approval.requestKind}
+        />
       )}
       {approval.appName ? <p className="mt-2 text-muted-foreground">{approval.appName}</p> : null}
       {approval.responseCapability !== "live" ? (

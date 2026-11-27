@@ -1951,12 +1951,13 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
 });
 
 describe("AntigravityAdapterV2 work after the prompt ends", () => {
-  it.effect("shows the tracked command and directory on a native approval", () =>
+  it.effect("shows the native summary and keeps the tracked approval command and directory", () =>
     Effect.gen(function* () {
-      const line = "openship domain add -p project quiz.example.com";
+      const line = "gsc sitemap-submit example.com /sitemap.xml";
+      const summary = "Submit the sitemap to Google Search Console";
       const { command, startTurn, throughPromptSettled, requestPermission, until } =
         yield* openSessionWithRunningCommand(
-          { CommandLine: line, Cwd: "/repo" },
+          { CommandLine: line, Cwd: "/repo", toolSummary: summary },
           undefined,
           undefined,
           {
@@ -1976,12 +1977,10 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
       const event = (yield* until(
         (event) => event.type === "turn_item.updated" && event.turnItem.type === "approval_request",
       )).at(-1);
-      assert.equal(
-        event?.type === "turn_item.updated" &&
-          event.turnItem.type === "approval_request" &&
-          event.turnItem.prompt,
-        `/repo\n$ ${line}`,
-      );
+      assert.include(event?.type === "turn_item.updated" ? event.turnItem : {}, {
+        commandSummary: summary,
+        prompt: `/repo\n$ ${line}`,
+      });
     }).pipe(Effect.provide(layerSession)),
   );
 

@@ -1,3 +1,4 @@
+import { SymbolView } from "../../components/ui/AppSymbol";
 import { Button } from "../../components/ui/Button";
 import type {
   ProviderApprovalDecision,
@@ -45,9 +46,12 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
   const disabled = !canRespond || props.respondingApprovalId === props.approval.requestId;
   const [explanationOpen, setExplanationOpen] = useState(false);
   // T3 Code's own question reads as the app asking: a plain sentence, then what it names.
-  const { pushHooks } = props.approval;
+  const { pushHooks, commandSummary } = props.approval;
+  const [showCommand, setShowCommand] = useState(false);
   const detail =
-    !pushHooks && props.approval.detail ? approvalTextParts(props.approval.detail) : null;
+    !pushHooks && (!commandSummary || showCommand) && props.approval.detail
+      ? approvalTextParts(props.approval.detail)
+      : null;
   return (
     <View className="gap-2.5 rounded-[20px] border border-border bg-card-alt p-4">
       <Text className="font-t3-bold text-2xs uppercase tracking-[1.1px] text-foreground-secondary">
@@ -56,8 +60,25 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
       <Text className="font-t3-bold text-lg text-foreground">
         {pushHooks
           ? m(PUSH_HOOKS_APPROVAL_QUESTION)
-          : (props.approval.appName ?? props.approval.requestKind)}
+          : (commandSummary ?? props.approval.appName ?? props.approval.requestKind)}
       </Text>
+      {commandSummary && props.approval.detail ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{ expanded: showCommand }}
+          onPress={() => setShowCommand(!showCommand)}
+          className="min-h-11 flex-row items-center gap-1"
+        >
+          <SymbolView
+            name={showCommand ? "chevron.down" : "chevron.right"}
+            size={12}
+            tintColorClassName="accent-icon-muted"
+          />
+          <Text className="font-sans text-xs text-foreground-secondary">
+            <T>Details</T>
+          </Text>
+        </Pressable>
+      ) : null}
       {pushHooks ? (
         <View className="gap-1.5">
           {pushHooksApprovalRows(pushHooks, m).map((row, index) => (
@@ -84,6 +105,8 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
               </Text>
               <ApprovalTextScroll parts={detail.tail} fromEnd />
             </>
+          ) : commandSummary ? (
+            <ApprovalTextScroll parts={detail.parts} />
           ) : (
             <ApprovalTextParts parts={detail.parts} />
           )}

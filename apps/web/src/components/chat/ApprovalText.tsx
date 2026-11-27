@@ -12,15 +12,33 @@ import { cn } from "~/lib/utils";
  * name, and a note says when the text runs past its box. Text too long to show in full is shown
  * as its beginning and its end, with a note between them of how much is left out.
  */
-export function ApprovalText({
-  text,
-  label,
-  className,
-}: {
+interface ApprovalTextProps {
   text: string;
   label?: string;
   className?: string;
-}) {
+}
+
+export function ApprovalText({
+  summary,
+  ...props
+}: ApprovalTextProps & { summary?: string | undefined }) {
+  const [open, setOpen] = useState(false);
+  return summary ? (
+    <>
+      <span className="block text-foreground wrap-anywhere">{summary}</span>
+      <details className="text-xs" onToggle={(event) => setOpen(event.currentTarget.open)}>
+        <summary className="cursor-pointer text-muted-foreground">
+          <T>Details</T>
+        </summary>
+        {open ? <ApprovalTextBody {...props} /> : null}
+      </details>
+    </>
+  ) : (
+    <ApprovalTextBody {...props} />
+  );
+}
+
+function ApprovalTextBody({ text, label, className }: ApprovalTextProps) {
   const gt = useGT();
   const [clipped, setClipped] = useState(false);
   const [endClipped, setEndClipped] = useState(false);

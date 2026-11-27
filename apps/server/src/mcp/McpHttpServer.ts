@@ -1632,6 +1632,10 @@ const registerToolCall = Effect.fn("McpHttpServer.registerToolCall")(function* (
         },
         required: ["name"],
       },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: true,
+      },
     }),
     annotations,
     handle: (payload) =>

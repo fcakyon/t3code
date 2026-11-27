@@ -2486,6 +2486,19 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
       });
       expect(yield* proxying.listed).toEqual(["delegate_task", "tool_call", "tool_search"]);
 
+      expect(
+        (yield* proxying.call("tool_search", { query: "remind me tomorrow" })).result
+          ?.structuredContent,
+      ).toEqual({
+        tools: [
+          {
+            name: "schedule_task",
+            description: "Schedules a task.",
+            inputSchema: expect.objectContaining({ type: "object" }),
+          },
+        ],
+      });
+
       // An oversized schema falls back to name + description so the whole response stays <= 8 KB, while small matches keep schemas.
       const budgetSearch = yield* proxying.call("tool_search", { query: "budget" });
       const budgetPayload = budgetSearch.result?.structuredContent as {
@@ -2511,6 +2524,11 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
       // tool_call invokes optional tools, preserves image content, blocks disabled/meta tools, and returns schema on bad args.
       expect(
         (yield* proxying.call("tool_call", { name: "schedule_task", arguments: {} })).result
+          ?.structuredContent,
+      ).toEqual({ ok: true });
+      // Core tools such as delegate_task also work through tool_call if the agent evicts them.
+      expect(
+        (yield* proxying.call("tool_call", { name: "delegate_task", arguments: {} })).result
           ?.structuredContent,
       ).toEqual({ ok: true });
       const imageCall = yield* proxying.call("tool_call", {
