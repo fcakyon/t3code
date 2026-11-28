@@ -76,18 +76,17 @@ export const isAntigravityTextGenerationAvailable = Effect.fn(
 )(function* (input: { readonly profileDirectory: string; readonly userHome: string }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  // agy 1.5.12 reads plugin hooks and MCP servers only from these files at the plugin root.
-  const directories = [
-    path.join(input.profileDirectory, "config"),
-    ...(yield* readAntigravityPlugins(input)).map((plugin) => plugin.directory),
-  ];
-  for (const directory of directories) {
+  const isDirectoryClean = Effect.fn("AntigravityTextGeneration.isDirectoryClean")(function* (
+    directory: string,
+  ) {
     for (const name of ["hooks.json", "mcp_config.json"]) {
       const configurationPath = path.join(directory, name);
-      if (!(yield* fs.exists(configurationPath))) {
+      const info = yield* fs
+        .stat(configurationPath)
+        .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.undefined));
+      if (info === undefined) {
         continue;
       }
-      const info = yield* fs.stat(configurationPath);
       if (info.type !== "File" || info.size > 64_000n) {
         return false;
       }
@@ -109,6 +108,19 @@ export const isAntigravityTextGenerationAvailable = Effect.fn(
       );
       if (!empty) return false;
     }
+    return true;
+  });
+
+  if (!(yield* isDirectoryClean(path.join(input.profileDirectory, "config")))) {
+    return false;
+  }
+  const plugins = yield* readAntigravityPlugins(input).pipe(
+    Effect.catchTags({ AntigravitySkillsProbeError: () => Effect.undefined }),
+  );
+  if (plugins === undefined) return false;
+  for (const plugin of plugins) {
+    // agy 1.5.12 reads plugin hooks and MCP servers only from these files at the plugin root.
+    if (!(yield* isDirectoryClean(plugin.directory))) return false;
   }
   return true;
 });

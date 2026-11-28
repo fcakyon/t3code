@@ -678,18 +678,17 @@ it.layer(NodeServices.layer)("AntigravityTextGeneration", (it) => {
       Effect.gen(function* () {
         const fixture = yield* makeFixture();
         const { fs, path } = fixture;
-        const write = Effect.fn("writePluginFile")(function* (file: string, text: string) {
-          yield* fs.makeDirectory(path.dirname(file), { recursive: true });
-          yield* fs.writeFileString(file, text);
-        });
+        const write = (file: string, text: string) =>
+          fs
+            .makeDirectory(path.dirname(file), { recursive: true })
+            .pipe(Effect.andThen(fs.writeFileString(file, text)));
         // agy links the user's plugins into the profile after this check, so both must pass.
-        for (const [config, manifest] of [
-          [path.join(fixture.profileDirectory, "config"), '{"name":"p"}'],
-          [path.join(fixture.userHome, ".gemini", "config"), '{"name":"p"}'],
-        ] as const) {
+        for (const config of [
+          path.join(fixture.profileDirectory, "config"),
+          path.join(fixture.userHome, ".gemini", "config"),
+        ]) {
           const plugin = path.join(config, "plugins", "p");
-          if (manifest !== undefined) yield* write(path.join(plugin, "plugin.json"), manifest);
-          for (const [file, text] of Object.entries(files)) {
+          for (const [file, text] of Object.entries({ "plugin.json": '{"name":"p"}', ...files })) {
             yield* write(path.join(plugin, file), text);
           }
           if (disabled) {

@@ -702,10 +702,10 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         const config = path.join(userHome, ".gemini", "config");
         const userPlugins = path.join(config, "plugins");
         const profilePlugins = path.join(profileDirectory, "config", "plugins");
-        const write = Effect.fn("writeFile")(function* (file: string, text: string) {
-          yield* fs.makeDirectory(path.dirname(file), { recursive: true });
-          yield* fs.writeFileString(file, text);
-        });
+        const write = (file: string, text: string) =>
+          fs
+            .makeDirectory(path.dirname(file), { recursive: true })
+            .pipe(Effect.andThen(fs.writeFileString(file, text)));
         const linkTarget = (name: string) =>
           fs.readLink(path.join(profilePlugins, name)).pipe(Effect.orElseSucceed(() => undefined));
         const profileConfig = path.join(profileDirectory, "config", "config.json");
@@ -740,19 +740,19 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         yield* fs.symlink(foreign, path.join(profilePlugins, "foreign"));
 
         yield* prepareAntigravityProfile({ profileDirectory, userHome });
+        expect((yield* fs.readDirectory(profilePlugins)).toSorted()).toEqual([
+          "ag",
+          "foreign",
+          "gem",
+          "local",
+          "on",
+        ]);
         for (const plugin of ["on", "ag", "gem"]) {
           expect(yield* linkTarget(plugin)).toBe(path.join(userPlugins, plugin));
         }
-        expect(yield* fs.exists(path.join(profilePlugins, "off"))).toBe(false);
-        expect(yield* fs.exists(path.join(profilePlugins, "bare"))).toBe(false);
         expect(yield* linkTarget("local")).toBeUndefined();
         expect(yield* linkTarget("foreign")).toBe(foreign);
-        for (const name of ["mcp_config.json", "hooks.json", "config.json"]) {
-          expect(yield* fs.exists(path.join(profileDirectory, "config", name))).toBe(false);
-        }
-        for (const plugin of ["opted-in", "kept-off", "shadowed"]) {
-          expect(yield* fs.exists(path.join(profilePlugins, plugin))).toBe(false);
-        }
+        expect(yield* fs.readDirectory(path.join(profileDirectory, "config"))).toEqual(["plugins"]);
 
         // A user enabled override for a plugin that ships disabled must reach the profile.
         yield* configure({ on: false, "opted-in": true, "kept-off": true, shadowed: true });
@@ -768,17 +768,22 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
         yield* fs.remove(path.join(profilePlugins, "gem"));
         yield* fs.symlink(path.join(userPlugins, "off"), path.join(profilePlugins, "gem"));
         yield* prepareAntigravityProfile({ profileDirectory, userHome });
-        expect(yield* linkTarget("on")).toBeUndefined();
-        expect(yield* linkTarget("ag")).toBeUndefined();
-        expect(yield* linkTarget("gem")).toBe(path.join(userPlugins, "gem"));
-        expect(yield* linkTarget("off")).toBe(path.join(userPlugins, "off"));
-        expect(yield* fs.exists(path.join(profilePlugins, "local", "plugin.json"))).toBe(true);
-        expect(yield* linkTarget("foreign")).toBe(foreign);
-        for (const plugin of ["opted-in", "kept-off"]) {
+        expect((yield* fs.readDirectory(profilePlugins)).toSorted()).toEqual([
+          "foreign",
+          "gem",
+          "kept-off",
+          "local",
+          "off",
+          "opted-in",
+          "shadowed",
+        ]);
+        for (const plugin of ["gem", "off", "opted-in", "kept-off"]) {
           expect(yield* linkTarget(plugin)).toBe(path.join(userPlugins, plugin));
         }
+        expect(yield* fs.exists(path.join(profilePlugins, "local", "plugin.json"))).toBe(true);
+        expect(yield* linkTarget("foreign")).toBe(foreign);
         expect(yield* linkTarget("shadowed")).toBeUndefined();
-        expect(JSON.parse(yield* fs.readFileString(profileConfig))).toEqual({
+        expect(decodeJson(yield* fs.readFileString(profileConfig))).toEqual({
           theme: "dark",
           plugins: {
             "kept-off": { enabled: false },
@@ -789,8 +794,13 @@ it.layer(NodeServices.layer)("Antigravity profile preparation", (it) => {
 
         yield* configure({ on: false, "opted-in": false });
         yield* prepareAntigravityProfile({ profileDirectory, userHome });
-        expect(yield* linkTarget("opted-in")).toBeUndefined();
-        expect(yield* linkTarget("kept-off")).toBeUndefined();
+        expect((yield* fs.readDirectory(profilePlugins)).toSorted()).toEqual([
+          "foreign",
+          "gem",
+          "local",
+          "off",
+          "shadowed",
+        ]);
       }),
   );
 

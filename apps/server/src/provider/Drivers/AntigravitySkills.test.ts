@@ -102,17 +102,13 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
       const profileDirectory = path.join(workspace.userHome, "t3", "providers", "antigravity", "p");
       const plugins = path.join(profileDirectory, "config", "plugins");
       const skill = (name: string) => `---\nname: ${name}\ndescription: From ${name}.\n---\n`;
-      for (const plugin of ["demo", "off", "solo"]) {
+      for (const plugin of ["demo", "off", "solo", "default-off", "opted-in"]) {
         yield* writeSkill(
           path.join(plugins, plugin, "skills", `${plugin}-skill`),
           skill(`${plugin}-skill`),
         );
       }
       for (const plugin of ["default-off", "opted-in"]) {
-        yield* writeSkill(
-          path.join(plugins, plugin, "skills", `${plugin}-skill`),
-          `---\nname: ${plugin}-skill\n---\n`,
-        );
         yield* fileSystem.writeFileString(
           path.join(plugins, plugin, "plugin.json"),
           '{"disabled":true}',
@@ -301,10 +297,10 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
         );
 
         assert.deepEqual(
-          (yield* discoverAntigravitySkills(input)).map((skill) => [
-            skill.name,
-            skill.scope,
-            skill.displayName,
+          (yield* discoverAntigravitySkills(input)).map(({ name, scope, displayName }) => [
+            name,
+            scope,
+            displayName,
           ]),
           [
             ["ag", "user", "ag:ag"],
@@ -318,46 +314,56 @@ it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
       }),
   );
 
-  it.effect(
-    "skips an oversized plugin manifest and loads no plugins from invalid preferences",
-    () =>
-      Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const input = yield* makeWorkspace();
-        const config = path.join(input.userHome, ".gemini", "config");
-        for (const plugin of ["big", "ok", "off"]) {
-          yield* writeSkill(
-            path.join(config, "plugins", plugin, "skills", plugin),
-            `---\nname: ${plugin}\n---\n`,
-          );
-        }
-        yield* fileSystem.writeFileString(
-          path.join(config, "plugins", "big", "plugin.json"),
-          "x".repeat(1_000_001),
+  it.effect("parses plugin preferences with a UTF-8 BOM and null enabled fields", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const input = yield* makeWorkspace();
+      const config = path.join(input.profileDirectory, "config");
+      for (const plugin of ["ok", "off"]) {
+        yield* writeSkill(
+          path.join(config, "plugins", plugin, "skills", plugin),
+          `---\nname: ${plugin}\n---\n`,
         );
-        for (const plugin of ["ok", "off"]) {
-          yield* fileSystem.writeFileString(
-            path.join(config, "plugins", plugin, "plugin.json"),
-            "{}",
-          );
-        }
-        const names = () =>
-          discoverAntigravitySkills(input).pipe(
-            Effect.map((skills) => skills.map((skill) => skill.name)),
-          );
-        // A null entry leaves its plugin's default and keeps the explicit false beside it.
         yield* fileSystem.writeFileString(
+          path.join(config, "plugins", plugin, "plugin.json"),
+          JSON.stringify({ name: plugin }),
+        );
+      }
+      const names = () =>
+        discoverAntigravitySkills(input).pipe(
+          Effect.map((skills) => skills.map((skill) => skill.name)),
+        );
+      const writePreferences = (contents: unknown) =>
+        fileSystem.writeFileString(
           path.join(config, "config.json"),
-          JSON.stringify({ plugins: { ok: { enabled: null }, off: { enabled: false } } }),
+          typeof contents === "string" ? contents : JSON.stringify(contents),
         );
-        assert.deepEqual(yield* names(), ["ok"]);
-        yield* fileSystem.writeFileString(
-          path.join(config, "config.json"),
-          '{"plugins":{"off":{"enabled":"no"}}}',
-        );
-        assert.deepEqual(yield* names(), []);
-      }),
+
+      yield* writePreferences(`\uFEFF${JSON.stringify({ plugins: { off: { enabled: false } } })}`);
+      assert.deepEqual(yield* names(), ["ok"]);
+
+      yield* writePreferences({ plugins: { ok: { enabled: null }, off: { enabled: false } } });
+      assert.deepEqual(yield* names(), ["ok"]);
+
+      yield* writePreferences(
+        `\uFEFF${JSON.stringify({ plugins: { ok: { enabled: null }, off: { enabled: false } } })}`,
+      );
+      assert.deepEqual(yield* names(), ["ok"]);
+
+      yield* writePreferences({ plugins: null });
+      assert.deepEqual(yield* names(), ["off", "ok"]);
+
+      // agy fails open when config.json cannot decode, including null plugin entries.
+      for (const invalid of [
+        { plugins: { other: null, off: { enabled: false } } },
+        { plugins: { bad: { enabled: "no" }, off: { enabled: false } } },
+        "{broken",
+      ] as const) {
+        yield* writePreferences(invalid);
+        assert.deepEqual(yield* names(), ["off", "ok"]);
+      }
+    }),
   );
 
   it.effect("uses native root order for duplicate names", () =>
