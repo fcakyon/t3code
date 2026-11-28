@@ -408,6 +408,28 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     return yield* options.stampIdentity(next.draft);
   });
 
+  const checkUsageLimits =
+    options.probeUsage === undefined
+      ? undefined
+      : Effect.gen(function* () {
+          if (!settings.enabled) return undefined;
+          const before = yield* SubscriptionRef.get(metadata);
+          if (before.draft.auth.status === "unauthenticated") return undefined;
+          const usage = yield* options.probeUsage!;
+          if (usage === undefined) return undefined;
+          const after = yield* SubscriptionRef.get(metadata);
+          if (
+            after.authRevision !== before.authRevision ||
+            after.draft.auth.status === "unauthenticated"
+          ) {
+            return undefined;
+          }
+          return {
+            usageLimits: usage.usageLimits,
+            ...(usage.email ? { auth: { email: usage.email } } : {}),
+          };
+        });
+
   const maintenanceCapabilities =
     options.maintenanceCapabilities ??
     makeManualOnlyProviderMaintenanceCapabilities({
@@ -421,6 +443,7 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
     haveSettingsChanged: () => false,
     initialSnapshot: () => getSnapshot,
     checkProvider: checkProvider(),
+    ...(checkUsageLimits ? { checkUsageLimits } : {}),
     enrichSnapshot: ({ publishSnapshot }) =>
       SubscriptionRef.changes(metadata).pipe(
         Stream.runForEach((state) =>
@@ -618,8 +641,46 @@ export const makeAntigravityProvider = Effect.fn("makeAntigravityProvider")(func
       : { ...snapshot, skills: resolvedSkills };
   });
 
+  const refreshUsage =
+    checkUsageLimits === undefined || managed.refreshUsage === undefined
+      ? managed.refreshUsage
+      : Effect.gen(function* () {
+          const before = yield* SubscriptionRef.get(metadata);
+          yield* managed.refreshUsage!;
+          const latest = yield* managed.getSnapshot;
+          const switched = yield* SubscriptionRef.modify(metadata, (state) => {
+            if (
+              state.authRevision !== before.authRevision ||
+              state.draft.auth.status === "unauthenticated"
+            ) {
+              return [false, state] as const;
+            }
+            const beforeEmail = state.draft.auth.email?.toLowerCase();
+            const nextEmail = latest.auth.email?.toLowerCase();
+            const accountSwitched =
+              beforeEmail !== undefined && nextEmail !== undefined && beforeEmail !== nextEmail;
+            const nextDraft: ServerProviderDraft = {
+              ...state.draft,
+              auth: {
+                ...state.draft.auth,
+                ...(latest.auth.email !== undefined ? { email: latest.auth.email } : {}),
+              },
+              ...(latest.usageLimits !== undefined ? { usageLimits: latest.usageLimits } : {}),
+            };
+            if (Equal.equals(state.draft, nextDraft)) {
+              return [accountSwitched, state] as const;
+            }
+            return [accountSwitched, { ...state, draft: nextDraft }] as const;
+          });
+          // managedProvider bumps enrichmentGeneration on account switch, which stops the
+          // metadata subscriber until a full refresh restarts enrichSnapshot.
+          if (switched) {
+            yield* managed.refresh;
+          }
+        });
+
   return {
-    snapshot: { ...managed, getSnapshot },
+    snapshot: { ...managed, getSnapshot, ...(refreshUsage ? { refreshUsage } : {}) },
     onSessionStarted,
     onConfigOptionsUpdated,
     onAvailableCommands,

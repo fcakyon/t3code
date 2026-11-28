@@ -27,7 +27,7 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as ProviderHostLive from "./ProviderHostLive.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
-import type { ServerProvider } from "@t3tools/contracts";
+import type { ServerProvider, ServerProviderUsageLimits } from "@t3tools/contracts";
 import {
   buildAntigravityModelsFromSession,
   makeAntigravityProvider,
@@ -134,21 +134,28 @@ const layerTest = makeLayerTest(false);
 
 type ProbeError = EffectAcpErrors.AcpError | ProviderSetupError;
 
+type UsageProbeResult =
+  | { readonly usageLimits: ServerProviderUsageLimits; readonly email: string | undefined }
+  | undefined;
+
 const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
   options: {
     readonly auth?: { readonly type: string; readonly label: string };
     readonly enabled?: boolean;
     readonly safe?: boolean;
     readonly rememberedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+    readonly initialUsage?: UsageProbeResult;
   } = {},
 ) {
   const savedRuntimeModes = yield* Ref.make<ReadonlyArray<ReadonlyArray<RuntimeMode>>>([]);
   const initialProbe = yield* Deferred.make<EffectAcpSchema.InitializeResponse, ProbeError>();
   const probeCalls = yield* Ref.make(0);
+  const usageCalls = yield* Ref.make(0);
   const safetyCalls = yield* Ref.make(0);
   const probe = yield* Ref.make<Effect.Effect<EffectAcpSchema.InitializeResponse, ProbeError>>(
     Deferred.await(initialProbe),
   );
+  const usage = yield* Ref.make<UsageProbeResult>(options.initialUsage);
   const safety = yield* Ref.make<Effect.Effect<boolean>>(Effect.succeed(options.safe ?? true));
   const provider = yield* makeAntigravityProvider(
     decodeSettings({ enabled: options.enabled ?? true, customModels: ["do-not-seed-me"] }),
@@ -163,6 +170,13 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
         Effect.andThen(Ref.get(probe)),
         Effect.flatten,
       ),
+      ...(options.initialUsage !== undefined
+        ? {
+            probeUsage: Ref.update(usageCalls, (count) => count + 1).pipe(
+              Effect.andThen(Ref.get(usage)),
+            ),
+          }
+        : {}),
       supportsTextGeneration: Ref.update(safetyCalls, (count) => count + 1).pipe(
         Effect.andThen(Ref.get(safety)),
         Effect.flatten,
@@ -187,6 +201,8 @@ const makeHarness = Effect.fn("makeAntigravityProviderHarness")(function* (
     provider,
     probe,
     probeCalls,
+    usage,
+    usageCalls,
     safety,
     safetyCalls,
     initialProbe,
@@ -1029,6 +1045,55 @@ it.layer(layerTest)("Antigravity provider snapshots", (it) => {
       expect(snapshot.slashCommands).toEqual(expectedCommands);
       expect(yield* Ref.get(harness.probeCalls)).toBe(1);
     }),
+  );
+
+  it.effect(
+    "refreshUsage updates limits without running the ACP probe and restarts enrichment on account switch",
+    () =>
+      Effect.gen(function* () {
+        const initialLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-11-28T00:00:00.000Z",
+          windows: [{ id: "gemini-3", kind: "session", label: "Gemini · 5-hour", usedPercent: 10 }],
+        };
+        const refreshedLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-11-28T00:05:00.000Z",
+          windows: [{ id: "gemini-3", kind: "session", label: "Gemini · 5-hour", usedPercent: 25 }],
+        };
+        const switchedLimits: ServerProviderUsageLimits = {
+          checkedAt: "2026-11-28T00:10:00.000Z",
+          windows: [{ id: "gemini-3", kind: "session", label: "Gemini · 5-hour", usedPercent: 0 }],
+        };
+        const harness = yield* makeHarness({
+          initialUsage: { usageLimits: initialLimits, email: "a@example.com" },
+        });
+        yield* harness.initialize;
+        yield* harness.provider.onSessionStarted(started, "/workspace");
+        expect(yield* Ref.get(harness.probeCalls)).toBe(1);
+        expect(yield* Ref.get(harness.usageCalls)).toBe(1);
+
+        yield* Ref.set(harness.usage, { usageLimits: refreshedLimits, email: "a@example.com" });
+        const awaitRefreshed = yield* harness.nextPublish(
+          (snapshot) => snapshot.usageLimits?.checkedAt === refreshedLimits.checkedAt,
+        );
+        yield* harness.provider.snapshot.refreshUsage!;
+        expect((yield* awaitRefreshed)?.usageLimits).toEqual(refreshedLimits);
+        expect(yield* Ref.get(harness.probeCalls)).toBe(1);
+        expect(yield* Ref.get(harness.usageCalls)).toBe(2);
+        expect((yield* harness.provider.snapshot.getSnapshot).usageLimits).toEqual(refreshedLimits);
+
+        yield* Ref.set(harness.usage, { usageLimits: switchedLimits, email: "b@example.com" });
+        yield* harness.provider.snapshot.refreshUsage!;
+        expect(yield* Ref.get(harness.probeCalls)).toBe(2);
+        const switched = yield* harness.provider.snapshot.getSnapshot;
+        expect(switched.auth.email).toBe("b@example.com");
+        expect(switched.usageLimits).toEqual(switchedLimits);
+
+        const awaitCommands = yield* harness.nextPublish(
+          (snapshot) => snapshot.slashCommands.length === expectedCommands.length,
+        );
+        yield* harness.provider.onAvailableCommands(commands, "/workspace");
+        expect((yield* awaitCommands)?.slashCommands).toEqual(expectedCommands);
+      }),
   );
 });
 
