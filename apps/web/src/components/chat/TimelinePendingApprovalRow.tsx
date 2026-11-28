@@ -49,7 +49,8 @@ export const TimelinePendingApprovalRow = memo(function TimelinePendingApprovalR
 }: {
   approval: PendingApproval;
 }) {
-  const { respondingRequestIds, canOperateThread, onRespondToApproval } = use(TimelineRowCtx);
+  const { respondingRequestIds, canOperateThread, onRespondToApproval, onOpenToolDiff } =
+    use(TimelineRowCtx);
   const m = useMessages();
   const presentation = APPROVAL_PRESENTATION[approval.requestKind];
   // T3 Code's own question reads as the app asking: a plain sentence, then what it names.
@@ -121,6 +122,11 @@ export const TimelinePendingApprovalRow = memo(function TimelinePendingApprovalR
               <T>Provider process is gone. Interrupt or restart the run to respond.</T>
             </span>
           )}
+          {approval.fileChangeTarget && onOpenToolDiff ? (
+            <InlineButton onClick={() => onOpenToolDiff(approval.fileChangeTarget!)}>
+              <T>Open diff</T>
+            </InlineButton>
+          ) : null}
           {approval.fullAccessOverride ? (
             <Popover>
               <PopoverTrigger openOnHover render={<InlineButton tone="muted" />}>

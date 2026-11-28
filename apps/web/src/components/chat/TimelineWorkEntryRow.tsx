@@ -61,6 +61,7 @@ import type { MessageResolver } from "~/i18n/messages";
 import { formatUpcomingTimestamp } from "../../timestampFormat";
 import { FetchedToolOutput, V2ItemInspector } from "./V2ItemInspector";
 import { SubagentNotificationLink } from "./V2LifecycleRow";
+import { TruncatedFilePath, usesFilePathTruncation } from "./TruncatedFilePath";
 import {
   TimelineRowCtx,
   TimelineRowActivityCtx,
@@ -620,6 +621,8 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
                   environmentId={ctx.activeThreadEnvironmentId}
                   linked
                 />
+              ) : !questionHeading && usesFilePathTruncation(workEntry) ? (
+                <TruncatedFilePath text={previewText} />
               ) : (
                 previewText
               )}

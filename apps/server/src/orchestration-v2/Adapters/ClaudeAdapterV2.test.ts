@@ -6041,6 +6041,92 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         ),
     );
 
+    it.effect.each([
+      {
+        name: "Edit",
+        toolName: "Edit",
+        toolInput: {
+          file_path: "/workspace/target.txt",
+          old_string: "before",
+          new_string: "after",
+        },
+        assertPrompt: (prompt: string) => {
+          assert.include(prompt, "--- /workspace/target.txt");
+          assert.include(prompt, "+++ /workspace/target.txt");
+          assert.include(prompt, "-before");
+          assert.include(prompt, "+after");
+        },
+      },
+      {
+        name: "MultiEdit",
+        toolName: "MultiEdit",
+        toolInput: {
+          file_path: "/workspace/multi.txt",
+          edits: [
+            { old_string: "one", new_string: "two" },
+            { old_string: "three", new_string: "four" },
+          ],
+        },
+        assertPrompt: (prompt: string) => {
+          assert.include(prompt, "-one");
+          assert.include(prompt, "+two");
+          assert.include(prompt, "-three");
+          assert.include(prompt, "+four");
+        },
+      },
+      {
+        name: "Write",
+        toolName: "Write",
+        toolInput: {
+          file_path: "/workspace/new.txt",
+          content: "hello\nworld\n",
+        },
+        assertPrompt: (prompt: string) => {
+          assert.equal(prompt, "Write replaces /workspace/new.txt with:\nhello\nworld\n");
+        },
+      },
+    ] as const)(
+      "formats pre-approval $name prompt with file-change diff detail",
+      ({ toolName, toolInput, assertPrompt }) =>
+        Effect.gen(function* () {
+          const turn = yield* openPlanTurn("auto");
+          const permission = yield* requestWrite(turn, toolName, toolInput);
+          assert.equal(permission.first.type, "request");
+          if (permission.first.type !== "request") return;
+          const requestEvent = permission.first.event;
+          assert.equal(requestEvent.runtimeRequest.kind, "file-change");
+          const approvalItem = turn.events.findLast(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "approval_request" &&
+              event.turnItem.requestId === requestEvent.runtimeRequest.id,
+          );
+          assert.equal(approvalItem?.type, "turn_item.updated");
+          if (
+            approvalItem?.type === "turn_item.updated" &&
+            approvalItem.turnItem.type === "approval_request"
+          ) {
+            assert.isDefined(approvalItem.turnItem.prompt);
+            assertPrompt(approvalItem.turnItem.prompt!);
+          }
+          yield* turn.runtime.respondToRuntimeRequest({
+            requestId: requestEvent.runtimeRequest.id,
+            decision: "decline",
+          });
+          yield* Fiber.join(permission.decision);
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
+          ),
+        ),
+    );
+
     it.effect("denies Plan writes without asking when approvals are never allowed", () =>
       Effect.gen(function* () {
         const turn = yield* openPlanTurn("full-access", "never");

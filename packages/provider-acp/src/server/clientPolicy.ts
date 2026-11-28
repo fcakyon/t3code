@@ -149,8 +149,8 @@ export function acpChangedPathsOfToolCall(toolCall: {
         continue;
       }
       if (entry.path !== undefined && entry.path !== null) requirePath(entry.path);
-      for (const value of entry.changes) {
-        const change = unknownRecord(value);
+      for (const changeValue of entry.changes) {
+        const change = unknownRecord(changeValue);
         switch (change?.operation) {
           case "move":
             requirePath(change.oldPath);
@@ -211,13 +211,10 @@ function acpReadDisposition(runtimePolicy: AcpRuntimePolicy): "allow" | "deny" {
   }
 }
 
-/** True when the change names at least one path and every path is inside `cwd`, a sandbox writable root or one of the thread's other folders. */
-function acpMutationStaysInWorkspace(
+function acpWorkspaceContainmentRoots(
   runtimePolicy: AcpRuntimePolicy,
   sandboxPolicy: Record<string, unknown>,
-  changedPaths: AcpChangedPaths,
-): boolean {
-  if (changedPaths === "unknown" || changedPaths.length === 0) return false;
+): { readonly cwd: string | null; readonly roots: ReadonlyArray<string> } {
   const cwd =
     typeof runtimePolicy.cwd === "string" && runtimePolicy.cwd.trim().length > 0
       ? (resolveAcpPermissionPath(runtimePolicy.cwd, process.cwd()) ?? null)
@@ -238,8 +235,15 @@ function acpMutationStaysInWorkspace(
     const canonicalRoot = acpCanonicalPathForContainment(resolved);
     if (canonicalRoot !== undefined) roots.push(canonicalRoot);
   }
-  if (roots.length === 0) return false;
+  return { cwd, roots };
+}
 
+function acpPathsStayWithinRoots(
+  changedPaths: ReadonlyArray<string>,
+  cwd: string | null,
+  roots: ReadonlyArray<string>,
+): boolean {
+  if (roots.length === 0 || changedPaths.length === 0) return false;
   for (const changedPath of changedPaths) {
     const resolved = resolveAcpPermissionPath(changedPath, cwd);
     const canonicalPath =
@@ -252,6 +256,17 @@ function acpMutationStaysInWorkspace(
     }
   }
   return true;
+}
+
+/** True when the change names at least one path and every path is inside `cwd`, a sandbox writable root or one of the thread's other folders. */
+function acpMutationStaysInWorkspace(
+  runtimePolicy: AcpRuntimePolicy,
+  sandboxPolicy: Record<string, unknown>,
+  changedPaths: AcpChangedPaths,
+): boolean {
+  if (changedPaths === "unknown" || changedPaths.length === 0) return false;
+  const { cwd, roots } = acpWorkspaceContainmentRoots(runtimePolicy, sandboxPolicy);
+  return acpPathsStayWithinRoots(changedPaths, cwd, roots);
 }
 
 function acpOperationDisposition(
@@ -272,11 +287,7 @@ function acpOperationDisposition(
       return "deny";
     case "workspaceWrite":
       if (isAcpMutationKind(toolKind)) {
-        return acpMutationStaysInWorkspace(
-          runtimePolicy,
-          sandboxPolicy ?? {},
-          operation.changedPaths,
-        )
+        return acpMutationStaysInWorkspace(runtimePolicy, sandboxPolicy, operation.changedPaths)
           ? "allow"
           : "deny";
       }
@@ -314,6 +325,32 @@ export function acpPermissionDisposition(
     kind: request.toolCall.kind,
     changedPaths: acpChangedPathsOfToolCall(request.toolCall),
   });
+}
+
+export function acpPermissionAskReason(
+  runtimePolicy: AcpRuntimePolicy,
+  request: EffectAcpSchema.RequestPermissionRequest,
+): string | undefined {
+  const toolKind = request.toolCall.kind ?? "other";
+  const mode = runtimePolicy.runtimeMode;
+  if (
+    (mode === "auto-accept-edits" || mode === "auto") &&
+    runtimePolicy.approvalPolicy === undefined &&
+    unknownRecord(runtimePolicy.sandboxPolicy)?.type === undefined &&
+    isAcpMutationKind(toolKind)
+  ) {
+    const changedPaths = acpChangedPathsOfToolCall(request.toolCall);
+    const { cwd, roots } = acpWorkspaceContainmentRoots(runtimePolicy, {});
+    if (roots.length === 0 || changedPaths === "unknown" || changedPaths.length === 0) {
+      return mode === "auto-accept-edits"
+        ? "Target file paths could not be verified inside the workspace."
+        : undefined;
+    }
+    if (!acpPathsStayWithinRoots(changedPaths, cwd, roots)) {
+      return "Edits files outside the current workspace.";
+    }
+  }
+  return undefined;
 }
 
 export function acpMcpToolApprovalElicitationDisposition(

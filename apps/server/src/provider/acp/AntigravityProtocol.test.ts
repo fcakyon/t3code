@@ -1,3 +1,8 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
+
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import type * as EffectAcpSchema from "effect-acp/compat";
@@ -7,6 +12,7 @@ import {
   extractAntigravityUserInputQuestion,
   antigravityApprovalOptions,
   antigravityCommandApproval,
+  antigravityNormalizePermissionRequest,
   antigravitySubagentOutput,
   antigravityToolOutlivesPrompt,
   classifyAntigravitySubagentToolCall,
@@ -1136,5 +1142,206 @@ describe("Antigravity served reads", () => {
       }).toolCall,
     );
     expect(foreignCall.data.rawInput).toEqual({ message: "Hello", toolSummary: "Send greeting" });
+  });
+});
+
+describe("antigravity approval normalization and presentation", () => {
+  it("infers execute/edit kinds, fills locations, and keeps non-file content untouched", () => {
+    const execReq = antigravityNormalizePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "exec-1",
+        kind: "other",
+        rawInput: { CommandLine: "git status" },
+      },
+    });
+    expect(execReq.toolCall.kind).toBe("execute");
+
+    const editReq = antigravityNormalizePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "edit-1",
+        rawInput: {
+          TargetFile: "/etc/hosts",
+          Target: "127.0.0.1 localhost",
+          Replacement: "127.0.0.1 dev.local",
+        },
+      },
+    });
+    expect(editReq.toolCall.kind).toBe("edit");
+    expect(editReq.toolCall.locations).toEqual([{ path: "/etc/hosts" }]);
+
+    const nonFileReq = antigravityNormalizePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "mcp-1",
+        kind: "other",
+        rawInput: { message: "hello", content: "body text" },
+      },
+    });
+    expect(nonFileReq.toolCall.kind).toBe("other");
+    expect(nonFileReq.toolCall.locations).toBeUndefined();
+  });
+
+  it("extracts edit diffs, write previews, and keeps prompt alongside non-execute toolSummary", () => {
+    const diffApproval = antigravityCommandApproval({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "edit-diff-1",
+        kind: "edit",
+        title: "Edit file",
+        locations: [{ path: "/tmp/a.ts" }],
+        content: [{ type: "diff", path: "/tmp/a.ts", oldText: "one\n", newText: "two\n" }],
+        rawInput: { toolSummary: "Update greeting" },
+      },
+    });
+    expect(diffApproval?.commandSummary).toBe("Update greeting");
+    expect(diffApproval?.prompt).toContain("-one");
+    expect(diffApproval?.prompt).toContain("+two");
+
+    const writeApproval = antigravityCommandApproval({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "write-1",
+        kind: "edit",
+        locations: [{ path: "/tmp/nonexistent-antigravity-write.ts" }],
+        rawInput: {
+          TargetFile: "/tmp/nonexistent-antigravity-write.ts",
+          CodeContent: "export const x = 1;\n",
+        },
+      },
+    });
+    expect(writeApproval?.prompt).toBe(
+      "Write replaces /tmp/nonexistent-antigravity-write.ts with:\nexport const x = 1;\n",
+    );
+
+    const readApproval = antigravityCommandApproval({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "read-1",
+        kind: "read",
+        locations: [{ path: "/etc/hosts" }],
+        rawInput: { toolSummary: "Inspect hosts file" },
+      },
+    });
+    expect(readApproval).toEqual({
+      commandSummary: "Inspect hosts file",
+      prompt: "Read /etc/hosts",
+    });
+  });
+
+  it("does not reclassify MCP or generic path-content calls and merges partial locations fail-closed", () => {
+    const mcpWriteReq = antigravityNormalizePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      _meta: { is_mcp_tool_call: true },
+      toolCall: {
+        toolCallId: "mcp-write-1",
+        kind: "other",
+        title: "MCP write",
+        rawInput: { server: "fs", tool: "write_file", path: "/remote/a.ts", content: "hi" },
+      },
+    });
+    expect(mcpWriteReq.toolCall.kind).toBe("other");
+    expect(mcpWriteReq.toolCall.locations).toBeUndefined();
+
+    const genericReq = antigravityNormalizePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "generic-1",
+        kind: "other",
+        rawInput: { path: "/tmp/a.ts", content: "hello" },
+      },
+    });
+    expect(genericReq.toolCall.kind).toBe("other");
+
+    const targetFileReq = antigravityNormalizePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "target-file-1",
+        kind: "other",
+        rawInput: { target_file: "/tmp/written.ts", content: "export const a = 1;" },
+      },
+    });
+    expect(targetFileReq.toolCall.kind).toBe("edit");
+    expect(targetFileReq.toolCall.locations).toEqual([{ path: "/tmp/written.ts" }]);
+
+    const partialLocsReq = antigravityNormalizePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "partial-1",
+        kind: "edit",
+        locations: [{ path: "/ws/a.ts" }],
+        rawInput: { DestinationPath: "/outside/b.ts" },
+      },
+    });
+    expect(partialLocsReq.toolCall.locations).toEqual([
+      { path: "/ws/a.ts" },
+      { path: "/outside/b.ts" },
+    ]);
+
+    const nonStringRawPathReq = antigravityNormalizePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "bad-path-1",
+        kind: "edit",
+        locations: [{ path: "/ws/a.ts" }],
+        rawInput: { DestinationPath: 123 },
+      },
+    });
+    expect(acpChangedPathsOfToolCall(nonStringRawPathReq.toolCall)).toBe("unknown");
+  });
+
+  it("bounds oversized Write previews once and falls back when a whole-file patch has no hunks", () => {
+    const oversizedWrite = antigravityCommandApproval({
+      sessionId: "session-1",
+      options: [],
+      toolCall: {
+        toolCallId: "write-huge",
+        kind: "edit",
+        title: "Write file",
+        locations: [{ path: "/tmp/nonexistent-huge-file.ts" }],
+        rawInput: {
+          TargetFile: "/tmp/nonexistent-huge-file.ts",
+          CodeContent: "x".repeat(40_000),
+          toolSummary: "Write large file",
+        },
+      },
+    });
+    expect(oversizedWrite?.prompt.length).toBeLessThanOrEqual(32_768);
+    expect(oversizedWrite?.prompt.match(/more characters are not shown/g)?.length).toBe(1);
+
+    const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-ag-write-fallback-"));
+    try {
+      const filePath = NodePath.join(tempDir, "same.ts");
+      const content = "export const unchanged = true;\n";
+      NodeFS.writeFileSync(filePath, content, "utf8");
+      const unchangedWrite = antigravityCommandApproval({
+        sessionId: "session-1",
+        options: [],
+        toolCall: {
+          toolCallId: "write-unchanged",
+          kind: "edit",
+          locations: [{ path: filePath }],
+          rawInput: {
+            TargetFile: filePath,
+            CodeContent: content,
+          },
+        },
+      });
+      expect(unchangedWrite?.prompt).toBe(`Write replaces ${filePath} with:\n${content}`);
+    } finally {
+      NodeFS.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

@@ -115,6 +115,7 @@ import {
   acpClientExecuteDisposition,
   acpMcpToolApprovalElicitationDisposition,
   acpChangedPathsOfToolCall,
+  acpPermissionAskReason,
   acpPermissionDisposition,
   mergeAcpChangedPaths,
   type AcpPermissionDisposition,
@@ -605,6 +606,10 @@ export interface AcpAdapterV2Flavor {
   readonly approvalOptions?: (
     request: EffectAcpSchema.RequestPermissionRequest,
   ) => ReadonlyArray<ProviderApprovalOption>;
+  /** Moves what a flavor's agent names only in `_meta` (e.g. the files a review covers) into ACP fields. */
+  readonly normalizePermissionRequest?: (
+    request: EffectAcpSchema.RequestPermissionRequest,
+  ) => EffectAcpSchema.RequestPermissionRequest;
   /** Options T3 may answer with; the rest (e.g. Devin's bypass-permissions plan exit) are never sent. */
   readonly answerablePermissionOptions?: (
     request: EffectAcpSchema.RequestPermissionRequest,
@@ -7486,12 +7491,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           params: EffectAcpSchema.RequestPermissionRequest,
           generation: number,
           transportRequestId: string,
+          reason?: string,
         ) {
           yield* closeTextStreams(context);
           const parsed = parsePermissionRequest(params);
           const presentation =
             flavor.commandApproval?.(params) ??
             (parsed.detail === undefined ? {} : { prompt: parsed.detail });
+          const presentationPrompt = "prompt" in presentation ? presentation.prompt : undefined;
           const approvalOptions = flavor.approvalOptions?.(params);
           const nativeRequestId = params.toolCall.toolCallId;
           const requestId = yield* idAllocator.allocate.runtimeRequest({
@@ -7567,6 +7574,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             requestId,
             requestKind,
             ...presentation,
+            ...(reason !== undefined && reason !== presentationPrompt ? { reason } : {}),
             ...(approvalOptions === undefined ? {} : { options: approvalOptions }),
           };
           yield* Ref.update(pendingRuntimeRequests, (current) => {
@@ -8481,13 +8489,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 return { outcome: { outcome: "cancelled" } } as const;
               }
               const trackedTurn = yield* Ref.get(activeTurn);
-              const params =
-                trackedTurn !== null && nativeParams.sessionId === (yield* Ref.get(activeSessionId))
-                  ? withTrackedPermissionToolCall(
-                      nativeParams,
-                      trackedTurn.tools.get(nativeParams.toolCall.toolCallId),
-                    )
-                  : nativeParams;
+              const currentSessionId = yield* Ref.get(activeSessionId);
+              const arrivalTool =
+                trackedTurn !== null && nativeParams.sessionId === currentSessionId
+                  ? trackedTurn.tools.get(nativeParams.toolCall.toolCallId)
+                  : undefined;
+              const trackedParams = withTrackedPermissionToolCall(nativeParams, arrivalTool);
+              const params = flavor.normalizePermissionRequest?.(trackedParams) ?? trackedParams;
               const transportRequestId = requestContext.requestId;
               const permissionQuestion = flavor.extractPermissionQuestion?.(params);
               if (permissionQuestion !== undefined) {
@@ -8523,17 +8531,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               // callers pass no tool for another session's request.
               const policyRequest = (knownTool: AcpToolCallState | undefined) =>
                 withTrackedChangedPaths(
-                  params.toolCall.kind == null && knownTool?.kind !== undefined
+                  params.toolCall.kind === undefined && knownTool?.kind !== undefined
                     ? { ...params, toolCall: { ...params.toolCall, kind: knownTool.kind } }
                     : params,
                   unreadToolCalls.has(params.sessionId, params.toolCall.toolCallId)
                     ? withUnknownChangedPaths(knownTool, params.toolCall.toolCallId)
                     : knownTool,
                 );
-              const arrivalTool =
-                trackedTurn !== null && params.sessionId === (yield* Ref.get(activeSessionId))
-                  ? trackedTurn.tools.get(params.toolCall.toolCallId)
-                  : undefined;
               if (
                 (followsAgentWorkState &&
                   dispositionFor(latestRuntimePolicy, policyRequest(arrivalTool)) === "ask") ||
@@ -8548,14 +8552,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   const context = followsAgentWorkState
                     ? yield* Ref.get(activeTurn)
                     : yield* activeContext;
-                  const disposition = dispositionFor(
-                    context?.input.runtimePolicy ?? latestRuntimePolicy,
-                    policyRequest(
-                      params.sessionId === (yield* Ref.get(activeSessionId))
-                        ? context?.tools.get(params.toolCall.toolCallId)
-                        : undefined,
-                    ),
+                  const effectivePolicy = context?.input.runtimePolicy ?? latestRuntimePolicy;
+                  const effectivePolicyRequest = policyRequest(
+                    params.sessionId === (yield* Ref.get(activeSessionId))
+                      ? context?.tools.get(params.toolCall.toolCallId)
+                      : undefined,
                   );
+                  const disposition = dispositionFor(effectivePolicy, effectivePolicyRequest);
                   if (disposition === "allow") {
                     const optionId = selectAutoApprovedPermissionOption(answerableParams);
                     return {
@@ -8583,6 +8586,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       params,
                       handlerGeneration,
                       transportRequestId,
+                      acpPermissionAskReason(effectivePolicy, effectivePolicyRequest),
                     ),
                   };
                 }),

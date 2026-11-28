@@ -7,6 +7,7 @@ import {
   resolveViewedImageAsset,
   workEntriesViewedImagePaths,
 } from "@t3tools/client-runtime/work-log/presentation";
+import { TruncatedFilePath, usesFilePathTruncation } from "./TruncatedFilePath";
 import { resolveWorkGroupScrollAnchor } from "@t3tools/client-runtime/work-log/scroll-anchor";
 import { useAssetUrls } from "~/assets/assetUrls";
 import { observeResize } from "~/lib/observeResize";
@@ -704,6 +705,8 @@ export function LiveWorkEntryTimelineRow({
               environmentId={ctx.activeThreadEnvironmentId}
               linked={false}
             />
+          ) : usesFilePathTruncation(row.entry) ? (
+            <TruncatedFilePath text={label} />
           ) : (
             label
           )

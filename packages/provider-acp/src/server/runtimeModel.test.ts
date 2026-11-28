@@ -8,6 +8,7 @@ import {
   acpContentBlockDisplayText,
   embeddedTerminalIdsFromSessionUpdate,
   extractMcpToolCallIdentity,
+  formatBoundedLocationLines,
   makeAcpUnreadToolCalls,
   MAX_UNREAD_TOOL_CALLS,
   mergeToolCallState,
@@ -399,7 +400,9 @@ describe("AcpRuntimeModel", () => {
 
     expect(
       mergeToolCallState(created, toolCall({ rawInput: { path: "new.txt" } })).data.rawInput,
-    ).toEqual({ path: "new.txt" });
+    ).toEqual({
+      path: "new.txt",
+    });
 
     const cleared = mergeToolCallState(
       created,
@@ -2116,5 +2119,83 @@ describe("embeddedTerminalIdsFromSessionUpdate", () => {
         },
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("permission request detail improvements", () => {
+  it("appends unmentioned complete location paths and preserves complete-path boundaries", () => {
+    expect(
+      parsePermissionRequest({
+        sessionId: "session-1",
+        options: [],
+        toolCall: {
+          toolCallId: "edit-1",
+          kind: "edit",
+          title: "Edit file",
+          locations: [{ path: "/src/foo.ts" }],
+        },
+      }).detail,
+    ).toBe("Edit file\n/src/foo.ts");
+
+    expect(
+      parsePermissionRequest({
+        sessionId: "session-1",
+        options: [],
+        toolCall: {
+          toolCallId: "edit-2",
+          kind: "edit",
+          title: "Edit foo.ts",
+          locations: [{ path: "foo.ts" }, { path: "foo.ts.bak" }],
+        },
+      }).detail,
+    ).toBe("Edit foo.ts\nfoo.ts.bak");
+  });
+
+  it("extracts ACP v2 subject.command on execute permission requests", () => {
+    const parsed = parsePermissionRequest({
+      sessionId: "session-1",
+      options: [],
+      subject: { type: "command", command: "git status" },
+      toolCall: {
+        toolCallId: "exec-v2",
+        kind: "execute",
+      },
+    } as unknown as EffectAcpSchema.RequestPermissionRequest);
+    expect(parsed.detail).toBe("git status");
+  });
+
+  it("inherits tracked kind and locations on ID-only permission requests without copying content", () => {
+    const tracked: AcpToolCallState = {
+      toolCallId: "call-edit",
+      kind: "edit",
+      title: "Edit file",
+      status: "pending",
+      data: {
+        locations: [{ path: "/workspace/file.ts" }],
+        content: [{ type: "diff", path: "/workspace/file.ts", oldText: "a", newText: "b" }],
+      },
+    };
+    const merged = withTrackedPermissionToolCall(
+      {
+        sessionId: "session-1",
+        options: [],
+        toolCall: { toolCallId: "call-edit" },
+      },
+      tracked,
+    );
+    expect(merged.toolCall.kind).toBe("edit");
+    expect(merged.toolCall.locations).toEqual([{ path: "/workspace/file.ts" }]);
+    expect(merged.toolCall.content).toBeUndefined();
+  });
+
+  it("bounds location lines at 4096 characters with a remaining count suffix", () => {
+    const paths = Array.from(
+      { length: 60 },
+      (_, index) => `/workspace/dir-${index}/${"x".repeat(90)}.ts`,
+    );
+    const lines = formatBoundedLocationLines(paths);
+    expect(lines.length).toBeLessThan(60);
+    expect(lines.at(-1)).toMatch(/^… \+\d+ more files?$/);
+    expect(lines.slice(0, -1).join("\n").length).toBeLessThanOrEqual(4096);
   });
 });

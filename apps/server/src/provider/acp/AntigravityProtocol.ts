@@ -3,6 +3,11 @@ import type {
   ProviderUserInputAnswers,
   UserInputQuestion,
 } from "@t3tools/contracts";
+import {
+  boundFileChangeApprovalPrompt,
+  formatWriteApprovalText,
+  withoutTrailingHighSurrogate,
+} from "@t3tools/shared/approvalPrompt";
 import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
 import { resolveT3McpToolId } from "@t3tools/shared/t3McpToolPresentation";
 import {
@@ -23,6 +28,8 @@ import type { AcpAdapterV2Flavor } from "@t3tools/provider-acp/server/adapter";
 import { parseElicitationForm } from "@t3tools/provider-acp/server/elicitationForm";
 import {
   extractMcpToolCallIdentity,
+  parsePermissionRequest,
+  summaryContainsCompletePath,
   type AcpToolCallState,
 } from "@t3tools/provider-acp/server/runtimeModel";
 
@@ -142,7 +149,7 @@ function copyBoundedText(text: string): string {
 
 function boundQuestionText(text: string, limit: number): string {
   if (text.length <= limit) return text;
-  const prefix = text.slice(0, limit - 3).replace(/[\uD800-\uDBFF]$/u, "");
+  const prefix = withoutTrailingHighSurrogate(text.slice(0, limit - 3));
   return copyBoundedText(`${prefix}...`);
 }
 
@@ -250,7 +257,7 @@ function boundCommandText(text: string, limit = TOOL_TEXT_LIMIT): string {
 function boundCommandLine(text: string, limit = TOOL_TEXT_LIMIT): string {
   if (text.length <= limit) return text;
   const keep = Math.max(0, limit - COMMAND_LINE_TRUNCATED.length);
-  const head = text.slice(0, Math.ceil(keep / 2)).replace(/[\uD800-\uDBFF]$/u, "");
+  const head = withoutTrailingHighSurrogate(text.slice(0, Math.ceil(keep / 2)));
   const tail = text.slice(text.length - Math.floor(keep / 2)).replace(/^[\uDC00-\uDFFF]/u, "");
   return copyBoundedText(`${head}${COMMAND_LINE_TRUNCATED}${tail}`);
 }
@@ -703,6 +710,18 @@ function hasTruncatedText(value: unknown): boolean {
   return Predicate.isObject(value) && Object.values(value).some(hasTruncatedText);
 }
 
+function memoizePreEditReader(
+  readPreEditFile: (path: string) => string | undefined,
+): (path: string) => string | undefined {
+  const cache = new Map<string, string | undefined>();
+  return (path) => {
+    if (cache.has(path)) return cache.get(path);
+    const value = readPreEditFile(path);
+    cache.set(path, value);
+    return value;
+  };
+}
+
 /** The ACP adapter renders a diff's `patch.text` ahead of its bare old/new snippets. */
 function withAntigravityEditPatches(
   content: ReadonlyArray<unknown>,
@@ -710,6 +729,7 @@ function withAntigravityEditPatches(
   readPreEditFile: ((path: string) => string | undefined) | undefined,
   wholeFilePatches: unknown,
 ) {
+  const cachedReadPreEditFile = readPreEditFile ? memoizePreEditReader(readPreEditFile) : undefined;
   return content.map((received) => {
     if (
       !Predicate.isObject(received) ||
@@ -744,9 +764,9 @@ function withAntigravityEditPatches(
       rawInput: data.rawInput,
       locations: data.locations,
       readPreEditFile:
-        edit && readPreEditFile
-          ? (path) => preEditFileOfRunningEdit(readPreEditFile(path), edit)
-          : readPreEditFile,
+        edit && cachedReadPreEditFile
+          ? (path) => preEditFileOfRunningEdit(cachedReadPreEditFile(path), edit)
+          : cachedReadPreEditFile,
     });
     // A truncated patch would no longer parse, and bare snippets would render at line 1.
     if (
@@ -854,23 +874,280 @@ function antigravityCommandInput(rawInput: unknown) {
   };
 }
 
-export function antigravityCommandApproval({ toolCall }: EffectAcpSchema.RequestPermissionRequest) {
-  if (toolCall.kind !== "execute") return undefined;
-  const { command, cwd } = antigravityCommandInput(toolCall.rawInput);
-  if (!command?.trim()) return undefined;
-  const rawSummary = Predicate.isObject(toolCall.rawInput)
-    ? toolCall.rawInput.toolSummary
-    : undefined;
+function validAntigravityToolSummary(rawInput: unknown): string | undefined {
+  const rawSummary = Predicate.isObject(rawInput) ? rawInput.toolSummary : undefined;
   const summary =
     typeof rawSummary === "string" && rawSummary.length <= NATIVE_LABEL_LIMIT
       ? rawSummary.trim()
       : "";
-  return {
-    prompt: cwd?.trim() ? `${cwd}\n$ ${command}` : command,
-    ...(/[\p{L}\p{N}]/u.test(summary) && !/[\p{Cc}\p{Bidi_Control}\p{Zl}\p{Zp}]/u.test(summary)
-      ? { commandSummary: summary }
-      : {}),
+  return /[\p{L}\p{N}]/u.test(summary) && !/[\p{Cc}\p{Bidi_Control}\p{Zl}\p{Zp}]/u.test(summary)
+    ? summary
+    : undefined;
+}
+
+const ANTIGRAVITY_PERMISSION_PATH_KEYS: ReadonlyArray<string> = [
+  ...new Set([
+    ...ACP_RAW_INPUT_PATH_KEYS,
+    "Path",
+    "TargetFile",
+    "target_file",
+    "FilePath",
+    "DestinationPath",
+    "SourcePath",
+  ]),
+];
+
+function collectAntigravityApprovalPaths(
+  toolCall: EffectAcpSchema.RequestPermissionRequest["toolCall"],
+): ReadonlyArray<string> {
+  const seen = new Set<string>();
+  const add = (value: unknown) => {
+    if (typeof value !== "string") return;
+    const trimmed = value.trim();
+    if (trimmed) seen.add(trimmed);
   };
+  if (Array.isArray(toolCall.locations)) {
+    for (const loc of toolCall.locations) add(loc.path);
+  }
+  if (Array.isArray(toolCall.content)) {
+    for (const entry of toolCall.content) {
+      if (Predicate.isObject(entry) && entry.type === "diff") add(entry.path);
+    }
+  }
+  const changed = acpChangedPathsOfToolCall(toolCall);
+  if (Array.isArray(changed)) {
+    for (const path of changed) add(path);
+  }
+  if (Predicate.isObject(toolCall.rawInput)) {
+    for (const key of ANTIGRAVITY_PERMISSION_PATH_KEYS) add(toolCall.rawInput[key]);
+  }
+  return [...seen];
+}
+
+function readWriteFileInput(rawInput: unknown): { readonly content: string } | undefined {
+  if (!Predicate.isObject(rawInput)) return undefined;
+  const codeContent = rawInput.CodeContent ?? rawInput.codeContent ?? rawInput.code_content;
+  if (typeof codeContent === "string") return { content: codeContent };
+  if (extractAntigravityEditPath({ rawInput }) === undefined) return undefined;
+  const content = rawInput.Content ?? rawInput.content;
+  return typeof content === "string" ? { content } : undefined;
+}
+
+function isAntigravityEditLikeInput(rawInput: unknown): boolean {
+  if (readEditFileInput(rawInput) !== undefined) return true;
+  if (!Predicate.isObject(rawInput)) return false;
+  const hasReplacementContent =
+    typeof (rawInput.TargetContent ?? rawInput.target_content) === "string" &&
+    typeof (rawInput.ReplacementContent ?? rawInput.replacement_content) === "string";
+  const hasCodeContent =
+    typeof (rawInput.CodeContent ?? rawInput.codeContent ?? rawInput.code_content) === "string";
+  const hasTargetFileContent =
+    typeof (rawInput.TargetFile ?? rawInput.target_file) === "string" &&
+    typeof (rawInput.Content ?? rawInput.content) === "string";
+  return (
+    hasReplacementContent ||
+    hasCodeContent ||
+    hasTargetFileContent ||
+    Array.isArray(rawInput.ReplacementChunks ?? rawInput.replacement_chunks)
+  );
+}
+
+function normalizeEditRawInput(rawInput: unknown): unknown {
+  const edit = readEditFileInput(rawInput);
+  return edit === undefined
+    ? rawInput
+    : { TargetContent: edit.Target, ReplacementContent: edit.Replacement };
+}
+
+export function antigravityNormalizePermissionRequest(
+  request: EffectAcpSchema.RequestPermissionRequest,
+): EffectAcpSchema.RequestPermissionRequest {
+  const { toolCall } = request;
+  const mcpIdentity = extractMcpToolCallIdentity({
+    toolCallId: toolCall.toolCallId,
+    ...(typeof toolCall.title === "string" ? { title: toolCall.title } : {}),
+    data: {
+      ...(toolCall.title !== undefined ? { title: toolCall.title } : {}),
+      ...(toolCall.rawInput !== undefined ? { rawInput: toolCall.rawInput } : {}),
+      ...(Predicate.isObject(request._meta) ? { meta: request._meta } : {}),
+    },
+  });
+  if (mcpIdentity !== undefined) return request;
+
+  const { command } = antigravityCommandInput(toolCall.rawInput);
+  const hasDiffContent =
+    Array.isArray(toolCall.content) &&
+    toolCall.content.some((entry) => Predicate.isObject(entry) && entry.type === "diff");
+  const nextKind =
+    toolCall.kind === undefined || toolCall.kind === "other"
+      ? command?.trim()
+        ? ("execute" as const)
+        : hasDiffContent || isAntigravityEditLikeInput(toolCall.rawInput)
+          ? ("edit" as const)
+          : undefined
+      : undefined;
+  const normalizedToolCall = nextKind === undefined ? toolCall : { ...toolCall, kind: nextKind };
+
+  const canAppendLocations = toolCall.locations === undefined || Array.isArray(toolCall.locations);
+  const existing = Array.isArray(toolCall.locations) ? toolCall.locations : [];
+  const existingPaths = new Set(existing.map((loc) => loc.path));
+  const appended: Array<{ readonly path: string }> = [];
+  if (canAppendLocations) {
+    if (Predicate.isObject(normalizedToolCall.rawInput)) {
+      for (const key of ANTIGRAVITY_PERMISSION_PATH_KEYS) {
+        const value = normalizedToolCall.rawInput[key];
+        if (value === undefined || value === null) continue;
+        const rawPath = typeof value === "string" ? value : "";
+        if (!existingPaths.has(rawPath)) {
+          appended.push({ path: rawPath });
+          existingPaths.add(rawPath);
+        }
+      }
+    }
+    if (existing.length === 0 && Array.isArray(normalizedToolCall.content)) {
+      for (const entry of normalizedToolCall.content) {
+        if (!Predicate.isObject(entry) || entry.type !== "diff" || typeof entry.path !== "string")
+          continue;
+        const trimmed = entry.path.trim();
+        if (trimmed && !existingPaths.has(trimmed)) {
+          appended.push({ path: trimmed });
+          existingPaths.add(trimmed);
+        }
+      }
+    }
+  }
+  if (nextKind === undefined && appended.length === 0) return request;
+  return {
+    ...request,
+    toolCall: {
+      ...normalizedToolCall,
+      ...(appended.length > 0 ? { locations: [...existing, ...appended] } : {}),
+    },
+  };
+}
+
+function formatAntigravityWriteApproval(
+  path: string,
+  newText: string,
+  oldText: string | undefined,
+  readFile: (path: string) => string | undefined,
+): string {
+  const before = oldText ?? readFile(path);
+  if (before !== undefined) {
+    return (
+      antigravityWholeFilePatch(path, before, newText) ?? formatWriteApprovalText(path, newText)
+    );
+  }
+  return formatWriteApprovalText(path, newText);
+}
+
+function diffPatchFromRawInput(
+  path: string,
+  rawInput: unknown,
+  readFile: (path: string) => string | undefined,
+): string | undefined {
+  const patch = antigravityEditPatch({
+    path,
+    rawInput: normalizeEditRawInput(rawInput),
+    readPreEditFile: readFile,
+  });
+  if (patch !== undefined && patch !== ANTIGRAVITY_EDIT_DIFF_OMITTED) return patch;
+  const write = readWriteFileInput(rawInput);
+  if (write === undefined) return undefined;
+  return formatAntigravityWriteApproval(path, write.content, undefined, readFile);
+}
+
+function extractAntigravityApprovalDiff(
+  toolCall: EffectAcpSchema.RequestPermissionRequest["toolCall"],
+  paths: ReadonlyArray<string>,
+): string | undefined {
+  const patches: string[] = [];
+  const readFile = memoizePreEditReader(readAntigravityPreEditFile);
+  const normalizedInput = normalizeEditRawInput(toolCall.rawInput);
+  if (Array.isArray(toolCall.content)) {
+    for (const entry of toolCall.content) {
+      if (!Predicate.isObject(entry) || entry.type !== "diff" || typeof entry.path !== "string")
+        continue;
+      if (
+        Predicate.isObject(entry.patch) &&
+        typeof entry.patch.text === "string" &&
+        entry.patch.format !== "omitted" &&
+        !entry.patch.text.startsWith(TOOL_TEXT_TRUNCATED)
+      ) {
+        patches.push(entry.patch.text);
+        continue;
+      }
+      if (hasTruncatedText(entry)) continue;
+      const fromInput = antigravityEditPatch({
+        path: entry.path,
+        rawInput: normalizedInput,
+        locations: toolCall.locations,
+        readPreEditFile: readFile,
+      });
+      if (fromInput !== undefined && fromInput !== ANTIGRAVITY_EDIT_DIFF_OMITTED) {
+        patches.push(fromInput);
+        continue;
+      }
+      if (typeof entry.newText === "string") {
+        patches.push(
+          formatAntigravityWriteApproval(
+            entry.path,
+            entry.newText,
+            typeof entry.oldText === "string" ? entry.oldText : undefined,
+            readFile,
+          ),
+        );
+      }
+    }
+  }
+  if (patches.length === 0) {
+    const targetPath =
+      extractAntigravityEditPath({ locations: toolCall.locations, rawInput: toolCall.rawInput }) ??
+      paths[0];
+    if (targetPath !== undefined && !hasTruncatedText(toolCall.rawInput)) {
+      const fromInput = diffPatchFromRawInput(targetPath, toolCall.rawInput, readFile);
+      if (fromInput !== undefined) patches.push(fromInput);
+    }
+  }
+  return patches.length === 0 ? undefined : patches.join("\n\n");
+}
+
+export function antigravityCommandApproval(request: EffectAcpSchema.RequestPermissionRequest) {
+  const { toolCall } = request;
+  const commandSummary = validAntigravityToolSummary(toolCall.rawInput);
+  if (toolCall.kind === "execute") {
+    const { command, cwd } = antigravityCommandInput(toolCall.rawInput);
+    if (!command?.trim()) return undefined;
+    return {
+      prompt: cwd?.trim() ? `${cwd}\n$ ${command}` : command,
+      ...(commandSummary !== undefined ? { commandSummary } : {}),
+    };
+  }
+  const isMutation =
+    toolCall.kind === "edit" || toolCall.kind === "delete" || toolCall.kind === "move";
+  const paths = isMutation ? collectAntigravityApprovalPaths(toolCall) : [];
+  const diffText = isMutation ? extractAntigravityApprovalDiff(toolCall, paths) : undefined;
+  if (diffText !== undefined) {
+    const parsed = parsePermissionRequest(request);
+    const needsHeader =
+      parsed.detail !== undefined &&
+      (isAntigravitySnippetPatch(diffText) ||
+        !paths.every((path) => summaryContainsCompletePath(diffText, path)));
+    return {
+      prompt: boundFileChangeApprovalPrompt(
+        needsHeader ? `${parsed.detail}\n${diffText}` : diffText,
+      ),
+      ...(commandSummary !== undefined ? { commandSummary } : {}),
+    };
+  }
+  if (commandSummary !== undefined) {
+    const parsed = parsePermissionRequest(request);
+    return {
+      prompt: parsed.detail ?? commandSummary,
+      ...(parsed.detail !== undefined ? { commandSummary } : {}),
+    };
+  }
+  return undefined;
 }
 
 export function normalizeAntigravityToolCall(

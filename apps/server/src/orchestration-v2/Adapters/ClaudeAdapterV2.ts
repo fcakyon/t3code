@@ -1,5 +1,10 @@
 import * as DocumentText from "../../provider/DocumentText.ts";
 import {
+  boundFileChangeApprovalPrompt,
+  formatWriteApprovalPreview,
+  withoutTrailingHighSurrogate,
+} from "@t3tools/shared/approvalPrompt";
+import {
   compactDynamicToolOutput,
   mcpToolResultOutput,
   toolOutputImages,
@@ -4520,6 +4525,77 @@ function claudeFileChangeText(output: ClaudeNativeToolOutput): string {
   return patch.hunks.length === 0 ? "" : formatPatch(patch, FILE_HEADERS_ONLY);
 }
 
+function claudePatchText(
+  oldPath: string,
+  newPath: string,
+  oldText: string,
+  newText: string,
+): string | undefined {
+  const patch = structuredPatch(oldPath, newPath, oldText, newText);
+  return patch.hunks.length === 0 ? undefined : formatPatch(patch, FILE_HEADERS_ONLY);
+}
+
+function claudeMultiEditPatches(
+  filePath: string,
+  edits: ReadonlyArray<unknown>,
+): ReadonlyArray<string> {
+  const patches: string[] = [];
+  for (const entry of edits) {
+    if (!Predicate.isObject(entry)) continue;
+    const oldText = entry.old_string;
+    const newText = entry.new_string;
+    if (typeof oldText !== "string" || typeof newText !== "string") continue;
+    const formatted = claudePatchText(filePath, filePath, oldText, newText);
+    if (formatted !== undefined) patches.push(formatted);
+  }
+  return patches;
+}
+
+function claudeFileChangeApprovalPrompt(
+  toolName: string,
+  toolInput: ClaudeNativeToolInput,
+): string | undefined {
+  const rawPath = inputRecordValue(toolInput, "file_path");
+  const filePath = typeof rawPath === "string" ? rawPath.trim() : "";
+  if (filePath === "") return undefined;
+  if (toolName === "Edit") {
+    const oldText = inputRecordValue(toolInput, "old_string");
+    const newText = inputRecordValue(toolInput, "new_string");
+    if (typeof oldText !== "string" || typeof newText !== "string") return undefined;
+    const patch = claudePatchText(filePath, filePath, oldText, newText);
+    return patch === undefined ? undefined : boundFileChangeApprovalPrompt(patch);
+  }
+  if (toolName === "MultiEdit") {
+    const edits = inputRecordValue(toolInput, "edits");
+    if (!Array.isArray(edits)) return undefined;
+    const patches = claudeMultiEditPatches(filePath, edits);
+    return patches.length === 0 ? undefined : boundFileChangeApprovalPrompt(patches.join("\n\n"));
+  }
+  if (toolName === "Write") {
+    const content = inputRecordValue(toolInput, "content");
+    return typeof content === "string" ? formatWriteApprovalPreview(filePath, content) : undefined;
+  }
+  return undefined;
+}
+
+function claudePendingFileChangeDiff(
+  toolName: string,
+  toolInput: ClaudeNativeToolInput,
+): string | undefined {
+  if (toolName === "Edit" || toolName === "MultiEdit") {
+    return claudeFileChangeApprovalPrompt(toolName, toolInput);
+  }
+  if (toolName === "Write") {
+    const rawPath = inputRecordValue(toolInput, "file_path");
+    const filePath = typeof rawPath === "string" ? rawPath.trim() : "";
+    const content = inputRecordValue(toolInput, "content");
+    if (filePath === "" || typeof content !== "string") return undefined;
+    const patch = claudePatchText("/dev/null", filePath, "", content);
+    return patch === undefined ? undefined : boundFileChangeApprovalPrompt(patch);
+  }
+  return undefined;
+}
+
 function claudeCommandOutputText(output: ClaudeNativeToolOutput): string {
   const value = claudeNativeToolOutputValue(output);
   if (typeof value === "object" && value !== null) {
@@ -4671,12 +4747,6 @@ function webSearchResultsFromClaudeOutput(
       url: content.url,
     }));
   });
-}
-
-// A code-unit slice can split a surrogate pair; drop the lone high half it leaves.
-function withoutTrailingHighSurrogate(text: string): string {
-  const last = text.charCodeAt(text.length - 1);
-  return last >= 0xd800 && last <= 0xdbff ? text.slice(0, -1) : text;
 }
 
 function summarizeClaudeToolRequest(toolName: string, input: ClaudeNativeToolInput): string {
@@ -4865,7 +4935,10 @@ function claudeToolResultEntriesFromMessage(message: SDKMessage): ReadonlyArray<
   readonly output: ClaudeNativeToolOutput;
 }> {
   const assistantResults = claudeToolResultBlocksFromAssistantMessage(message).map(
-    (toolResult) => ({ toolResult, output: claudeNativeToolOutputFromToolResult(toolResult) }),
+    (toolResult) => ({
+      toolResult,
+      output: claudeNativeToolOutputFromToolResult(toolResult),
+    }),
   );
   const userResults = claudeToolResultBlocksFromUserMessage(message);
   const structuredOutput =
@@ -7995,6 +8068,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               : itemType === "file_change"
                 ? claudeFileChangeText(input.output)
                 : claudeNativeToolOutputText(input.output);
+          const pendingDiff =
+            itemType === "file_change" && outputText.length === 0 && input.status === "running"
+              ? claudePendingFileChangeDiff(input.toolName, input.toolInput)
+              : undefined;
+          const fileChangeDiff = outputText.length > 0 ? outputText : pendingDiff;
           const turnItem: OrchestrationV2TurnItem =
             itemType === "command_execution"
               ? {
@@ -8008,7 +8086,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     ...itemBase,
                     type: "file_change",
                     fileName: fileNameFromClaudeTool(input.toolName, input.toolInput),
-                    ...(outputText.length === 0 ? {} : { diffStr: outputText }),
+                    ...(fileChangeDiff === undefined || fileChangeDiff.length === 0
+                      ? {}
+                      : { diffStr: fileChangeDiff }),
                   }
                 : itemType === "web_search"
                   ? {
@@ -13596,8 +13676,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const requestKind = providerRequestKindFromClaudeTool(toolName);
           // The user approves the command itself; Claude's title and description only summarize it.
           const command = inputRecordValue(nativeToolInput, "command");
+          const fileChangePrompt =
+            requestKind === "file-change"
+              ? claudeFileChangeApprovalPrompt(toolName, nativeToolInput)
+              : undefined;
           const prompt =
             (typeof command === "string" && command.trim() !== "" ? command : undefined) ??
+            fileChangePrompt ??
             callbackOptions.title ??
             callbackOptions.description ??
             callbackOptions.decisionReason ??
@@ -14113,7 +14198,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               if (keepsWork) {
                 yield* Effect.logWarning(
                   "orchestration-v2.claude-stale-process-kept-for-background-work",
-                  { threadId: turnInput.threadId, nativeThreadId },
+                  {
+                    threadId: turnInput.threadId,
+                    nativeThreadId,
+                  },
                 );
               } else {
                 replaceStaleProcess = true;

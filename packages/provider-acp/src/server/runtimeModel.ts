@@ -10,8 +10,10 @@ import {
   deriveToolActivityPresentation,
   mergeToolActivityData,
 } from "@t3tools/shared/toolActivity";
+import { withoutTrailingHighSurrogate } from "@t3tools/shared/approvalPrompt";
 import { T3_MCP_TOOL_NAMES } from "@t3tools/shared/t3McpToolPresentation";
 import {
+  ACP_RAW_INPUT_PATH_KEYS,
   acpChangedPathsOfToolCall,
   mergeAcpChangedPaths,
   type AcpChangedPaths,
@@ -647,14 +649,10 @@ function locationsFromToolCallInput(input: {
     }
   }
   if (isRecord(input.rawInput)) {
-    pushPath(input.rawInput.path);
-    pushPath(input.rawInput.filePath);
-    pushPath(input.rawInput.file_path);
+    for (const key of ACP_RAW_INPUT_PATH_KEYS) pushPath(input.rawInput[key]);
   }
   if (isRecord(input.rawOutput)) {
-    pushPath(input.rawOutput.path);
-    pushPath(input.rawOutput.filePath);
-    pushPath(input.rawOutput.file_path);
+    for (const key of ACP_RAW_INPUT_PATH_KEYS) pushPath(input.rawOutput[key]);
   }
 
   return locations.length > 0 ? locations : undefined;
@@ -1338,7 +1336,7 @@ export function withTrackedPermissionToolCall(
   tracked: AcpToolCallState | undefined,
 ): EffectAcpSchema.RequestPermissionRequest {
   if (tracked === undefined) return params;
-  const { title, kind, rawInput } = params.toolCall;
+  const { title, kind, rawInput, locations } = params.toolCall;
   return {
     ...params,
     toolCall: {
@@ -1346,13 +1344,82 @@ export function withTrackedPermissionToolCall(
       ...(title === undefined && typeof tracked.data.title === "string"
         ? { title: tracked.data.title }
         : {}),
-      // Unrecognised kinds map to command approvals, so only a tracked execute kind may grant execution.
-      ...(kind === undefined && tracked.kind === "execute" ? { kind: "execute" as const } : {}),
+      // Policy already judges an ID-only request by its tracked kind; the card and grants follow it.
+      ...(kind === undefined && tracked.kind !== undefined ? { kind: tracked.kind } : {}),
       ...(rawInput === undefined && tracked.data.rawInput !== undefined
         ? { rawInput: tracked.data.rawInput }
         : {}),
+      ...(locations === undefined && Array.isArray(tracked.data.locations)
+        ? { locations: tracked.data.locations }
+        : {}),
     },
   };
+}
+
+function toolCallLocationPaths(toolCall: AcpToolCallState | undefined): ReadonlyArray<string> {
+  const locations = toolCall?.data.locations;
+  if (!Array.isArray(locations)) return [];
+  const seen = new Set<string>();
+  return locations.flatMap((location) => {
+    if (!isRecord(location) || typeof location.path !== "string" || location.path.length === 0) {
+      return [];
+    }
+    if (seen.has(location.path)) return [];
+    seen.add(location.path);
+    return [location.path];
+  });
+}
+
+const GENERIC_TITLE_KINDS = new Set(["execute", "edit", "delete", "move"]);
+const MAX_PERMISSION_LOCATION_CHARS = 4_096;
+const PATH_BOUNDARY_BEFORE = /[\s"'([{,;:=`]/;
+const PATH_BOUNDARY_AFTER = /[\s"'`)\]},;:]/;
+
+export function summaryContainsCompletePath(summary: string, path: string): boolean {
+  if (path.length === 0) return false;
+  let start = 0;
+  while (start <= summary.length - path.length) {
+    const index = summary.indexOf(path, start);
+    if (index === -1) return false;
+    const beforeOk = index === 0 || PATH_BOUNDARY_BEFORE.test(summary[index - 1]!);
+    const afterIndex = index + path.length;
+    const nextChar = summary[afterIndex];
+    const afterNextChar = summary[afterIndex + 1];
+    const afterOk =
+      afterIndex === summary.length ||
+      PATH_BOUNDARY_AFTER.test(nextChar!) ||
+      (nextChar === "." && (afterNextChar === undefined || /\s/.test(afterNextChar)));
+    if (beforeOk && afterOk) return true;
+    start = index + 1;
+  }
+  return false;
+}
+
+export function formatBoundedLocationLines(
+  paths: ReadonlyArray<string>,
+  maxChars = MAX_PERMISSION_LOCATION_CHARS,
+): ReadonlyArray<string> {
+  if (paths.length === 0) return [];
+  const lines: string[] = [];
+  let totalChars = 0;
+  for (const path of paths) {
+    if (lines.length === 0) {
+      const bounded =
+        path.length > maxChars ? `${withoutTrailingHighSurrogate(path.slice(0, maxChars))}…` : path;
+      lines.push(bounded);
+      totalChars = bounded.length;
+      continue;
+    }
+    const nextCost = 1 + path.length;
+    if (totalChars + nextCost > maxChars) {
+      const omitted = paths.length - lines.length;
+      lines.push(`… +${omitted} more ${omitted === 1 ? "file" : "files"}`);
+      break;
+    }
+    lines.push(path);
+    totalChars += nextCost;
+  }
+  return lines;
 }
 
 /** A location entry no path can be read from, so the changed paths of a request carrying it are unknown. */
@@ -1473,16 +1540,39 @@ export function parsePermissionRequest(
   // The person approves the command or title as the agent sent it, so the card gets its edges too:
   // a trailing carriage return is part of what would run.
   const sentTitle = params.toolCall.title ?? undefined;
-  const detail =
-    (toolCall?.command === undefined
+  const subjectCommand =
+    params.subject?.type === "command" &&
+    typeof params.subject.command === "string" &&
+    params.subject.command.trim().length > 0
+      ? params.subject.command
+      : undefined;
+  const extractedCommand =
+    toolCall?.command === undefined
       ? undefined
       : (extractToolCallCommand(params.toolCall.rawInput, sentTitle, toolCall.kind, true) ??
-        toolCall.command)) ??
+        toolCall.command);
+  // Presentation titles are generic ("Ran command", "Changed files"), so command and file
+  // requests keep the agent's own title, and a file request also lists its paths.
+  const agentTitle =
+    GENERIC_TITLE_KINDS.has(kind) && sentTitle !== undefined && sentTitle.trim().length > 0
+      ? sentTitle
+      : undefined;
+  const summary =
+    agentTitle ??
     (toolCall?.title !== undefined && toolCall.title === sentTitle?.trim()
       ? sentTitle
       : toolCall?.title) ??
-    toolCall?.detail ??
-    (typeof params.sessionId === "string" ? `Session ${params.sessionId}` : undefined);
+    toolCall?.detail;
+  const paths = formatBoundedLocationLines(
+    toolCallLocationPaths(toolCall).filter(
+      (path) => !summary || !summaryContainsCompletePath(summary, path),
+    ),
+  );
+  const detail =
+    subjectCommand ??
+    extractedCommand ??
+    ([...(summary ? [summary] : []), ...paths].join("\n") ||
+      (typeof params.sessionId === "string" ? `Session ${params.sessionId}` : undefined));
   return {
     kind,
     ...(detail ? { detail } : {}),

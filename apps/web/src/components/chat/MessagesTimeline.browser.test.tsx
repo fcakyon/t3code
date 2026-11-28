@@ -2196,7 +2196,10 @@ describe("MessagesTimeline attachments", () => {
       });
     await using screen = await renderTimeline(
       [read("first.png"), read("second.png"), read("third.png")],
-      { onImageExpand, workspaceRoot: "/repo" },
+      {
+        onImageExpand,
+        workspaceRoot: "/repo",
+      },
     );
     await click(screen.button(/^Read 3 files/));
     await vi.waitFor(() => expect(screen.buttons("Read")).toHaveLength(3));
@@ -2992,4 +2995,188 @@ it("keeps concurrent approvals actionable outside collapsed work and restores se
   await expect
     .element(screen.getByRole("button", { name: "Open the current tab", exact: true }))
     .toBeVisible();
+});
+
+it("highlights unified diffs in approval cards without changing text and triggers Open diff", async () => {
+  setup();
+  const fixture = makeStreamingTimelineFixture();
+  const diffText = [
+    "--- a/src/app/feature.ts",
+    "+++ b/src/app/feature.ts",
+    "@@ -1 +1 @@",
+    "-const value = 1;",
+    "+const value = 2;",
+  ].join("\n");
+  const target = {
+    threadId: fixture.threadId,
+    itemId: TurnItemId.make("file-change-pending"),
+    revision: "rev-pending",
+  };
+  const requestId = RuntimeRequestId.make("file-change-approval");
+  const approvals: PendingApproval[] = [
+    {
+      requestId,
+      requestKind: "file-change",
+      createdAt: fixture.time(6),
+      detail: diffText,
+      files: [{ path: "src/app/feature.ts", operation: "update", additions: 1, deletions: 1 }],
+      fileChangeTarget: target,
+      responseCapability: "live",
+    },
+  ];
+  const source = fixture.visibleTurnItems[4]!;
+  const onOpenToolDiff = vi.fn();
+  const timelineEntries = deriveTimelineEntriesFromVisibleTurnItems({
+    visibleTurnItems: [
+      {
+        ...source,
+        sourceItemId: TurnItemId.make("approval-file-item"),
+        item: {
+          ...(source.item as Extract<typeof source.item, { type: "dynamic_tool" }>),
+          id: TurnItemId.make("approval-file-item"),
+          type: "approval_request",
+          status: "waiting",
+          requestId,
+          requestKind: "file-change",
+          prompt: diffText,
+        },
+      },
+    ],
+    optimisticMessages: [],
+  });
+
+  await using screen = await renderElement(
+    <MessagesTimeline
+      {...baseProps()}
+      timelineEntries={timelineEntries}
+      pendingApprovals={approvals}
+      canOperateThread
+      onRespondToApproval={async () => {}}
+      onOpenToolDiff={onOpenToolDiff}
+    />,
+  );
+
+  const card = screen.getByRole("group", { name: "File change approval" }).element();
+  const detail = card.querySelector('[data-approval-detail="complete"]')!;
+  expect(detail.textContent).toBe(diffText);
+  expect(detail.querySelector(".text-diff-addition-foreground")?.textContent).toBe(
+    "+const value = 2;",
+  );
+  expect(detail.querySelector(".text-diff-deletion-foreground")?.textContent).toBe(
+    "-const value = 1;\n",
+  );
+
+  await screen.getByRole("button", { name: "Open diff", exact: true }).click();
+  expect(onOpenToolDiff).toHaveBeenCalledWith(target);
+});
+
+it("styles --- and +++ lines inside diff hunks as deletions and additions rather than headers", async () => {
+  setup();
+  const fixture = makeStreamingTimelineFixture();
+  const diffText = [
+    "--- a/src/app/feature.ts",
+    "+++ b/src/app/feature.ts",
+    "@@ -1 +1 @@",
+    "--- a comment removed inside hunk",
+    "+++ a comment added inside hunk",
+  ].join("\n");
+  const requestId = RuntimeRequestId.make("file-change-hunk-marker");
+  const approvals: PendingApproval[] = [
+    {
+      requestId,
+      requestKind: "file-change",
+      createdAt: fixture.time(6),
+      detail: diffText,
+      responseCapability: "live",
+    },
+  ];
+  const source = fixture.visibleTurnItems[4]!;
+  const timelineEntries = deriveTimelineEntriesFromVisibleTurnItems({
+    visibleTurnItems: [
+      {
+        ...source,
+        sourceItemId: TurnItemId.make("approval-hunk-marker-item"),
+        item: {
+          ...(source.item as Extract<typeof source.item, { type: "dynamic_tool" }>),
+          id: TurnItemId.make("approval-hunk-marker-item"),
+          type: "approval_request",
+          status: "waiting",
+          requestId,
+          requestKind: "file-change",
+          prompt: diffText,
+        },
+      },
+    ],
+    optimisticMessages: [],
+  });
+
+  await using screen = await renderElement(
+    <MessagesTimeline
+      {...baseProps()}
+      timelineEntries={timelineEntries}
+      pendingApprovals={approvals}
+      canOperateThread
+      onRespondToApproval={async () => {}}
+    />,
+  );
+
+  const detail = screen
+    .getByRole("group", { name: "File change approval" })
+    .element()
+    .querySelector('[data-approval-detail="complete"]')!;
+  expect(detail.querySelector(".text-diff-deletion-foreground")?.textContent).toBe(
+    "--- a comment removed inside hunk\n",
+  );
+  expect(detail.querySelector(".text-diff-addition-foreground")?.textContent).toBe(
+    "+++ a comment added inside hunk",
+  );
+});
+
+it("keeps long filenames in their own unshrunk segment for file_change work entries", async () => {
+  setup();
+  const fixture = makeStreamingTimelineFixture();
+  const source = fixture.visibleTurnItems[0]!;
+  const longPath = "/packages/very/long/nested/directory/structure/ImportantComponent.tsx";
+  const timelineEntries = deriveTimelineEntriesFromVisibleTurnItems({
+    visibleTurnItems: [
+      {
+        ...source,
+        sourceItemId: TurnItemId.make("work-file-change"),
+        item: {
+          id: TurnItemId.make("work-file-change"),
+          threadId: fixture.threadId,
+          runId: fixture.runId,
+          nodeId: NodeId.make("node-fc"),
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 0,
+          status: "completed",
+          title: null,
+          startedAt: source.item.startedAt,
+          completedAt: source.item.updatedAt,
+          updatedAt: source.item.updatedAt,
+          type: "file_change",
+          fileName: longPath,
+        },
+      },
+    ],
+    optimisticMessages: [],
+  });
+
+  await using screen = await renderElement(
+    <MessagesTimeline
+      {...baseProps()}
+      timelineEntries={timelineEntries}
+      isWorking
+      runningRunId={fixture.runId}
+    />,
+  );
+
+  expect(screen.text()).toContain(longPath);
+  const filenameSpan = [...screen.container.querySelectorAll("span.shrink-0")].find(
+    (node) => node.textContent === "/ImportantComponent.tsx",
+  );
+  expect(filenameSpan).toBeTruthy();
 });

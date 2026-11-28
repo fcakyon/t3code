@@ -56,6 +56,7 @@ import {
 import {
   antigravityApprovalOptions,
   antigravityCommandApproval,
+  antigravityNormalizePermissionRequest,
   antigravitySwarmAddChildSessionId,
   antigravitySwarmAddModel,
   antigravityToolOutlivesPrompt,
@@ -457,6 +458,7 @@ export function makeAntigravityAcpAdapterFlavor(
     },
     permissionDisposition: antigravityPermissionDisposition,
     approvalOptions: antigravityApprovalOptions,
+    normalizePermissionRequest: antigravityNormalizePermissionRequest,
     commandApproval: antigravityCommandApproval,
     extractPermissionQuestion: (request) => {
       const question = extractAntigravityUserInputQuestion(request);

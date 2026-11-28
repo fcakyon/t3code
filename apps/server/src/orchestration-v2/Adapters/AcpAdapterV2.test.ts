@@ -2115,7 +2115,11 @@ describe("AcpAdapterV2", () => {
           completed?.type === "provider_turn.updated"
             ? completed.providerTurn.turnTokenUsage
             : null,
-          { usageScope: "main_agent", usageStatus: "unavailable", hasSubagents: false },
+          {
+            usageScope: "main_agent",
+            usageStatus: "unavailable",
+            hasSubagents: false,
+          },
         );
       }
     }).pipe(Effect.provide(layerTest)),
@@ -5376,7 +5380,10 @@ describe("AcpAdapterV2", () => {
       const search = items.find((item) => item.type === "file_search");
       assert.deepEqual(
         search?.type === "file_search" ? { title: search.title, pattern: search.pattern } : null,
-        { title: "Searched TODO in web", pattern: "TODO" },
+        {
+          title: "Searched TODO in web",
+          pattern: "TODO",
+        },
       );
       const fileSearch = (nativeId: string) => {
         const item = items.find(
@@ -8067,6 +8074,308 @@ describe("AcpAdapterV2", () => {
           providerTurnId: answerOrRequest.runtimeRequest.providerTurnId,
         });
         yield* Fiber.join(turn.turnFiber);
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("normalizes ID-only permission requests after inheriting tracked tool fields", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const workspace = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-acp-normalize-order-",
+      });
+      type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let requestPermission: Parameters<RuntimeService["handleRequestPermission"]>[0] | undefined;
+      let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+      let runtimeInput: AcpAdapterV2RuntimeInput | undefined;
+      let observedRawInputOnNormalize: unknown;
+      const makeRuntime = makeMockRuntime({
+        childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+        mockAgentPath: yield* bundledMockAgentPath,
+        environment: { T3_ACP_HANG_PROMPT_FOREVER: "1" },
+        wrapRuntime: (nativeRuntime) => ({
+          ...nativeRuntime,
+          handleRequestPermission: (handler) =>
+            Effect.sync(() => {
+              requestPermission = handler;
+            }).pipe(Effect.andThen(nativeRuntime.handleRequestPermission(handler))),
+          handleSessionUpdate: (handler) =>
+            Effect.sync(() => {
+              sessionUpdate = handler;
+            }).pipe(Effect.andThen(nativeRuntime.handleSessionUpdate(handler))),
+        }),
+      });
+      const instanceId = ProviderInstanceId.make("acp-test-id-only-normalize-order");
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          interruptPromptOnCancel: true,
+          makeRuntime: (input) =>
+            Effect.sync(() => {
+              runtimeInput = input;
+            }).pipe(Effect.andThen(makeRuntime(input))),
+          normalizePermissionRequest: (request) => {
+            if (request.toolCall.toolCallId !== "id-only-flavor") return request;
+            observedRawInputOnNormalize = request.toolCall.rawInput;
+            return {
+              ...request,
+              toolCall: {
+                ...request.toolCall,
+                kind: "execute",
+                title: "Normalized pwd",
+              },
+            };
+          },
+        },
+        selfInvocation: yield* resolveSelfInvocation(),
+        clientTerminals: {},
+      });
+      const threadId = ThreadId.make("thread-acp-normalize-order");
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "auto-accept-edits",
+        interactionMode: "default",
+        cwd: workspace,
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-acp-normalize-order"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const turnFiber = yield* runtime
+        .startTurn(
+          makeTurnInput({
+            threadId,
+            providerThread,
+            instanceId,
+            runtimePolicy,
+            now: yield* DateTime.now,
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      const acknowledge = runtimeInput?.onOutgoingResponse;
+      if (!requestPermission || !sessionUpdate || !acknowledge) {
+        return yield* Effect.die("ACP runtime must register its handlers");
+      }
+      const options = [
+        { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+        { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+      ] as const;
+
+      // Wait until the forked startTurn fiber sets activeTurn before emitting session updates.
+      yield* runtime.events.pipe(
+        Stream.filter(
+          (event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+        ),
+        Stream.runHead,
+      );
+
+      yield* sessionUpdate({
+        sessionId: "mock-session-1",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "id-only-flavor",
+          title: "Raw title",
+          kind: "other",
+          status: "pending",
+          rawInput: { command: "pwd" },
+        },
+      });
+
+      const fiber = yield* requestPermission(
+        {
+          sessionId: "mock-session-1",
+          toolCall: { toolCallId: "id-only-flavor" },
+          options,
+        },
+        { requestId: "id-only-flavor-request", method: "session/request_permission" },
+      ).pipe(Effect.forkScoped);
+
+      const approvalEvent = Option.getOrThrow(
+        yield* runtime.events.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "turn_item.updated" && event.turnItem.type === "approval_request",
+          ),
+          Stream.runHead,
+        ),
+      );
+      if (
+        approvalEvent.type !== "turn_item.updated" ||
+        approvalEvent.turnItem.type !== "approval_request" ||
+        approvalEvent.turnItem.providerTurnId === null
+      ) {
+        return yield* Effect.die("Expected an ACP approval request");
+      }
+      assert.deepEqual(observedRawInputOnNormalize, { command: "pwd" });
+      assert.equal(approvalEvent.turnItem.requestKind, "command");
+      assert.equal(approvalEvent.turnItem.prompt, "pwd");
+
+      const responseFiber = yield* runtime
+        .respondToRuntimeRequest({
+          requestId: approvalEvent.turnItem.requestId,
+          decision: "decline",
+        })
+        .pipe(Effect.forkScoped);
+      yield* Fiber.join(fiber);
+      yield* acknowledge("id-only-flavor-request");
+      yield* Fiber.join(responseFiber);
+      yield* runtime.interruptTurn({
+        providerThread,
+        providerTurnId: approvalEvent.turnItem.providerTurnId,
+      });
+      yield* Fiber.join(turnFiber);
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect(
+    "preserves explicit null toolCall kind on policy requests instead of inheriting tracked edit kind",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const workspace = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-acp-explicit-null-kind-",
+        });
+        type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let requestPermission: Parameters<RuntimeService["handleRequestPermission"]>[0] | undefined;
+        let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+        let runtimeInput: AcpAdapterV2RuntimeInput | undefined;
+        const makeRuntime = makeMockRuntime({
+          childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+          mockAgentPath: yield* bundledMockAgentPath,
+          environment: { T3_ACP_HANG_PROMPT_FOREVER: "1" },
+          wrapRuntime: (nativeRuntime) => ({
+            ...nativeRuntime,
+            handleRequestPermission: (handler) =>
+              Effect.sync(() => {
+                requestPermission = handler;
+              }).pipe(Effect.andThen(nativeRuntime.handleRequestPermission(handler))),
+            handleSessionUpdate: (handler) =>
+              Effect.sync(() => {
+                sessionUpdate = handler;
+              }).pipe(Effect.andThen(nativeRuntime.handleSessionUpdate(handler))),
+          }),
+        });
+        const instanceId = ProviderInstanceId.make("acp-test-explicit-null-kind");
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            interruptPromptOnCancel: true,
+            makeRuntime: (input) =>
+              Effect.sync(() => {
+                runtimeInput = input;
+              }).pipe(Effect.andThen(makeRuntime(input))),
+          },
+          selfInvocation: yield* resolveSelfInvocation(),
+          clientTerminals: {},
+        });
+        const threadId = ThreadId.make("thread-acp-explicit-null-kind");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "auto-accept-edits",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const modelSelection = { instanceId, model: "default" } as const;
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("provider-session-acp-null-kind"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const turnFiber = yield* runtime
+          .startTurn(
+            makeTurnInput({
+              threadId,
+              providerThread,
+              instanceId,
+              runtimePolicy,
+              now: yield* DateTime.now,
+            }),
+          )
+          .pipe(Effect.forkScoped);
+        const acknowledge = runtimeInput?.onOutgoingResponse;
+        if (!requestPermission || !sessionUpdate || !acknowledge) {
+          return yield* Effect.die("ACP runtime must register its handlers");
+        }
+        const options = [
+          { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+          { optionId: "reject-once", name: "Reject", kind: "reject_once" },
+        ] as const;
+        const inside = path.join(workspace, "a.ts");
+
+        // Wait until the forked startTurn fiber sets activeTurn before emitting session updates.
+        yield* runtime.events.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "provider_turn.updated" && event.providerTurn.status === "running",
+          ),
+          Stream.runHead,
+        );
+
+        yield* sessionUpdate({
+          sessionId: "mock-session-1",
+          update: {
+            sessionUpdate: "tool_call",
+            toolCallId: "explicit-null-kind",
+            title: "Run tool",
+            kind: "edit",
+            status: "pending",
+            locations: [{ path: inside }],
+          },
+        });
+
+        const fiber = yield* requestPermission(
+          {
+            sessionId: "mock-session-1",
+            toolCall: { toolCallId: "explicit-null-kind", kind: null },
+            options,
+          },
+          { requestId: "explicit-null-kind-request", method: "session/request_permission" },
+        ).pipe(Effect.forkScoped);
+
+        const pending = Option.getOrThrow(
+          yield* runtime.events.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "runtime_request.updated" &&
+                event.runtimeRequest.status === "pending",
+            ),
+            Stream.runHead,
+          ),
+        );
+        if (
+          pending.type !== "runtime_request.updated" ||
+          pending.runtimeRequest.providerTurnId === null
+        ) {
+          return yield* Effect.die("Expected explicit null kind permission request to ask");
+        }
+        const responseFiber = yield* runtime
+          .respondToRuntimeRequest({ requestId: pending.runtimeRequest.id, decision: "decline" })
+          .pipe(Effect.forkScoped);
+        yield* Fiber.join(fiber);
+        yield* acknowledge("explicit-null-kind-request");
+        yield* Fiber.join(responseFiber);
+        yield* runtime.interruptTurn({
+          providerThread,
+          providerTurnId: pending.runtimeRequest.providerTurnId,
+        });
+        yield* Fiber.join(turnFiber);
       }).pipe(Effect.provide(layerTest)),
   );
 

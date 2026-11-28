@@ -2,6 +2,8 @@ import type {
   EnvironmentId,
   ScopedThreadRef,
   ThreadId,
+  TurnItemId,
+  OrchestrationV2FileChangeDetail,
   OrchestrationV2ThreadProjection,
   OrchestrationV2RuntimeRequest,
   OrchestrationV2UserInputQuestion,
@@ -19,6 +21,7 @@ import type { EnvironmentThreadShell } from "./models.ts";
 import * as DateTime from "effect/DateTime";
 import type { AtomCommandResult } from "./runtime.ts";
 import type { ThreadStructure, ThreadStructureVisibleTurnItem } from "./models.ts";
+import { turnItemDetailRevision } from "../work-log/itemDetail.ts";
 import { mFallback, msg } from "gt-i18n";
 import type { MFunctionType } from "gt-i18n/types";
 
@@ -52,12 +55,27 @@ export async function declinePendingApprovals(
   return true;
 }
 
+export interface ThreadPendingApprovalFile {
+  readonly path: string;
+  readonly operation?: OrchestrationV2FileChangeDetail["operation"];
+  readonly additions?: number;
+  readonly deletions?: number;
+}
+
+export interface ThreadPendingApprovalFileChangeTarget {
+  readonly threadId: ThreadId;
+  readonly itemId: TurnItemId;
+  readonly revision: string;
+}
+
 export interface ThreadPendingApproval {
   readonly requestId: RuntimeRequestId;
   readonly requestKind: ProviderRequestKind;
   readonly createdAt: string;
   readonly detail?: string;
   readonly commandSummary?: string;
+  readonly files?: ReadonlyArray<ThreadPendingApprovalFile>;
+  readonly fileChangeTarget?: ThreadPendingApprovalFileChangeTarget;
   readonly reason?: string;
   readonly fullAccessOverride?: ProviderApprovalFullAccessOverride;
   readonly appName?: string;
@@ -497,16 +515,44 @@ export function derivePendingThreadRequests(
 ): PendingThreadRequests {
   const approvals: ThreadPendingApproval[] = [];
   const userInputs: ThreadPendingUserInput[] = [];
+  if (!projection.runtimeRequests.some((request) => request.status === "pending")) {
+    return { approvals, userInputs };
+  }
+
+  type UserInputRequestItem = Extract<
+    ThreadStructure["turnItems"][number],
+    { readonly type: "user_input_request" }
+  >;
+  type ApprovalRequestItem = Extract<
+    ThreadStructure["turnItems"][number],
+    { readonly type: "approval_request" }
+  >;
+  type FileChangeItem = Extract<
+    ThreadStructure["turnItems"][number],
+    { readonly type: "file_change" }
+  >;
+
+  const userInputItems = new Map<RuntimeRequestId, UserInputRequestItem>();
+  const approvalItems = new Map<RuntimeRequestId, ApprovalRequestItem>();
+  const fileChangeItems = new Map<string, FileChangeItem>();
+  for (let index = projection.turnItems.length - 1; index >= 0; index -= 1) {
+    const candidate = projection.turnItems[index]!;
+    if (candidate.type === "user_input_request" && !userInputItems.has(candidate.requestId)) {
+      userInputItems.set(candidate.requestId, candidate);
+    } else if (candidate.type === "approval_request" && !approvalItems.has(candidate.requestId)) {
+      approvalItems.set(candidate.requestId, candidate);
+    } else if (candidate.type === "file_change" && candidate.nativeItemRef != null) {
+      const key = `${candidate.runId ?? ""}\0${candidate.nativeItemRef.driver}\0${candidate.nativeItemRef.nativeId}`;
+      if (!fileChangeItems.has(key)) fileChangeItems.set(key, candidate);
+    }
+  }
 
   for (const request of projection.runtimeRequests) {
     if (request.status !== "pending") continue;
     const responseCapability = request.responseCapability.type;
     if (request.kind === "user_input") {
-      const item = projection.turnItems.findLast(
-        (candidate) =>
-          candidate.type === "user_input_request" && candidate.requestId === request.id,
-      );
-      if (item === undefined || item.type !== "user_input_request") continue;
+      const item = userInputItems.get(request.id);
+      if (item === undefined) continue;
       userInputs.push({
         requestId: request.id,
         createdAt: DateTime.formatIso(request.createdAt),
@@ -524,26 +570,55 @@ export function derivePendingThreadRequests(
     }
 
     if (request.kind === "auth_refresh" || request.kind === "dynamic_tool_call") continue;
-    const item = projection.turnItems.findLast(
-      (candidate) => candidate.type === "approval_request" && candidate.requestId === request.id,
-    );
+    const item = approvalItems.get(request.id);
+    const nativeItemRef = item?.nativeItemRef;
+    const fileChange =
+      request.kind === "file-change" && item !== undefined && nativeItemRef != null
+        ? fileChangeItems.get(
+            `${item.runId ?? ""}\0${nativeItemRef.driver}\0${nativeItemRef.nativeId}`,
+          )
+        : undefined;
+    const counts =
+      fileChange !== undefined &&
+      (fileChange.changes === undefined || fileChange.changes.length <= 1)
+        ? {
+            ...(fileChange.additions !== undefined ? { additions: fileChange.additions } : {}),
+            ...(fileChange.deletions !== undefined ? { deletions: fileChange.deletions } : {}),
+          }
+        : undefined;
+    const files: ReadonlyArray<ThreadPendingApprovalFile> | undefined =
+      fileChange === undefined
+        ? undefined
+        : fileChange.changes && fileChange.changes.length > 0
+          ? fileChange.changes.map((change) => ({
+              path: change.path,
+              operation: change.operation,
+              ...(fileChange.changes?.length === 1 ? counts : undefined),
+            }))
+          : fileChange.fileName.trim() !== ""
+            ? [{ path: fileChange.fileName, ...counts }]
+            : undefined;
+    const fileChangeTarget: ThreadPendingApprovalFileChangeTarget | undefined =
+      fileChange !== undefined
+        ? {
+            threadId: fileChange.threadId,
+            itemId: fileChange.id,
+            revision: turnItemDetailRevision(fileChange),
+          }
+        : undefined;
     approvals.push({
       requestId: request.id,
       requestKind: request.kind,
       createdAt: DateTime.formatIso(request.createdAt),
-      ...(item?.type === "approval_request" && item.prompt ? { detail: item.prompt } : {}),
-      ...(item?.type === "approval_request" && item.commandSummary
-        ? { commandSummary: item.commandSummary }
-        : {}),
-      ...(item?.type === "approval_request" && item.reason ? { reason: item.reason } : {}),
-      ...(item?.type === "approval_request" && item.fullAccessOverride
-        ? { fullAccessOverride: item.fullAccessOverride }
-        : {}),
-      ...(item?.type === "approval_request" && item.appName ? { appName: item.appName } : {}),
-      ...(item?.type === "approval_request" && item.pushHooks ? { pushHooks: item.pushHooks } : {}),
-      ...(item?.type === "approval_request" && item.options !== undefined
-        ? { options: item.options }
-        : {}),
+      ...(item?.prompt ? { detail: item.prompt } : {}),
+      ...(item?.commandSummary ? { commandSummary: item.commandSummary } : {}),
+      ...(files ? { files } : {}),
+      ...(fileChangeTarget !== undefined ? { fileChangeTarget } : {}),
+      ...(item?.reason ? { reason: item.reason } : {}),
+      ...(item?.fullAccessOverride ? { fullAccessOverride: item.fullAccessOverride } : {}),
+      ...(item?.appName ? { appName: item.appName } : {}),
+      ...(item?.pushHooks ? { pushHooks: item.pushHooks } : {}),
+      ...(item?.options !== undefined ? { options: item.options } : {}),
       responseCapability: responseCapability === "live" ? "live" : "not_resumable",
       ...(request.responseCapability.type === "live" && request.responseCapability.supportsFeedback
         ? { supportsFeedback: true }

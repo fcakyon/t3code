@@ -11,6 +11,7 @@ import {
   acpChangedPathsOfToolCall,
   acpClientExecuteDisposition,
   acpMcpToolApprovalElicitationDisposition,
+  acpPermissionAskReason,
   acpPermissionDisposition,
   makeAcpClientPolicyGrants,
   mergeAcpChangedPaths,
@@ -622,5 +623,66 @@ describe("makeAcpClientPolicyGrants", () => {
     grants.recordApproval({ toolKind: "execute", scope: "turn", turnKey: "turn-2" });
     assert.isFalse(grants.allowsExecute("turn-1"));
     assert.isTrue(grants.allowsExecute("turn-2"));
+  });
+});
+
+describe("acpPermissionAskReason", () => {
+  const cwd = NodePath.resolve(process.cwd(), "acp-ask-reason-workspace");
+  const outsidePath = NodePath.resolve(cwd, "..", "outside.ts");
+  const insidePath = NodePath.join(cwd, "src", "inside.ts");
+
+  it("explains auto-accept-edits asks for outside or unverified paths and stays silent otherwise", () => {
+    const autoAccept: AcpRuntimePolicy = { runtimeMode: "auto-accept-edits", cwd };
+    assert.equal(
+      acpPermissionAskReason(autoAccept, permissionRequest("edit", [{ path: outsidePath }])),
+      "Edits files outside the current workspace.",
+    );
+    assert.equal(
+      acpPermissionAskReason(autoAccept, permissionRequest("edit")),
+      "Target file paths could not be verified inside the workspace.",
+    );
+    assert.isUndefined(
+      acpPermissionAskReason(autoAccept, permissionRequest("edit", [{ path: insidePath }])),
+    );
+    assert.isUndefined(acpPermissionAskReason(autoAccept, permissionRequest("execute")));
+    assert.isUndefined(
+      acpPermissionAskReason(
+        { runtimeMode: "approval-required", cwd },
+        permissionRequest("edit", [{ path: outsidePath }]),
+      ),
+    );
+    assert.equal(
+      acpPermissionAskReason(
+        { runtimeMode: "auto-accept-edits", cwd: null },
+        permissionRequest("edit", [{ path: insidePath }]),
+      ),
+      "Target file paths could not be verified inside the workspace.",
+    );
+    assert.isUndefined(
+      acpPermissionAskReason(
+        {
+          runtimeMode: "auto-accept-edits",
+          cwd,
+          sandboxPolicy: { type: "dangerFullAccess" },
+        },
+        permissionRequest("edit", [{ path: outsidePath }]),
+      ),
+    );
+    assert.equal(
+      acpPermissionAskReason(
+        { runtimeMode: "auto", cwd },
+        permissionRequest("edit", [{ path: outsidePath }]),
+      ),
+      "Edits files outside the current workspace.",
+    );
+    assert.isUndefined(
+      acpPermissionAskReason(
+        { runtimeMode: "auto", cwd },
+        permissionRequest("edit", [{ path: insidePath }]),
+      ),
+    );
+    assert.isUndefined(
+      acpPermissionAskReason({ runtimeMode: "auto", cwd }, permissionRequest("edit")),
+    );
   });
 });

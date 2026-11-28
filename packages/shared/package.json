@@ -698,6 +698,10 @@
     "./assistantInsights": {
       "types": "./src/assistantInsights.ts",
       "import": "./src/assistantInsights.ts"
+    },
+    "./approvalPrompt": {
+      "types": "./src/approvalPrompt.ts",
+      "import": "./src/approvalPrompt.ts"
     }
   },
   "scripts": {

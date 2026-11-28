@@ -7,6 +7,7 @@ import {
   ThreadId,
   type ScopedThreadRef,
   NodeId,
+  ProviderDriverKind,
   ProviderSessionId,
   RuntimeRequestId,
   TurnItemId,
@@ -295,7 +296,9 @@ describe("initial user input drafts", () => {
     expect(seedUserInputDraftAnswers(questions, edits)).toEqual(edits);
     expect(
       seedUserInputDraftAnswers(questions, { editor: { customAnswer: "Edited commit" } }).editor,
-    ).toEqual({ customAnswer: "Edited commit" });
+    ).toEqual({
+      customAnswer: "Edited commit",
+    });
     expect(seedUserInputDraftAnswers(questions, {}).editor).toEqual({
       customAnswer: "  Proposed commit\n\n",
     });
@@ -945,4 +948,124 @@ it("splits a megabyte of approval text the same way as a short one", () => {
   // Every other character named: one run each.
   expect(count(fill("a\r"))).toEqual([size, size / 2]);
   expect(count(fill("a"))).toEqual([1, 0]);
+});
+
+describe("linking pending file-change approvals to turn items", () => {
+  it("populates files and fileChangeTarget when a matching file_change shares nativeItemRef", () => {
+    const driver = ProviderDriverKind.make("claudeAgent");
+    const reqId = RuntimeRequestId.make("fc-req-1");
+    const unmatchedReqId = RuntimeRequestId.make("fc-req-2");
+    const fcItemId = TurnItemId.make("fc-item-1");
+    const pending = derivePendingThreadRequests({
+      runtimeRequests: [
+        {
+          id: reqId,
+          nodeId,
+          providerTurnId: null,
+          nativeRequestRef: { driver, nativeId: "native-1", strength: "strong" },
+          kind: "file-change",
+          status: "pending",
+          responseCapability: {
+            type: "live",
+            providerSessionId: ProviderSessionId.make("claude-session"),
+          },
+          createdAt: v2Now,
+          resolvedAt: null,
+        },
+        {
+          id: unmatchedReqId,
+          nodeId,
+          providerTurnId: null,
+          nativeRequestRef: {
+            driver,
+            nativeId: "native-missing",
+            strength: "strong",
+          },
+          kind: "file-change",
+          status: "pending",
+          responseCapability: {
+            type: "live",
+            providerSessionId: ProviderSessionId.make("claude-session"),
+          },
+          createdAt: v2Now,
+          resolvedAt: null,
+        },
+      ],
+      turnItems: [
+        {
+          id: fcItemId,
+          threadId: v2Projection.thread.id,
+          runId: null,
+          nodeId,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: { driver, nativeId: "native-1", strength: "strong" },
+          parentItemId: null,
+          ordinal: 0,
+          status: "running",
+          title: null,
+          startedAt: v2Now,
+          completedAt: null,
+          updatedAt: v2Now,
+          type: "file_change",
+          fileName: "src/app.ts",
+          additions: 3,
+          deletions: 1,
+          changes: [{ operation: "update", path: "src/app.ts" }],
+        },
+        {
+          id: TurnItemId.make("approval-item-1"),
+          threadId: v2Projection.thread.id,
+          runId: null,
+          nodeId,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: { driver, nativeId: "native-1", strength: "strong" },
+          parentItemId: null,
+          ordinal: 1,
+          status: "waiting",
+          title: null,
+          startedAt: v2Now,
+          completedAt: null,
+          updatedAt: v2Now,
+          type: "approval_request",
+          requestId: reqId,
+          requestKind: "file-change",
+          prompt: "--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1 @@\n-a\n+b",
+        },
+        {
+          id: TurnItemId.make("approval-item-2"),
+          threadId: v2Projection.thread.id,
+          runId: null,
+          nodeId,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: { driver, nativeId: "native-other", strength: "strong" },
+          parentItemId: null,
+          ordinal: 2,
+          status: "waiting",
+          title: null,
+          startedAt: v2Now,
+          completedAt: null,
+          updatedAt: v2Now,
+          type: "approval_request",
+          requestId: unmatchedReqId,
+          requestKind: "file-change",
+          prompt: "Edit /tmp/other.ts",
+        },
+      ],
+    });
+
+    expect(pending.approvals).toHaveLength(2);
+    expect(pending.approvals[0]?.files).toEqual([
+      { path: "src/app.ts", operation: "update", additions: 3, deletions: 1 },
+    ]);
+    expect(pending.approvals[0]?.fileChangeTarget).toEqual({
+      threadId: v2Projection.thread.id,
+      itemId: fcItemId,
+      revision: expect.any(String),
+    });
+    expect(pending.approvals[1]?.files).toBeUndefined();
+    expect(pending.approvals[1]?.fileChangeTarget).toBeUndefined();
+  });
 });

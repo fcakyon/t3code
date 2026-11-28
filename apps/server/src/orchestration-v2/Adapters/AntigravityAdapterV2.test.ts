@@ -2177,6 +2177,48 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
     }).pipe(Effect.provide(layerSession)),
   );
 
+  it.effect("explains out-of-workspace edits under auto-accept-edits and includes the diff", () =>
+    Effect.gen(function* () {
+      const outsidePath = yield* Path.Path.pipe(
+        Effect.map((p) => p.resolve(process.cwd(), "..", "outside-antigravity-edit.ts")),
+      );
+      const { startTurn, throughPromptSettled, requestPermission, until } =
+        yield* openSessionWithRunningCommand(
+          { CommandLine: "node fetch_throughput.mjs" },
+          undefined,
+          undefined,
+          { runtimeMode: "auto-accept-edits" },
+        );
+      yield* startTurn(1, false);
+      yield* throughPromptSettled;
+      yield* requestPermission(
+        {
+          sessionId: "mock-session-1",
+          toolCall: {
+            toolCallId: "edit-outside-1",
+            kind: "other",
+            title: "Edit file",
+            content: [{ type: "diff", path: outsidePath, oldText: "before\n", newText: "after\n" }],
+            rawInput: { TargetFile: outsidePath, toolSummary: "Update external config" },
+          },
+          options: [{ optionId: "allow", name: "Allow once", kind: "allow_once" }],
+        },
+        { requestId: "approve-outside-edit", method: "session/request_permission" },
+      ).pipe(Effect.forkScoped);
+      const event = (yield* until(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "approval_request",
+      )).at(-1);
+      assert.equal(event?.type, "turn_item.updated");
+      if (event?.type === "turn_item.updated" && event.turnItem.type === "approval_request") {
+        assert.equal(event.turnItem.requestKind, "file-change");
+        assert.equal(event.turnItem.commandSummary, "Update external config");
+        assert.equal(event.turnItem.reason, "Edits files outside the current workspace.");
+        assert.include(event.turnItem.prompt ?? "", "-before");
+        assert.include(event.turnItem.prompt ?? "", "+after");
+      }
+    }).pipe(Effect.provide(layerSession)),
+  );
+
   // agy sets `IsDaemon` on a command it does not wait for. When it exits, the agent replies
   // with no prompt open.
   it.effect("continues in one run when a finished daemon wakes the agent", () =>

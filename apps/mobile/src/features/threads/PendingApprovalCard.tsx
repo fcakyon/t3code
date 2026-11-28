@@ -13,6 +13,7 @@ import {
   PUSH_HOOKS_APPROVAL_QUESTION,
   pushHooksApprovalRows,
 } from "@t3tools/client-runtime/state/thread-requests";
+import { isUnifiedDiffText } from "@t3tools/shared/approvalPrompt";
 import { T, useGT, useMessages } from "gt-react-native";
 import { type ComponentRef, useRef, useState } from "react";
 import { Pressable, ScrollView, View } from "react-native";
@@ -47,9 +48,14 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
   const [explanationOpen, setExplanationOpen] = useState(false);
   // T3 Code's own question reads as the app asking: a plain sentence, then what it names.
   const { pushHooks, commandSummary } = props.approval;
-  const [showCommand, setShowCommand] = useState(false);
+  const files = props.approval.files ?? [];
+  const isDiff = Boolean(props.approval.detail && isUnifiedDiffText(props.approval.detail));
+  const hasCollapsibleDetail = Boolean(
+    !pushHooks && props.approval.detail && (commandSummary || files.length > 0),
+  );
+  const [showDetail, setShowDetail] = useState(false);
   const detail =
-    !pushHooks && (!commandSummary || showCommand) && props.approval.detail
+    !pushHooks && (!hasCollapsibleDetail || showDetail) && props.approval.detail
       ? approvalTextParts(props.approval.detail)
       : null;
   return (
@@ -62,15 +68,44 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
           ? m(PUSH_HOOKS_APPROVAL_QUESTION)
           : (commandSummary ?? props.approval.appName ?? props.approval.requestKind)}
       </Text>
-      {commandSummary && props.approval.detail ? (
+      {!pushHooks && files.length > 0 ? (
+        <View className="gap-1">
+          {files.map((file, index) => (
+            <View
+              // oxlint-disable-next-line react/no-array-index-key -- approval file entries do not reorder
+              key={`${file.operation ?? "change"}:${file.path}:${index}`}
+              className="flex-row items-center gap-2"
+            >
+              <Text
+                numberOfLines={1}
+                ellipsizeMode="middle"
+                className="flex-1 font-mono text-xs text-foreground"
+              >
+                {file.path}
+              </Text>
+              {file.additions !== undefined || file.deletions !== undefined ? (
+                <View className="shrink-0 flex-row items-center gap-1.5">
+                  <Text className="font-t3-medium text-2xs tabular-nums text-adaptive-emerald-600-400">
+                    +{file.additions ?? 0}
+                  </Text>
+                  <Text className="font-t3-medium text-2xs tabular-nums text-danger-foreground">
+                    -{file.deletions ?? 0}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+          ))}
+        </View>
+      ) : null}
+      {hasCollapsibleDetail ? (
         <Pressable
           accessibilityRole="button"
-          accessibilityState={{ expanded: showCommand }}
-          onPress={() => setShowCommand(!showCommand)}
+          accessibilityState={{ expanded: showDetail }}
+          onPress={() => setShowDetail((open) => !open)}
           className="min-h-11 flex-row items-center gap-1"
         >
           <SymbolView
-            name={showCommand ? "chevron.down" : "chevron.right"}
+            name={showDetail ? "chevron.down" : "chevron.right"}
             size={12}
             tintColorClassName="accent-icon-muted"
           />
@@ -93,24 +128,22 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
           ))}
         </View>
       ) : detail ? (
-        <>
-          {detail.hiddenLength > 0 ? (
-            <>
-              <ApprovalTextScroll parts={detail.parts} />
-              <Text className="font-sans text-xs leading-normal text-warning-foreground">
-                {gt(
-                  "{count, plural, one {… {hidden} character in the middle is not shown.} other {… {hidden} characters in the middle are not shown.}} The text ends with:",
-                  { count: detail.hiddenLength, hidden: detail.hiddenLength.toLocaleString() },
-                )}
-              </Text>
-              <ApprovalTextScroll parts={detail.tail} fromEnd />
-            </>
-          ) : commandSummary ? (
-            <ApprovalTextScroll parts={detail.parts} />
-          ) : (
-            <ApprovalTextParts parts={detail.parts} />
-          )}
-        </>
+        detail.hiddenLength > 0 ? (
+          <>
+            <ApprovalTextScroll parts={detail.parts} monospace={isDiff} />
+            <Text className="font-sans text-xs leading-normal text-warning-foreground">
+              {gt(
+                "{count, plural, one {… {hidden} character in the middle is not shown.} other {… {hidden} characters in the middle are not shown.}} The text ends with:",
+                { count: detail.hiddenLength, hidden: detail.hiddenLength.toLocaleString() },
+              )}
+            </Text>
+            <ApprovalTextScroll parts={detail.tail} monospace={isDiff} fromEnd />
+          </>
+        ) : hasCollapsibleDetail || isDiff ? (
+          <ApprovalTextScroll parts={detail.parts} monospace={isDiff} />
+        ) : (
+          <ApprovalTextParts parts={detail.parts} monospace={isDiff} />
+        )
       ) : null}
       {props.approval.reason ? (
         <Text className="font-sans text-xs leading-normal text-warning-foreground">
@@ -177,6 +210,7 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
  */
 function ApprovalTextScroll(props: {
   readonly parts: ReadonlyArray<ApprovalTextPart>;
+  readonly monospace?: boolean;
   readonly fromEnd?: boolean;
 }) {
   const box = useRef<ComponentRef<typeof ScrollView>>(null);
@@ -189,14 +223,23 @@ function ApprovalTextScroll(props: {
         props.fromEnd ? () => box.current?.scrollToEnd({ animated: false }) : undefined
       }
     >
-      <ApprovalTextParts parts={props.parts} />
+      <ApprovalTextParts parts={props.parts} monospace={props.monospace} />
     </ScrollView>
   );
 }
 
-function ApprovalTextParts(props: { readonly parts: ReadonlyArray<ApprovalTextPart> }) {
+function ApprovalTextParts(props: {
+  readonly parts: ReadonlyArray<ApprovalTextPart>;
+  readonly monospace?: boolean;
+}) {
   return (
-    <Text className="font-sans text-sm leading-normal text-foreground-secondary">
+    <Text
+      className={
+        props.monospace
+          ? "font-mono text-xs leading-normal text-foreground-secondary"
+          : "font-sans text-sm leading-normal text-foreground-secondary"
+      }
+    >
       {props.parts.map((part, index) =>
         part.named ? (
           // Tinted only: a second font inside wrapped lines makes Android lay the text out shorter
