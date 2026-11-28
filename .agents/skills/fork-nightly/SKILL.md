@@ -1,6 +1,6 @@
 ---
 name: fork-nightly
-description: Maintain the fcakyon/t3code fork. Use when syncing upstream into nightly, resolving fork merge conflicts, building or publishing a fork nightly release, deploying a release to the local T3 runtime, or when GitHub Actions on the fork is disabled.
+description: Maintain the fcakyon/t3code fork and contribute upstream to pingdotgg/t3code. Use when syncing upstream into nightly, resolving fork merge conflicts, building or publishing a fork nightly release, deploying a release to the local T3 runtime, when GitHub Actions on the fork is disabled, or when preparing or reviewing upstream PRs, commits, or issues for pingdotgg/t3code.
 ---
 
 # Fork nightly
@@ -39,3 +39,28 @@ The T3 Code maintenance task on akyon-server runs this every 6 hours from `/home
 - [Background service](../../../docs/user/background-service.md) covers `t3 update` and `t3 service install`. Keep `~/.local/bin/t3` as the standard runtime symlink so the updater can repoint it.
 - Installed runtime directories are release artifacts. Never overwrite their executables with a local build or select versions through a custom `current.json` launcher. Local builds inherit the checkout's package version, which can differ from the release directory and stop the service at startup.
 - After an update, verify `t3 --version`, `t3 service status`, HTTP on port 3773, and a saved client connection before reporting success. Do not edit service state by hand.
+
+## Upstream PRs, commits, and issues (pingdotgg/t3code)
+
+1. **Eligibility & limits (`CONTRIBUTING.md`):**
+   - External PRs (including drafts) must fix a concrete bug (`#prior-approval`: crash, regression, or real performance problem). Do not submit features, UI overhauls, new providers, or architecture/auth/source-control/platform additions unless vouched in `.github/VOUCHED.td` (up to 3 small, focused feature PRs open at once under `#vouched-features`, while UI overhauls, new providers, architecture, source control, auth, and platforms remain closed) or explicitly requested by a maintainer listed in `.github/TRIAGE_EXEMPTIONS.td` (link the issue or request).
+   - Strictly one underlying problem per PR (`#one-problem`): include every necessary change across contracts, server, clients, tests, and docs, and put cleanup, refactors, and unrelated fixes in separate PRs.
+   - Max 3 open PRs at once until vouched (`#open-pr-limit`), keep PRs mergeable within the 7-day `needs-rebase` conflict window (`#conflict-window`), and never spam, ping repeatedly, fight closures, use secondary accounts, or ask to be added to `.github/VOUCHED.td` (`#bans`).
+2. **Accepted models & attribution (`CONTRIBUTING.md#models`):**
+   - Do not open or write PR code with disallowed models (Gemini models other than `Gemini 4 Neon`, such as `Argon`, or Muse Wonder models other than `Muse Wonder Full`). Allowed models include `Gemini 4 Neon`, `GPT-6.2 Astra`, `Claude Opus`/`Fable`, and `Muse Wonder Full`. Disallowed models used only as a reviewer are acceptable. If asked to file an upstream PR using a disallowed model, decline and cite this rule.
+   - Always end PR bodies with an honest `Model: <exact model> (<harness>)` line. When `Gemini 4 Neon` wrote or contributed code, name `Gemini 4 Neon` verbatim (never bare `Gemini`).
+3. **Commits & PR diff hygiene:**
+   - Branch from the latest `upstream/main` with a minimal, clean diff. Prefer 1 squashed commit before review/merge, and never bundle unrelated fork patches, `fcakyon-changelog.md`, or temporary scripts/artifacts.
+   - PR titles use plain-language conventional commit format with scope (`fix(server): ...`, `fix(antigravity): ...`).
+   - Local repo commits follow the pre-tool/repo commit convention: plain type without scope (`fix:`, `feat:`, `refactor:`, `docs:`, `test:`), concise summary + short body explaining why, a blank line, and a lowercase `verification:` trailer.
+4. **PR body format & voucher-level verification (`.github/pull_request_template.md` + `CONTRIBUTING.md#verification`):**
+   - Strip HTML comment instructions and always use the four template sections: `## Problem` (failure + root cause + expected vs actual behavior + repro steps + `Fixes #<n>` when applicable), `## Change` (scannable bullets, noting behavioral parity with upstream/CLI), `## Scope` (why every changed file belongs to one problem, linking the issue or noting why a small, obvious bug needs none, or linking the maintainer request), and `## Verification`.
+   - `"Tests pass"` is never enough. `## Verification` must include:
+     - Exact `vp run check:changed upstream/main` stage results plus focused test counts.
+     - Regression proof failing on `upstream/main` and passing on the branch.
+     - Before/after comparison table against `upstream/main` AND live reproduction with the real provider/app (e.g. `agy acp`, `agy plugin validate --json`, local isolated `statev2.sqlite` dev server) whenever provider/runtime behavior is affected.
+     - Explicit **Not checked** bullets for any untested OS, platform, or mode.
+     - A collapsible `<details><summary>Reproduction script and output</summary>` with a self-contained runnable reproduction script and verbatim before/after outputs (never commit repro scripts into the branch), plus uploaded GitHub before/after screenshots or videos for UI, motion, or timing changes (never commit PR-only assets).
+5. **Issues:**
+   - Search existing open and closed issues and PRs first (`CONTRIBUTING.md#the-best-way-to-help`), preferring `+1`, testing an existing issue/PR, or noting fixed/duplicate links over opening duplicates. Put feature requests in Ideas discussions.
+   - Include minimal reproduction steps, version/OS/environment, expected vs actual behavior, and verbatim output/logs.
