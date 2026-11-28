@@ -3083,6 +3083,13 @@ export const layerWithOptions = (
             if (nativeEvent.type === "command_output.delta") {
               return commandOutput.append(nativeEvent);
             }
+            // Only run subscribers act on it, because unloading is not provider activity.
+            if (nativeEvent.type === "provider_thread.unloaded") {
+              return publishToSubscribers(entry.eventSubscribers, {
+                type: "event",
+                event: nativeEvent,
+              });
+            }
             // A query process can exit under a live session, after the run's last event.
             if (nativeEvent.type === "background_work.lost") {
               return writeReleasedWorkNote({
