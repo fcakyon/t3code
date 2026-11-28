@@ -503,6 +503,7 @@ function makeLocalCommandHarness(input: {
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
   readonly failReadsAfterRunning?: boolean;
+  readonly childThreads?: ReadonlyArray<OrchestrationV2ThreadProjection>;
   readonly missingProviderSession?: boolean;
   readonly recoveryReadFailure?: string;
   readonly previousTurn?: {
@@ -1300,8 +1301,10 @@ function makeLocalCommandHarness(input: {
   const createWorktree = vi.fn<GitWorkflow.GitWorkflowService["Service"]["createWorktree"]>(() =>
     Effect.succeed({} as never),
   );
+  const childThread = (id: ThreadId) =>
+    input.childThreads?.find((candidate) => candidate.thread.id === id);
   const getThreadRecords = vi.fn<ProjectionStore.ProjectionStoreV2Shape["getThreadRecords"]>((id) =>
-    Effect.succeed(id === parentThreadId ? parentRecords : projection),
+    Effect.succeed(childThread(id) ?? (id === parentThreadId ? parentRecords : projection)),
   );
   const prepareProviderHandoff = vi.fn<
     ContextHandoffService.ContextHandoffServiceV2["Service"]["prepareProviderHandoff"]
@@ -1410,6 +1413,8 @@ function makeLocalCommandHarness(input: {
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
           getForkSourceRunIds: () => Effect.succeed(parentRecords.runs.map((run) => run.id)),
           getThreadRecords,
+          findThread: (id) =>
+            Effect.succeed(id === threadId ? projection.thread : (childThread(id)?.thread ?? null)),
           getTurnStartContext,
           getTurnItem: () => Effect.succeed(null),
           getRuntimeRecoveryProjection,
@@ -3681,5 +3686,92 @@ effectIt.effect("rejects citation expansion before opening a provider session", 
       },
     ]);
     expect(harness.projection().messages[0]?.text).toBe(text);
+  }),
+);
+
+effectIt.effect("reads a saved native child from its immediate parent in this thread's tree", () =>
+  Effect.gen(function* () {
+    const rootThreadId = ThreadId.make("thread-native-account-command");
+    const [middle, leaf, fork, forkChild, delegated, delegatedLeaf] = [
+      "middle",
+      "leaf",
+      "fork",
+      "fork-child",
+      "delegated",
+      "delegated-leaf",
+    ].map((id) => ThreadId.make(`thread-${id}`)) as [
+      ThreadId,
+      ThreadId,
+      ThreadId,
+      ThreadId,
+      ThreadId,
+      ThreadId,
+    ];
+    const providerThreadIdFor = (id: ThreadId) => ProviderThreadId.make(`provider-${id}`);
+    const savedChildren = (children: ReadonlyArray<ThreadId>) => ({
+      subagents: children.map((id) => ({
+        id: NodeId.make(`task-${id}`),
+        origin: "provider_native",
+        childThreadId: id,
+        providerThreadId: providerThreadIdFor(id),
+      })),
+      turnItems: children.map((id) => ({
+        type: "subagent",
+        subagentId: NodeId.make(`task-${id}`),
+      })),
+    });
+    const thread = (
+      id: ThreadId,
+      parentThreadId: ThreadId,
+      relationshipToParent: "fork" | "subagent",
+      children: ReadonlyArray<ThreadId> = [],
+      creationSource: "provider" | "agent" = "provider",
+    ) =>
+      ({
+        thread: {
+          id,
+          creationSource,
+          lineage: { parentThreadId, relationshipToParent, rootThreadId },
+        },
+        providerThreads: [{ id: providerThreadIdFor(id) }],
+        providerTurns: [1, 2].map((ordinal) => ({
+          providerThreadId: providerThreadIdFor(id),
+          ordinal,
+        })),
+        ...savedChildren(children),
+      }) as unknown as OrchestrationV2ThreadProjection;
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      previousTurn: { runStatus: "completed", turnStatus: "completed" },
+      childThreads: [
+        thread(middle, rootThreadId, "subagent", [leaf]),
+        thread(leaf, middle, "subagent"),
+        thread(fork, rootThreadId, "fork", [forkChild]),
+        thread(forkChild, fork, "subagent"),
+        thread(delegated, rootThreadId, "subagent", [delegatedLeaf], "agent"),
+        thread(delegatedLeaf, delegated, "subagent"),
+      ],
+    });
+    yield* harness.start;
+    harness.setProjection({
+      ...harness.projection(),
+      ...savedChildren([middle]),
+    } as unknown as OrchestrationV2ThreadProjection);
+    const read = harness.startRootRun.mock.calls[0]![0].readSubagentThread!;
+
+    const savedMiddle = yield* read(middle);
+    expect(savedMiddle?.subagent.id).toBe(NodeId.make(`task-${middle}`));
+    const savedLeaf = yield* read(leaf);
+    expect(savedLeaf).toMatchObject({
+      subagent: { id: NodeId.make(`task-${leaf}`) },
+      childThread: { id: leaf },
+      providerThread: { id: providerThreadIdFor(leaf) },
+      turnItem: { subagentId: NodeId.make(`task-${leaf}`) },
+      latestProviderTurnOrdinal: 2,
+    });
+    // Forks, app-owned delegated subagents, and uncreated children stay outside this tree.
+    expect(yield* read(forkChild)).toBeNull();
+    expect(yield* read(delegatedLeaf)).toBeNull();
+    expect(yield* read(ThreadId.make("thread-not-created-yet"))).toBeNull();
   }),
 );

@@ -18,6 +18,7 @@ import {
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
   isDeliveredProviderTurn,
+  isProviderNativeSubagentThread,
   parseGoalCommand,
   RunId,
   RunAttemptId,
@@ -467,6 +468,84 @@ export const layer: Layer.Layer<
             Effect.catchCause(() => Effect.succeed(input.inheritedBackgroundTurnItems)),
           ),
         shouldStartProviderTurn: () => isCurrentAttemptInStatus("running"),
+        readSubagentThread: Effect.fn("ProviderTurnStartService.readSubagentThread")(
+          function* (childThreadId: ThreadId) {
+            // A child's turn can start before the spawn that creates its thread.
+            const childThread = yield* projectionStore.findThread(childThreadId);
+            if (childThread === null || !isProviderNativeSubagentThread(childThread)) return null;
+            const { parentThreadId } = childThread.lineage;
+            if (parentThreadId === null) return null;
+            // A nested child is saved on its immediate parent. Only children descended
+            // from this run's thread through provider-native subagent links belong to it.
+            let ancestorId = parentThreadId;
+            const visited = new Set<ThreadId>([childThreadId]);
+            while (ancestorId !== input.threadId) {
+              if (visited.has(ancestorId)) return null;
+              visited.add(ancestorId);
+              const ancestor = yield* projectionStore.findThread(ancestorId);
+              if (
+                ancestor === null ||
+                !isProviderNativeSubagentThread(ancestor) ||
+                ancestor.lineage.parentThreadId === null
+              )
+                return null;
+              ancestorId = ancestor.lineage.parentThreadId;
+            }
+            const parent = yield* projectionStore.getThreadRecords(
+              parentThreadId,
+              ["subagents", "turnItems"],
+              {
+                subagentChildThreadIds: [childThreadId],
+                turnItemTypes: ["subagent"],
+              },
+            );
+            const subagent = parent.subagents.find(
+              (task) => task.origin === "provider_native" && task.childThreadId === childThreadId,
+            );
+            const turnItem = parent.turnItems.find(
+              (item): item is Extract<typeof item, { readonly type: "subagent" }> =>
+                item.type === "subagent" && item.subagentId === subagent?.id,
+            );
+            if (
+              subagent === undefined ||
+              subagent.providerThreadId === null ||
+              turnItem === undefined
+            )
+              return null;
+            const child = yield* projectionStore.getThreadRecords(
+              childThreadId,
+              ["providerThreads", "providerTurns"],
+              {
+                providerTurnThreadIds: [subagent.providerThreadId],
+              },
+            );
+            const providerThread = child.providerThreads.find(
+              (thread) => thread.id === subagent.providerThreadId,
+            );
+            if (providerThread === undefined) return null;
+            return {
+              subagent,
+              childThread: child.thread,
+              providerThread,
+              turnItem,
+              latestProviderTurnOrdinal: Math.max(
+                0,
+                ...child.providerTurns
+                  .filter((turn) => turn.providerThreadId === providerThread.id)
+                  .map((turn) => turn.ordinal),
+              ),
+            };
+          },
+          (effect, childThreadId) =>
+            effect.pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("Failed to read a saved provider-native subagent.", {
+                  childThreadId,
+                  cause,
+                }).pipe(Effect.as(null)),
+              ),
+            ),
+        ),
         shouldFinalizeRun: () => isCurrentAttemptIn(["starting", "running"]),
         hasUnpairedRunInterruptRequest: () =>
           projectionStore
@@ -2741,6 +2820,7 @@ export const layer: Layer.Layer<
             sameNativeThread &&
             !acceptedAttempts.some((source) => source.nativeThreadId !== undefined)),
         shouldStartProviderTurn: runControls.shouldStartProviderTurn,
+        readSubagentThread: runControls.readSubagentThread,
         shouldFinalizeRun: runControls.shouldFinalizeRun,
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
         loadRunInterruptReason: runControls.loadRunInterruptReason,

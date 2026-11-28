@@ -682,6 +682,7 @@ export const layer: Layer.Layer<
               ];
             }
             case "background_work.updated":
+            case "provider_thread.unloaded":
               return [];
             case "background_work.lost":
             case "command_output.delta":
